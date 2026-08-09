@@ -51,11 +51,24 @@ def check_kernel_contract(kernel_dir: str) -> list[str]:
         )
         return problems
 
-    # errors="replace", not the default strict decoding: a RESULT.md that is
-    # binary garbage must still produce a "could not be parsed" problem, not an
-    # unhandled UnicodeDecodeError. check_kernel_contract must never raise.
-    with open(result_path, encoding="utf-8", errors="replace") as f:
-        text = f.read()
+    # Strict UTF-8, with the decode error turned into a problem rather than an
+    # exception. Both obvious alternatives are wrong:
+    #   - strict decode with no handler RAISES on a binary file, breaking the
+    #     "never raises" contract;
+    #   - errors="replace" silently repairs corruption, and if the damaged bytes
+    #     happen to fall outside the two regions the regexes anchor on, a
+    #     corrupt file PARSES and PASSES. That trades a loud failure for a
+    #     silent one, in the module whose whole purpose is making an accidental
+    #     green impossible.
+    try:
+        with open(result_path, encoding="utf-8") as f:
+            text = f.read()
+    except UnicodeDecodeError as e:
+        problems.append(
+            f"{RESULT_FILENAME} is not valid UTF-8: {e}. Re-generate it with "
+            "`hexlib test` rather than editing it by hand."
+        )
+        return problems
 
     parsed = parse_result_table(text)
     if parsed is None:

@@ -73,3 +73,49 @@ def test_structural_problems_are_also_reported(tmp_path):
     d = _kernel(tmp_path)
     os.remove(os.path.join(d, "baseline.c"))
     assert any("baseline.c" in p for p in contract.check_kernel_contract(d))
+
+
+def test_wrong_target_is_rejected(tmp_path):
+    bad = GOOD_TABLE.replace("v75", "v73")
+    problems = contract.check_kernel_contract(_kernel(tmp_path, table=bad))
+    assert any("v73" in p and "v75" in p for p in problems)
+
+
+def test_binary_garbage_result_is_rejected(tmp_path):
+    """A RESULT.md that is pure binary garbage must be rejected, not raise."""
+    d = tmp_path / "rmsnorm_fp16"
+    d.mkdir()
+    for f in kd.REQUIRED_FILES:
+        (d / f).write_text("")
+    (d / "nearmiss_x.c").write_text("")
+    (d / "spec.json").write_text(json.dumps({"task_id": "rmsnorm_fp16", "dtype": "fp16"}))
+    (d / "RESULT.md").write_bytes(bytes([0xFF, 0xFE, 0x00, 0x80, 0x81]))
+    problems = contract.check_kernel_contract(str(d))
+    assert problems != []
+
+
+def test_corrupted_prose_outside_matched_regions_is_rejected(tmp_path):
+    """A RESULT.md can be a syntactically valid, correctly-toolchained PASS
+    table -- both regex-anchored regions parse cleanly -- and still be a
+    corrupted file: invalid UTF-8 bytes landing in the surrounding prose,
+    outside the conditions line and the gate row, must not be silently
+    repaired into a pass. Written as raw bytes so the corruption is real,
+    not something Python would re-encode away.
+    """
+    d = tmp_path / "rmsnorm_fp16"
+    d.mkdir()
+    for f in kd.REQUIRED_FILES:
+        (d / f).write_text("")
+    (d / "nearmiss_x.c").write_text("")
+    (d / "spec.json").write_text(json.dumps({"task_id": "rmsnorm_fp16", "dtype": "fp16"}))
+    corrupted = (
+        GOOD_TABLE.encode("utf-8")
+        + "\nMeasured on the hexagon simulator under the pinned bus model.".encode(
+            "utf-8"
+        )
+        + b"\xff\xfe"
+        + " Not a silicon measurement.".encode("utf-8")
+    )
+    (d / "RESULT.md").write_bytes(corrupted)
+    problems = contract.check_kernel_contract(str(d))
+    assert problems != []
