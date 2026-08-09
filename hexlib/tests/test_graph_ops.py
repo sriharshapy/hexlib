@@ -92,7 +92,7 @@ def test_module_registry_is_populated_and_not_empty():
     # vacuously, is the "absence read as success" hazard CONTRIBUTING.md names.
     import hexlib.graph.opdefs  # noqa: F401
 
-    assert len(opsmod.REGISTRY.all_kinds()) >= 11
+    assert len(opsmod.REGISTRY.all_kinds()) >= 12
 
 
 def test_every_registered_opdef_is_complete():

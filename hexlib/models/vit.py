@@ -135,7 +135,18 @@ def build_vision_encoder(cfg: VitConfig) -> Graph | Err:
         },
         out_dtype="fp32",
     )
-    embedded = b.linear(patches, "w_patch_embed", "b_patch_embed", feat, H, "patch_embed.out")
+    # The host always hands in an fp32 image, but activations may be fp16
+    # (cfg.act_dtype). Make that dtype boundary an explicit op rather than
+    # relying on the patch-embed matmul's infer to declare a dtype other than
+    # its own input's -- that mismatch is exactly what broke M1 Task 1's
+    # infer/declared cross-check. Emitted unconditionally, even when
+    # act_dtype == "fp32" (a no-op conversion), so the graph shape is
+    # identical across configs.
+    patches_act = b.emit(
+        "cast", (patches,), "patches.cast", (n, feat), {"dtype": cfg.act_dtype},
+        out_dtype=cfg.act_dtype,
+    )
+    embedded = b.linear(patches_act, "w_patch_embed", "b_patch_embed", feat, H, "patch_embed.out")
     # The learned 48x48 position grid is bilinearly resampled to this image's
     # patch grid (modeling_qwen3_5.py:1100). Resolution is fixed, so the result
     # is a constant and the interpolation costs no ops here.

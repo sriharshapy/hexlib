@@ -11,7 +11,8 @@ from typing import Sequence
 
 import numpy as np
 
-from hexlib.graph.ir import Tensor
+from hexlib.graph.eager import NUMPY_DTYPE
+from hexlib.graph.ir import DTYPES, Tensor
 from hexlib.graph.ops import OpDef, register
 
 
@@ -49,6 +50,36 @@ register(
         infer=_matmul_infer,
         working_set=_default_working_set,
         reference=lambda arrays, attrs: ((arrays[0] @ arrays[1]).astype(arrays[0].dtype),),
+    )
+)
+
+# --- cast ----------------------------------------------------------------
+
+# There is a real dtype boundary at the host/activation edge: the host hands
+# in an fp32 image, but activations inside the encoder may be fp16. `cast` is
+# the op that makes that boundary explicit in the IR, instead of leaving a
+# builder to smuggle a dtype change through an op (e.g. matmul) whose own
+# `infer` says otherwise -- which is exactly how the patch-embed matmul's
+# dtype disagreement happened.
+
+
+def _cast_infer(inputs, attrs):
+    dtype = attrs["dtype"]
+    if dtype not in DTYPES:
+        raise ValueError(f"cast: unknown dtype {dtype!r}; expected one of {sorted(DTYPES)}")
+    return ((inputs[0].shape, dtype),)
+
+
+def _cast_reference(arrays, attrs):
+    return (arrays[0].astype(NUMPY_DTYPE[attrs["dtype"]]),)
+
+
+register(
+    OpDef(
+        kind="cast",
+        infer=_cast_infer,
+        working_set=_default_working_set,
+        reference=_cast_reference,
     )
 )
 

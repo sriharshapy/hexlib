@@ -245,3 +245,34 @@ def test_every_inner_dim_is_divisible_by_32():
         if t.dtype == "q4_0":
             assert t.shape[-2] % 32 == 0, f"{t.name} inner dim {t.shape[-2]}"
             assert t.shape[-1] % 32 == 0, f"{t.name} outer dim {t.shape[-1]}"
+
+
+def test_every_op_infer_agrees_with_the_builders_own_declaration():
+    """M1's `infer_shapes` pass (docs/superpowers/plans/
+    2026-08-09-vlm-encoder-m1-pass-pipeline.md, Task 1) trusts that every op's
+    own `infer` agrees with what the builder declared for its outputs. Prove
+    that on the REAL shipped graph -- qwen35_at(256), fp16 activations over
+    q4_0 weights -- not on a synthetic fixture where every dtype happens to be
+    the same and a disagreement like this one cannot show up.
+
+    This caught a real bug: patchify emits `patches` as fp32 (the host always
+    hands in an fp32 image), but the patch-embed matmul's builder-declared
+    output was `cfg.act_dtype` (fp16 for the shipped config) while
+    `matmul.infer` takes the output dtype from its first input (patches,
+    fp32) -- disagreement, undetected until this test walked infer over the
+    real graph.
+    """
+    from hexlib.graph.ops import get
+
+    g = build_vision_encoder(qwen35_at(256))
+    assert not isinstance(g, Err), getattr(g, "detail", "")
+    assert g.ops, "graph has no ops; this test would pass vacuously"
+
+    mismatches = []
+    for op in g.ops:
+        inputs = tuple(g.tensor(name) for name in op.inputs)
+        got = get(op.kind).infer(inputs, op.attrs)
+        declared = tuple((g.tensor(name).shape, g.tensor(name).dtype) for name in op.outputs)
+        if got != declared:
+            mismatches.append(f"op {op.id} {op.kind} {op.outputs}: declared {declared}, infer says {got}")
+    assert not mismatches, "\n".join(mismatches)
