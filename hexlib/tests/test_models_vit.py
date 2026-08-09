@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from dataclasses import fields
+from typing import get_type_hints
 
 import hexlib.graph.opdefs  # noqa: F401
 from hexlib.graph import eager
 from hexlib.models.qwen35 import QWEN35_08B_VISION, qwen35_at
-from hexlib.models.vit import VitConfig, build_vision_encoder, weight_names
+from hexlib.models.vit import VitConfig, build_vision_encoder, weight_names, _get_positive_int_field_names
 from hexlib.result import Err
 
 
@@ -237,6 +239,29 @@ def test_every_dimension_bearing_field_is_guarded_not_just_the_three_divisors(fi
     assert isinstance(result, Err), f"{field}={value} should be Err, was {result!r}"
     assert field in result.detail
     assert str(value) in result.detail
+
+
+def test_guard_tracks_vit_config_int_fields_not_a_constant():
+    # The guard derives int field names from VitConfig's type annotations
+    # rather than maintaining a hand-written list. This test proves the
+    # derivation is structural: if someone adds a new int field to VitConfig,
+    # the guard immediately catches it without modifying this function.
+
+    # Get the set of int-typed fields directly from the dataclass.
+    hints = get_type_hints(VitConfig)
+    declared_int_fields = {
+        field.name for field in fields(VitConfig)
+        if hints.get(field.name) is int
+    }
+
+    # Get the set of fields the guard actually checks.
+    guarded_fields = _get_positive_int_field_names()
+
+    # They must be identical.
+    assert guarded_fields == declared_int_fields, (
+        f"guard checks {sorted(guarded_fields)} but VitConfig has int fields "
+        f"{sorted(declared_int_fields)}; the guard is out of sync"
+    )
 
 
 def test_weight_names_on_a_bad_config_is_an_err_not_an_empty_tuple():

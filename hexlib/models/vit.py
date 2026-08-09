@@ -7,8 +7,8 @@ it is constant, and none of it costs an op at run time.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, fields
+from typing import Any, get_type_hints
 
 from hexlib.graph.ir import Graph, Op, Tensor
 from hexlib.result import Err
@@ -229,31 +229,28 @@ def _layernorm(
     return b.emit("layernorm", (x, w, bias), out_name, shape, {"eps": eps})
 
 
-# Every int field that is a count, a dimension, or a divisor somewhere in
-# `build_vision_encoder`. `Tensor.__post_init__` raises on a non-positive
-# shape dim, and a plain `%` raises `ZeroDivisionError` on a zero divisor, so
-# any field in this list left unguarded turns a bad config into a crash
-# instead of an `Err`. Checked by name, in a loop, rather than field by field:
-# a field added to `VitConfig` later and left out of a hand-written chain of
-# `if`s is exactly how `image_size` slipped through (`-32 % 16 == 0` passes
-# the divisibility check even though the field itself is nonsense).
-_POSITIVE_INT_FIELDS: tuple[str, ...] = (
-    "depth",
-    "hidden_size",
-    "num_heads",
-    "intermediate_size",
-    "patch_size",
-    "temporal_patch_size",
-    "in_channels",
-    "spatial_merge_size",
-    "out_hidden_size",
-    "image_size",
-)
+def _get_positive_int_field_names() -> set[str]:
+    """Get the names of all int-typed fields in VitConfig that must be positive.
+
+    Every int field is a count, a dimension, or a divisor somewhere in
+    `build_vision_encoder`. `Tensor.__post_init__` raises on a non-positive
+    shape dim, and a plain `%` raises `ZeroDivisionError` on a zero divisor, so
+    any int field left unguarded turns a bad config into a crash instead of
+    an `Err`. This derives the set of field names from VitConfig's type
+    annotations rather than maintaining a hand-written tuple: a field added
+    to `VitConfig` later is immediately guarded without changing this function.
+    """
+    hints = get_type_hints(VitConfig)
+    int_field_names = set()
+    for field in fields(VitConfig):
+        if hints.get(field.name) is int:
+            int_field_names.add(field.name)
+    return int_field_names
 
 
 def _config_problems(cfg: VitConfig) -> list[str]:
     problems: list[str] = []
-    for name in _POSITIVE_INT_FIELDS:
+    for name in _get_positive_int_field_names():
         value = getattr(cfg, name)
         if value <= 0:
             problems.append(f"{name} {value} must be positive")
