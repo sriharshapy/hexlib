@@ -31,13 +31,19 @@ jobs:
           python - <<'PY'
           import pathlib, sys
           from hexlib.contract import check_kernel_contract
+          dirs = sorted(p for p in pathlib.Path("kernels").glob("*/") if p.is_dir())
+          if not dirs:
+              # A check that found nothing to check must never report success.
+              print("::error::no kernel directories found under kernels/")
+              sys.exit(1)
           failed = False
-          for d in sorted(pathlib.Path("kernels").glob("*/")):
+          for d in dirs:
               problems = check_kernel_contract(str(d))
               if problems:
                   failed = True
                   print(f"::error::{d}")
                   for p in problems:
                       print(f"  - {p}")
+          print(f"checked {len(dirs)} kernel directories")
           sys.exit(1 if failed else 0)
           PY
