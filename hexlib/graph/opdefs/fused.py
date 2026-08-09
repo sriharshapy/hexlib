@@ -34,7 +34,11 @@ def _infer(inputs, attrs):
 
 
 def _working_set(inputs, outputs, attrs) -> int:
-    return sum(t.nbytes for t in inputs) + sum(t.nbytes for t in outputs)
+    # Imported lazily: dma imports layout, which imports ir, and a top-level
+    # import here would be circular.
+    from hexlib.graph.dma import matmul_working_set
+
+    return matmul_working_set(inputs, outputs, attrs)
 
 
 def _reference(arrays, attrs):

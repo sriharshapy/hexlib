@@ -24,6 +24,14 @@ def _default_working_set(inputs, outputs, attrs) -> int:
     return _sum_bytes(inputs) + _sum_bytes(outputs)
 
 
+def _matmul_working_set(inputs, outputs, attrs) -> int:
+    # Imported lazily: dma imports layout, which imports ir, and a top-level
+    # import here would be circular.
+    from hexlib.graph.dma import matmul_working_set
+
+    return matmul_working_set(inputs, outputs, attrs)
+
+
 # --- matmul ------------------------------------------------------------
 
 
@@ -48,7 +56,7 @@ register(
     OpDef(
         kind="matmul",
         infer=_matmul_infer,
-        working_set=_default_working_set,
+        working_set=_matmul_working_set,
         reference=lambda arrays, attrs: ((arrays[0] @ arrays[1]).astype(arrays[0].dtype),),
     )
 )
