@@ -51,6 +51,14 @@ def parse_kernel_cycles(text: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def count_verdicts(text: str) -> int:
+    return len(_VERDICT.findall(text))
+
+
+def count_kernel_cycles(text: str) -> int:
+    return len(_KCYCLES.findall(text))
+
+
 def sim_command(sim_exe: str, elf: str, caps: list[str]) -> list[str]:
     """Assemble the simulator command. Pure — assertable without an SDK.
 
@@ -89,6 +97,29 @@ def run_sim(
             combined,
         )
 
+    if rc != 0:
+        raise SimError(
+            f"simulator exited {rc}. A run that faulted has not demonstrated "
+            "anything, even if the harness managed to flush its verdict first.",
+            combined,
+        )
+
+    # EXACTLY ONE of each, never merely "at least one". re.search takes the
+    # first match and discards the rest: a harness that reports per shape would
+    # have every failure after the first silently dropped, and a kernel that
+    # prints these lines itself runs BEFORE the harness reports, so its forged
+    # verdict would win -- and would keep winning when a maintainer re-ran the
+    # gate to check.
+    n_verdicts = count_verdicts(combined)
+    if n_verdicts > 1:
+        raise SimError(
+            f"{n_verdicts} HEXLIB_VERDICT lines recovered; exactly one is "
+            "required. Only the harness may print it, and only once. Two "
+            "verdicts means either a harness reporting per shape (in which "
+            "case every failure after the first would be discarded) or output "
+            "from the kernel itself.",
+            combined,
+        )
     verdict = parse_verdict(combined)
     if verdict is None:
         raise SimError(
@@ -98,6 +129,13 @@ def run_sim(
             combined,
         )
 
+    n_cycles = count_kernel_cycles(combined)
+    if n_cycles > 1:
+        raise SimError(
+            f"{n_cycles} HEXLIB_KCYCLES lines recovered; exactly one is "
+            "required. A run with two cycle counts has no single measurement.",
+            combined,
+        )
     cycles = parse_kernel_cycles(combined)
     if cycles is None:
         raise SimError(

@@ -66,6 +66,59 @@ def test_run_sim_reports_timeout_distinctly(monkeypatch, tmp_path):
         sim.run_sim(out, caps=[])
 
 
+def test_two_verdicts_is_a_failure(monkeypatch, tmp_path):
+    """re.search takes the first match; a second verdict must not be silently
+    discarded, and a kernel must not be able to pre-empt the harness."""
+    from hexlib.build import BuildOutput
+
+    text = (
+        "HEXLIB_VERDICT correct=1 wrong=0 maxerr=0\nHEXLIB_KCYCLES kernel=1\n"
+        "HEXLIB_VERDICT correct=0 wrong=512 maxerr=9.9\n"
+        "HEXLIB_KCYCLES kernel=70000\n"
+    )
+    monkeypatch.setattr(sim.tc, "run", lambda *a, **k: (0, text, "", False))
+    monkeypatch.setattr(sim.tc, "toolchain_env", lambda *a, **k: {})
+    out = BuildOutput(elf="x.elf", obj="x.o", bin_dir=str(tmp_path),
+                      toolchain_version="19.0.04")
+    with pytest.raises(sim.SimError, match="exactly one"):
+        sim.run_sim(out, caps=[])
+
+
+def test_two_kernel_cycle_lines_is_a_failure(monkeypatch, tmp_path):
+    """A run with two cycle counts has no single measurement, even if the
+    verdict itself is unambiguous."""
+    from hexlib.build import BuildOutput
+
+    text = (
+        "HEXLIB_VERDICT correct=1 wrong=0 maxerr=0\n"
+        "HEXLIB_KCYCLES kernel=1\nHEXLIB_KCYCLES kernel=2\n"
+    )
+    monkeypatch.setattr(sim.tc, "run", lambda *a, **k: (0, text, "", False))
+    monkeypatch.setattr(sim.tc, "toolchain_env", lambda *a, **k: {})
+    out = BuildOutput(elf="x.elf", obj="x.o", bin_dir=str(tmp_path),
+                      toolchain_version="19.0.04")
+    with pytest.raises(sim.SimError, match="exactly one"):
+        sim.run_sim(out, caps=[])
+
+
+def test_nonzero_return_code_is_a_failure_even_with_a_flushed_verdict(monkeypatch, tmp_path):
+    """hexlib_report() fflushes before returning, so a crash during CRT
+    teardown or a harness that exits nonzero can still leave a full PASS
+    verdict on the wire. The return code must not be discarded."""
+    from hexlib.build import BuildOutput
+
+    text = (
+        "HEXLIB_VERDICT correct=1 wrong=0 maxerr=0\n"
+        "HEXLIB_KCYCLES kernel=2021\nSegmentation fault\n"
+    )
+    monkeypatch.setattr(sim.tc, "run", lambda *a, **k: (139, text, "", False))
+    monkeypatch.setattr(sim.tc, "toolchain_env", lambda *a, **k: {})
+    out = BuildOutput(elf="x.elf", obj="x.o", bin_dir=str(tmp_path),
+                      toolchain_version="19.0.04")
+    with pytest.raises(sim.SimError, match="exited 139"):
+        sim.run_sim(out, caps=[])
+
+
 def test_sim_command_pins_the_bus_model():
     cmd = sim.sim_command("hexagon-sim", "a.elf", caps=[])
     assert "-mv75" in cmd
