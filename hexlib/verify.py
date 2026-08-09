@@ -46,6 +46,8 @@ class VerifyReport:
     host: str
     timestamp: str
     expert_kernel_cycles: int | None = None
+    n_wrong: int = 0
+    max_err: float = 0.0
 
     def gate_passed(self) -> bool:
         if not self.correct:
@@ -87,6 +89,7 @@ class VerifyReport:
             f"| gate | result |",
             f"|---|---|",
             f"| correct | {'PASS' if self.correct else 'FAIL'} |",
+            f"| max abs error | {self.max_err:.6g} (n_wrong {self.n_wrong}) |",
             f"| kernel_cycles | {self.kernel_cycles}{speedup} |",
             f"| accel (ELF-proven) | {', '.join(mechs) if mechs else 'NONE'} |",
         ]
@@ -137,6 +140,22 @@ def verify(kernel_dir: str, out_dir: str, sdk_root: str | None = None) -> Result
     spec = kd.load_spec(kernel_dir)
     root = sdk_root or tc.default_sdk_root()
 
+    # Delete any previous run's artifacts before anything that can fail. A
+    # result table that outlives the run that produced it will eventually be
+    # attached to a different one: a contributor greens the gate, edits
+    # kernel.c, re-runs and gets a build failure, and _work/<task>.result.md
+    # still holds the earlier PASS with its earlier timestamp.
+    os.makedirs(out_dir, exist_ok=True)
+    for stale in (
+        os.path.join(out_dir, f"{spec.task_id}.result.json"),
+        os.path.join(out_dir, f"{spec.task_id}.result.md"),
+        os.path.join(kernel_dir, "RESULT.md"),
+    ):
+        try:
+            os.remove(stale)
+        except FileNotFoundError:
+            pass
+
     try:
         built = build_kernel(kernel_dir, out_dir, spec.caps, sdk_root=root)
     except BuildError as e:
@@ -154,6 +173,26 @@ def verify(kernel_dir: str, out_dir: str, sdk_root: str | None = None) -> Result
         return Err(f"{spec.task_id}: simulation failed — {e}", e.sim_output)
 
     accel = prove_accel(built.obj, built.bin_dir)
+
+    # A declared mechanism the ELF does not show is a claim exceeding the
+    # measurement -- spec.json is what a future index, search page, or docs
+    # generator would read, and nothing else ever compares it against the
+    # AccelProof already computed above. Only hvx and hmx are ELF-provable;
+    # dma/vtcm/l2fetch/scalar are not, so they are not checked here. Placed
+    # before the near-miss loop so a bad claim fails fast without paying for
+    # near-miss builds.
+    declared = set(spec.mechanisms or [])
+    unproven = sorted(
+        m for m in ("hvx", "hmx")
+        if m in declared
+        and not (accel.used_hvx if m == "hvx" else accel.used_hmx)
+    )
+    if unproven:
+        return Err(
+            f"{spec.task_id}: spec.json declares mechanisms the ELF does not "
+            f"show: {', '.join(unproven)}. Remove the claim from spec.json, or "
+            "use the mechanism.",
+        )
 
     # Every near-miss must build, run, and be REJECTED by the harness.
     #
@@ -196,6 +235,8 @@ def verify(kernel_dir: str, out_dir: str, sdk_root: str | None = None) -> Result
         host=f"{getpass.getuser()}@{platform.node()}",
         timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         expert_kernel_cycles=spec.expert_kernel_cycles,
+        n_wrong=outcome.n_wrong,
+        max_err=outcome.max_err,
     )
 
     os.makedirs(out_dir, exist_ok=True)
@@ -208,6 +249,14 @@ def verify(kernel_dir: str, out_dir: str, sdk_root: str | None = None) -> Result
 
     if not report.gate_passed():
         return Err(f"{spec.task_id}: gate FAILED", report.to_table())
+
+    # Write the contributor-facing artifact into the kernel directory itself,
+    # so the file CI validates (contract.py's RESULT_FILENAME) is the file
+    # this tool produced, and nobody has to copy a gitignored _work/ path by
+    # hand. Only on a pass: a FAIL belongs in _work, not committed next to the
+    # kernel.
+    with open(os.path.join(kernel_dir, "RESULT.md"), "w", encoding="utf-8") as f:
+        f.write(report.to_table() + "\n")
 
     return Ok(
         Measurements(

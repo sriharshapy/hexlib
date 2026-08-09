@@ -62,7 +62,10 @@ def _cmd_test(args) -> int:
         with open(table_path, encoding="utf-8") as f:
             print(f.read())
     print(f"result table: {table_path}")
-    print("Paste it into your pull request.")
+    result_md = os.path.join(args.kernel, "RESULT.md")
+    print(f"Wrote {result_md} — commit it with your kernel. CI has no SDK and "
+          "cannot regenerate it.")
+    print("Paste the same table into your pull request description for reviewers.")
     return 0
 
 
