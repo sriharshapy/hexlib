@@ -141,6 +141,17 @@ def _patchify_reference(arrays, attrs):
 
     Per-patch feature order is (C, T, ph, pw), matching the Conv3d weight
     layout [embed, C, T, ph, pw] at modeling_qwen3_5.py:864.
+
+    This ordering was independently confirmed against the actual image
+    processor qwen3_5 declares: `transformers/models/auto/image_processing_auto.py:128`
+    maps `"qwen3_5"` to `Qwen2VLImageProcessor`
+    (`transformers/models/qwen2_vl/image_processing_qwen2_vl.py:196-218`,
+    `Qwen2VLImageProcessor._preprocess`), whose own
+    `reshape(...).permute(0, 2, 5, 3, 6, 1, 4, 7)` chain produces the same
+    (grid_h/merge, grid_w/merge, merge_h, merge_w) token order and (channel,
+    T, patch_h, patch_w) feature order implemented below -- see
+    `scripts/gen_vision_oracle.py::_patches_from_image` for the full citation
+    and the independent numpy re-derivation this was checked against.
     """
     img = arrays[0]
     c, t, h, w = img.shape

@@ -87,6 +87,8 @@ docs/hardware/     measured hardware notes (HMX int8, simulator accuracy)
 - [`docs/hardware/simulator-accuracy.md`](docs/hardware/simulator-accuracy.md) — what
   "cycle-approximate" means and where the simulator is most likely to drift from
   silicon.
+- [`docs/research/oracle-provenance.md`](docs/research/oracle-provenance.md) — what the
+  committed vision-encoder golden vectors prove, and what they do not.
 
 ## License
 
