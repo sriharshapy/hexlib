@@ -87,9 +87,28 @@ def main() -> int:
     with torch.no_grad():
         result = model(torch.from_numpy(patches), grid_thw=grid_thw)
 
+    # A SECOND, independent computation of the same [C,T,H,W] -> [n, feat]
+    # patch ordering, run by literally executing torch's own
+    # reshape/permute/unsqueeze/expand/reshape chain (see
+    # `_patches_from_image_via_literal_upstream_chain` below) rather than by
+    # re-deriving the equivalent numpy expression by hand. `_patches_from_image`
+    # above and hexlib's `structural.py::_patchify_reference` are the SAME
+    # hand-derived expression, so comparing hexlib against `patches` proves
+    # nothing about ordering -- a wrong ordering shared by both sides cancels.
+    # `patches_upstream` is what `test_patchify_matches_upstreams_literal_chain`
+    # (hexlib/tests/test_vision_oracle.py) compares hexlib's `patchify` op
+    # against instead.
+    patches_upstream = _patches_from_image_via_literal_upstream_chain(image)
+    assert np.array_equal(patches, patches_upstream), (
+        "the hand-derived numpy patch ordering and the literal torch permute "
+        "chain disagree -- one of them is wrong; do not paper over this by "
+        "committing a golden that hides it"
+    )
+
     arrays = {
         "image": image,
         "patches": patches,
+        "patches_upstream": patches_upstream,
         "expected_merged": result.pooler_output.numpy().astype(np.float32),
         "expected_last_hidden": result.last_hidden_state.numpy().astype(np.float32),
     }
@@ -151,9 +170,16 @@ def _patches_from_image(image: np.ndarray) -> np.ndarray:
     the token/feature ORDERING is identical either way; only the source of
     the T-axis values differs.
 
-    Conclusion: this ordering agrees exactly with hexlib's `patchify` op
-    (verified independently here, not by importing it) -- no disagreement to
-    report.
+    This expression is hand-derived to match hexlib's `patchify` op -- it is
+    NOT an independent check, because it is (deliberately) the same
+    `reshape`/`transpose`/`reshape` chain as `structural.py::_patchify_reference`,
+    just spelled with numpy instead of torch. It exists so `patches` (used
+    below to actually run the upstream model) needs no torch tensor
+    round-trip. `_patches_from_image_via_literal_upstream_chain`, below, is
+    the actual independent check: it executes torch's own
+    `permute(0, 2, 5, 3, 6, 1, 4, 7)` call with upstream's own literal axis
+    indices, not a hand-translated equivalent, and its output
+    (`patches_upstream`) is what the ordering test compares hexlib against.
     """
     c, t, h, w = image.shape
     patch = TINY["patch_size"]
@@ -164,6 +190,62 @@ def _patches_from_image(image: np.ndarray) -> np.ndarray:
     # Token axes in merge-block order: bh, bw, mh, mw. Feature axes: c, t, ph, pw.
     x = x.transpose(2, 5, 3, 6, 0, 1, 4, 7)
     return x.reshape(grid_h * grid_w, c * t * patch * patch)
+
+
+def _patches_from_image_via_literal_upstream_chain(image: np.ndarray) -> np.ndarray:
+    """The independent check `_patches_from_image` (above) is not: this runs
+    `Qwen2VLImageProcessor._preprocess`'s own torch chain --
+    `image_processing_qwen2_vl.py:196-218` --
+
+        patches = patches.reshape(batch, channel, grid_h//merge, merge, patch,
+                                   grid_w//merge, merge, patch)
+        patches = patches.permute(0, 2, 5, 3, 6, 1, 4, 7)
+        flatten_patches = (patches.unsqueeze(6)
+                                   .expand(-1, -1, -1, -1, -1, -1, temporal_patch_size, -1, -1)
+                                   .reshape(batch, grid_h*grid_w,
+                                            channel*temporal_patch_size*patch*patch))
+
+    verbatim, with upstream's own literal `permute` axis indices -- not a
+    hand-translated equivalent -- on a real torch tensor.
+
+    The real image processor never sees a genuine T axis: it processes one
+    still frame and `.unsqueeze(6).expand(..., temporal_patch_size, ...)`
+    broadcasts that single frame across every temporal slot. Our synthetic
+    `image` carries a genuinely independent T axis (two distinct random
+    frames, not one broadcast frame -- see `main`'s `image` comment), which
+    the real chain has no path for: broadcasting a duplicate is not the same
+    operation as combining two distinct frames. So the reshape+permute step
+    -- the part that decides TOKEN order and (channel, ph, pw) FEATURE order,
+    which is what this check exists to verify -- is run once per T-slice,
+    verbatim and unmodified; the two slices are then stacked on the T axis at
+    the exact position (`dim=6`, between channel and patch_h) that
+    `unsqueeze(6)` would put it. That stacking step is the only part not
+    lifted directly from upstream, because no upstream code path has ever
+    needed to combine two DIFFERENT frames -- it is the direct generalisation
+    of "broadcast one frame twice" to "place two distinct frames", which are
+    definitionally the same operation when the two frames happen to be equal.
+    Numerically verified equal to `_patches_from_image`'s hand-derived numpy
+    expression by the `assert` in `main`.
+    """
+    c, t, h, w = image.shape
+    patch = TINY["patch_size"]
+    merge = TINY["spatial_merge_size"]
+    grid_h, grid_w = h // patch, w // patch
+
+    per_t_slices = []
+    for ti in range(t):
+        frame = torch.from_numpy(image[:, ti])[None]  # [1, C, H, W] -- one real frame
+        frame = frame.reshape(1, c, grid_h // merge, merge, patch, grid_w // merge, merge, patch)
+        # image_processing_qwen2_vl.py:208, literal indices:
+        frame = frame.permute(0, 2, 5, 3, 6, 1, 4, 7)
+        # [1, gh/merge, gw/merge, mh, mw, channel, ph, pw]
+        per_t_slices.append(frame)
+    # Insert T where unsqueeze(6).expand(...) would (image_processing_qwen2_vl.py:210-212),
+    # but with two genuinely distinct per-frame values instead of one duplicated.
+    stacked = torch.stack(per_t_slices, dim=6)
+    # [1, gh/merge, gw/merge, mh, mw, channel, T, ph, pw]
+    flatten_patches = stacked.reshape(1, grid_h * grid_w, c * t * patch * patch)
+    return flatten_patches[0].numpy()
 
 
 if __name__ == "__main__":

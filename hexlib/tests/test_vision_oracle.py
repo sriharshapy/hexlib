@@ -48,7 +48,7 @@ def test_golden_file_exists_and_is_not_empty():
 
 def test_golden_carries_every_array_the_test_needs():
     z = np.load(VISION_NPZ)
-    for key in ("image", "patches", "expected_merged", "expected_last_hidden"):
+    for key in ("image", "patches", "patches_upstream", "expected_merged", "expected_last_hidden"):
         assert key in z, f"golden is missing {key!r}"
     assert any(k.startswith("param::") for k in z.files), "golden carries no weights"
 
@@ -83,10 +83,29 @@ def test_pos_embed_grid_is_mismatched_with_the_patch_grid_on_purpose():
     )
 
 
-def test_patchify_matches_the_image_processor():
-    # The same image the encoder golden was produced from -- that is what makes
-    # this and the encoder test two claims about one pipeline rather than two
-    # unrelated facts.
+def test_patchify_matches_upstreams_own_literal_permute_chain():
+    """Compares against `patches_upstream`, not `patches`.
+
+    `z["patches"]` is produced by `gen_vision_oracle.py::_patches_from_image`,
+    which is -- deliberately -- the SAME `reshape`/`transpose`/`reshape`
+    expression as hexlib's own `structural.py::_patchify_reference`, just
+    spelled in numpy instead of being hexlib's op. Comparing hexlib against
+    it would be a tautology: a wrong ordering shared by both sides (because
+    both are the one expression, copied) cancels and this test would pass
+    regardless. It would also not be rescued by the encoder differential in
+    `test_encoder_matches_upstream_within_tolerance`, for the same reason --
+    that test feeds `patches` (not `patches_upstream`) into both hexlib's
+    graph and the upstream model that produced `expected_merged`.
+
+    `z["patches_upstream"]` is different: it is produced by
+    `_patches_from_image_via_literal_upstream_chain`, which executes
+    `Qwen2VLImageProcessor._preprocess`'s own torch `reshape` -> `permute(0,
+    2, 5, 3, 6, 1, 4, 7)` chain (`image_processing_qwen2_vl.py:196-218`)
+    verbatim, with upstream's own literal permute indices -- not hexlib's
+    transpose indices, hand-translated to drop the batch axis. Comparing
+    hexlib's `patchify` op against THAT is a real, independent check on
+    merge-block token ordering.
+    """
     z = np.load(VISION_NPZ)
     from hexlib.graph.ops import get
 
@@ -100,7 +119,7 @@ def test_patchify_matches_the_image_processor():
             "grid_w": TINY_CFG.grid,
         },
     )
-    np.testing.assert_allclose(out, z["patches"], rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(out, z["patches_upstream"], rtol=1e-6, atol=1e-6)
 
 
 def test_encoder_matches_upstream_within_tolerance():
