@@ -48,7 +48,7 @@ def test_returns_only_the_declared_outputs():
 def test_missing_feed_is_an_err_naming_the_tensor():
     out = eager.run(_linear_graph(), {"x": np.zeros((2, 3), np.float32)})
     assert isinstance(out, Err)
-    assert "w" in out.reason or "w" in out.detail
+    assert "'w'" in out.detail
 
 
 def test_wrong_feed_shape_is_an_err_naming_both_shapes():
@@ -155,3 +155,33 @@ def test_q4_0_tensors_are_fed_as_fp32_in_the_oracle():
     )
     assert not isinstance(out, Err)
     np.testing.assert_allclose(out["y"], np.full((2, 4), 32.0))
+
+
+def test_ragged_feed_is_an_err():
+    # A ragged nested list cannot be converted to a regular array.
+    out = eager.run(
+        _linear_graph(),
+        {
+            "x": [[1, 2, 3], [4, 5]],  # ragged, not rectangular
+            "w": np.zeros((3, 4), np.float32),
+            "b": np.zeros(4, np.float32),
+        },
+    )
+    assert isinstance(out, Err)
+    assert "'x'" in out.detail
+    assert "ValueError" in out.detail or "could not convert" in out.detail
+
+
+def test_non_numeric_feed_is_an_err():
+    # A feed of strings cannot be converted to a numeric array.
+    out = eager.run(
+        _linear_graph(),
+        {
+            "x": [["a", "b", "c"], ["d", "e", "f"]],
+            "w": np.zeros((3, 4), np.float32),
+            "b": np.zeros(4, np.float32),
+        },
+    )
+    assert isinstance(out, Err)
+    assert "'x'" in out.detail
+    assert "ValueError" in out.detail or "could not convert" in out.detail

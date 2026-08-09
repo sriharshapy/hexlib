@@ -57,14 +57,26 @@ def run(
                 f"supplied: {sorted(feeds)}",
             )
         spec = graph.tensor(name)
-        array = np.asarray(feeds[name])
+        try:
+            array = np.asarray(feeds[name])
+        except (ValueError, TypeError) as e:
+            return Err(
+                "feed conversion failed",
+                f"tensor {name!r}: {type(e).__name__}: {e}",
+            )
         if tuple(array.shape) != spec.shape:
             return Err(
                 "feed shape mismatch",
                 f"tensor {name!r} was declared {spec.shape} but the feed has shape "
                 f"{tuple(array.shape)}",
             )
-        env[name] = array.astype(NUMPY_DTYPE[spec.dtype], copy=False)
+        try:
+            env[name] = array.astype(NUMPY_DTYPE[spec.dtype], copy=False)
+        except (ValueError, TypeError) as e:
+            return Err(
+                "feed dtype conversion failed",
+                f"tensor {name!r}: {type(e).__name__}: {e}",
+            )
 
     for op in graph.ops:
         try:
@@ -96,13 +108,25 @@ def run(
 
         for name, value in zip(op.outputs, results):
             spec = graph.tensor(name)
-            value = np.asarray(value)
+            try:
+                value = np.asarray(value)
+            except (ValueError, TypeError) as e:
+                return Err(
+                    "op result conversion failed",
+                    f"op {op.id} ({op.kind}) output {name!r}: {type(e).__name__}: {e}",
+                )
             if tuple(value.shape) != spec.shape:
                 return Err(
                     "op result shape mismatch",
                     f"op {op.id} ({op.kind}) output {name!r} is declared {spec.shape} "
                     f"but the reference produced {tuple(value.shape)}",
                 )
-            env[name] = value.astype(NUMPY_DTYPE[spec.dtype], copy=False)
+            try:
+                env[name] = value.astype(NUMPY_DTYPE[spec.dtype], copy=False)
+            except (ValueError, TypeError) as e:
+                return Err(
+                    "op result dtype conversion failed",
+                    f"op {op.id} ({op.kind}) output {name!r}: {type(e).__name__}: {e}",
+                )
 
     return {name: env[name] for name in graph.outputs}
