@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hexlib.graph.opdefs  # noqa: F401
 from hexlib.graph.dma import (
+    WEIGHT_BUFFERS,
     WEIGHT_CHUNK_BYTES,
     insert_transfers,
     matmul_working_set,
@@ -83,11 +84,12 @@ def test_matmul_working_set_is_far_below_the_whole_weight():
     y = Tensor("y", "fp16", (256, 3072))
     ws = matmul_working_set((x, w), (y,), {})
     # At these shapes activation+output already exceed a quarter of the
-    # weight, so the achievable bound is "below the whole weight", not below
-    # a quarter of it -- the activation and output are the same size
-    # regardless of q4_0 vs fp16 weight, only the weight's own bytes change.
-    assert ws < w.nbytes, f"working set {ws} still counts the whole weight"
-    assert ws >= x.nbytes + y.nbytes
+    # weight, so "below w.nbytes // 4" is unsatisfiable by any
+    # implementation (3,146,880 >= 1,327,104). Pin the actual property
+    # instead: the weight contributes exactly two chunks, nothing more --
+    # a regression that folds in even a third of the real weight
+    # (1.77 MB) would still slip past a loose "< w.nbytes" bound.
+    assert ws - (x.nbytes + y.nbytes) == WEIGHT_CHUNK_BYTES * WEIGHT_BUFFERS
 
 
 def test_the_registered_matmul_working_set_uses_the_tiled_estimate():
@@ -179,7 +181,39 @@ def test_plan_problems_catches_a_working_set_over_budget():
 
 def test_plan_problems_is_empty_on_a_well_formed_plan():
     g, slots, (steps, _) = _steps_for(build_vision_encoder(qwen35_at(256)))
-    assert plan_problems(steps, g, slots) == []
+    # Invariant 5 needs a real budget to actually run; a plan certified
+    # "well-formed" with no budget passed would never exercise it.
+    assert plan_problems(steps, g, slots, budget=BUDGET) == []
+
+
+def test_plan_problems_catches_overlapping_transfers():
+    # Invariant 1's DMA-side analogue: two transfers resident at once must
+    # not share a VTCM address, or the second silently overwrites the
+    # first before its op reads it.
+    g, slots, (steps, _) = _steps_for(_matmul_graph())
+    (step,) = [s for s in steps if s.op is not None]
+    (weight_transfer,) = step.dma_in
+    collider = type(weight_transfer)(
+        id=weight_transfer.id + 1000,
+        tensor="collider",
+        direction="in",
+        vtcm_offset=weight_transfer.vtcm_offset,
+        nbytes=weight_transfer.nbytes,
+    )
+    broken = tuple(
+        type(s)(
+            op=s.op,
+            dma_in=s.dma_in + (collider,),
+            dma_wait=s.dma_wait + (collider.id,),
+            dma_out=s.dma_out,
+            tiling=s.tiling,
+        )
+        if s is step
+        else s
+        for s in steps
+    )
+    problems = plan_problems(broken, g, slots)
+    assert problems and "overlapping" in problems[0]
 
 
 def test_a_budget_too_small_for_two_chunks_is_an_err():

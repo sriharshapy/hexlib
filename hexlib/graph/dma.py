@@ -12,7 +12,7 @@ how much pressure there is, not whether the mechanism is needed.
 """
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from hexlib.graph.ir import Graph, Op
 from hexlib.graph.layout import Buffer, Layout, Placement, check_layouts
@@ -60,7 +60,8 @@ def insert_transfers(
 
     high_water = max((s.end for s in slots), default=0)
     scratch_base = _align(high_water)
-    if scratch_base + WEIGHT_CHUNK_BYTES * WEIGHT_BUFFERS > budget:
+    weight_region_bytes = WEIGHT_CHUNK_BYTES * WEIGHT_BUFFERS
+    if scratch_base + weight_region_bytes > budget:
         return Err(
             "no VTCM left for weight streaming",
             f"activations reach {high_water} bytes and the budget is {budget}; "
@@ -68,40 +69,49 @@ def insert_transfers(
             f"{WEIGHT_CHUNK_BYTES} bytes",
         )
 
+    # Every const tensor's VTCM offset, decided once up front. A tiled
+    # weight rotates through the double-buffered region at `scratch_base`;
+    # every other const is small enough to move once and stay resident for
+    # the rest of the plan, so each gets its OWN offset past that region.
+    # Sharing an offset between two simultaneously-resident buffers means the
+    # second transfer silently overwrites the first before its op reads it.
+    offsets, const_region_end = _plan_offsets(graph, scratch_base)
+    if const_region_end > budget:
+        const_region_start = _align(scratch_base + weight_region_bytes)
+        return Err(
+            "no VTCM left for the plan's resident consts",
+            f"the non-tiled consts need {const_region_end - const_region_start} "
+            f"bytes past the weight buffer, reaching {const_region_end}, but the "
+            f"budget is {budget}",
+        )
+
     steps: list[Step] = []
     moved = 0
     next_id = 0
-    # Every const is DDR-resident and reaches its first reader by DMA exactly
-    # once -- after that it stays put, so later ops that read the same const
-    # need no further transfer. Only a matmul/matmul_epilogue's 2D+ weight is
-    # big enough to need the chunked, double-buffered treatment below; a
-    # bias, a LayerNorm affine param, the position embedding and the RoPE
-    # tables are all small enough to move in one shot.
+    # Tracks which non-weight consts already got their one-shot transfer, so
+    # a tensor read by many ops (e.g. the RoPE cos/sin tables, read by every
+    # block) is moved once, not once per reader.
     transferred: set[str] = set()
 
     for op in graph.ops:
-        weights = [
-            graph.tensor(name)
-            for name in op.inputs
-            if graph.tensor(name).const and len(graph.tensor(name).shape) >= 2
-        ]
+        problems = check_layouts(op.kind, _placements_for(graph, op, offsets))
+        if problems:
+            return Err("layout mismatch at plan time", "\n".join(problems))
+
+        weight_name = _weight_name(graph, op)
         tiled_transfer: Transfer | None = None
         tiling: Tiling | None = None
 
-        if op.kind in TILED_KINDS and weights:
-            weight = weights[0]
-            problems = check_layouts(op.kind, _placements_for(graph, op, scratch_base))
-            if problems:
-                return Err("layout mismatch at plan time", "\n".join(problems))
-
+        if weight_name is not None:
+            weight = graph.tensor(weight_name)
             total = weight.nbytes
             count = max(1, -(-total // WEIGHT_CHUNK_BYTES))
             per_chunk = min(WEIGHT_CHUNK_BYTES, total)
             tiled_transfer = Transfer(
                 id=next_id,
-                tensor=weight.name,
+                tensor=weight_name,
                 direction="in",
-                vtcm_offset=scratch_base,
+                vtcm_offset=offsets[weight_name],
                 nbytes=per_chunk,
             )
             next_id += 1
@@ -115,10 +125,11 @@ def insert_transfers(
                 axis="n", tile_elements=tile_elements, count=count, buffers=WEIGHT_BUFFERS
             )
             moved += per_chunk * count
-            transferred.add(weight.name)
 
         extra_transfers: list[Transfer] = []
         for name in op.inputs:
+            if name == weight_name:
+                continue
             t = graph.tensor(name)
             if not t.const or name in transferred:
                 continue
@@ -127,7 +138,7 @@ def insert_transfers(
                     id=next_id,
                     tensor=name,
                     direction="in",
-                    vtcm_offset=scratch_base,
+                    vtcm_offset=offsets[name],
                     nbytes=t.nbytes,
                 )
             )
@@ -160,7 +171,51 @@ def _align(value: int, to: int = 128) -> int:
     return ((value + to - 1) // to) * to
 
 
-def _placements_for(graph: Graph, op: Op, scratch_base: int) -> tuple[Placement, ...]:
+def _weight_name(graph: Graph, op: Op) -> str | None:
+    """The 2D+ const input this op streams in chunks, if it has one."""
+    if op.kind not in TILED_KINDS:
+        return None
+    for name in op.inputs:
+        t = graph.tensor(name)
+        if t.const and len(t.shape) >= 2:
+            return name
+    return None
+
+
+def _plan_offsets(graph: Graph, scratch_base: int) -> tuple[dict[str, int], int]:
+    """VTCM offset for every const tensor this pass will transfer.
+
+    Every tiled weight shares `scratch_base`: that region is a rotating
+    double buffer, reused chunk after chunk and op after op, which is what
+    `Tiling.buffers=2` means. Every other const is resident for the whole
+    plan once transferred, so each is bump-allocated its own offset past the
+    weight region, in first-use order -- matching the order `insert_transfers`
+    itself schedules the one-shot transfers in.
+
+    Returns the offset map and the bump pointer's final position (i.e. one
+    past the last const's region), so the caller can check it against budget.
+    """
+    const_region_start = _align(scratch_base + WEIGHT_CHUNK_BYTES * WEIGHT_BUFFERS)
+    offsets: dict[str, int] = {}
+    offset = const_region_start
+    for op in graph.ops:
+        weight_name = _weight_name(graph, op)
+        if weight_name is not None:
+            offsets.setdefault(weight_name, scratch_base)
+        for name in op.inputs:
+            if name == weight_name or name in offsets:
+                continue
+            t = graph.tensor(name)
+            if not t.const:
+                continue
+            offsets[name] = offset
+            offset = _align(offset + t.nbytes)
+    return offsets, offset
+
+
+def _placements_for(
+    graph: Graph, op: Op, offsets: Mapping[str, int]
+) -> tuple[Placement, ...]:
     """What each input's placement will be once this pass has run.
 
     A const q4_0 weight is repacked on the way in -- that is what makes the
@@ -178,7 +233,7 @@ def _placements_for(graph: Graph, op: Op, scratch_base: int) -> tuple[Placement,
                 layout=layout,
                 perm=tuple(range(len(t.shape))),
                 buffer=Buffer.VTCM,
-                offset=scratch_base if t.const else 0,
+                offset=offsets.get(name, 0) if t.const else 0,
             )
         )
     return tuple(out)
@@ -194,6 +249,14 @@ def plan_problems(
 
     3. Every read of a tensor is preceded by a write or a completed DMA-in.
     5. Every op's working_set is satisfied at the point it runs.
+
+    Also checks that no two transfers active in the same step target
+    overlapping VTCM byte ranges -- the DMA-side analogue of the overlap
+    check `allocation_problems` already does for VTCM slots. A `Slot` has a
+    lifetime `allocation_problems` can compare; a `Transfer` does not, so
+    this is scoped to "within one step" rather than across the whole plan --
+    still enough to catch two consts landing at the same address because
+    neither was given its own offset.
     """
     from hexlib.graph.ops import REGISTRY
 
@@ -202,6 +265,19 @@ def plan_problems(
     seen_transfers: set[str] = set()
 
     for i, step in enumerate(steps):
+        concurrent = step.dma_in + step.dma_out
+        for a_idx, a in enumerate(concurrent):
+            for b in concurrent[a_idx + 1 :]:
+                if a.vtcm_offset < b.vtcm_offset + b.nbytes and b.vtcm_offset < (
+                    a.vtcm_offset + a.nbytes
+                ):
+                    problems.append(
+                        f"step {i}: transfers {a.id} ({a.tensor!r}) and {b.id} "
+                        f"({b.tensor!r}) both target overlapping VTCM ranges "
+                        f"[{a.vtcm_offset}, {a.vtcm_offset + a.nbytes}) and "
+                        f"[{b.vtcm_offset}, {b.vtcm_offset + b.nbytes})"
+                    )
+
         awaited = set(step.dma_wait)
         for transfer in step.dma_in:
             if transfer.id in awaited:
