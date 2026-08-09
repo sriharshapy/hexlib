@@ -1,0 +1,164 @@
+"""The kernel directory: hexlib's unit of contribution, review, and verification.
+
+A kernel is a directory, not a file. It carries its own scalar baseline, its own
+harness, its own near-miss variants, and a spec — so a contribution is one new
+directory, CI can check it mechanically, and a reviewer reads a generated table
+instead of four hundred lines of intrinsics.
+
+The near-miss requirement is deliberate and unusual: a PR must include at least
+one plausible-but-wrong variant that the harness catches. A harness that passes
+the kernel proves nothing until it is also shown to FAIL something close by.
+"""
+from __future__ import annotations
+
+import glob
+import json
+import os
+from dataclasses import dataclass, field
+from typing import Any
+
+REQUIRED_FILES: tuple[str, ...] = (
+    "kernel.c",
+    "kernel_api.h",
+    "baseline.c",
+    "harness.c",
+    "spec.json",
+)
+
+KNOWN_CAPS = frozenset({"hmx"})
+KNOWN_MECHANISMS = frozenset({"hvx", "hmx", "dma", "vtcm", "l2fetch", "scalar"})
+
+
+@dataclass(frozen=True)
+class KernelSpec:
+    task_id: str
+    dtype: str
+    caps: list[str] = field(default_factory=list)
+    mechanisms: list[str] = field(default_factory=list)
+    params: dict[str, Any] = field(default_factory=dict)
+    expert_kernel_cycles: int | None = None
+    tolerance: str = "exact"
+    tags: list[str] = field(default_factory=list)
+
+
+def load_spec(kernel_dir: str) -> KernelSpec:
+    path = os.path.join(kernel_dir, "spec.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        raise ValueError(f"{path} does not exist")
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{path} is not valid JSON: {e}")
+    if "task_id" not in raw or "dtype" not in raw:
+        raise ValueError(f"{path} must contain 'task_id' and 'dtype'")
+    known = {f.name for f in KernelSpec.__dataclass_fields__.values()}
+    return KernelSpec(**{k: v for k, v in raw.items() if k in known})
+
+
+def nearmiss_files(kernel_dir: str) -> list[str]:
+    return sorted(glob.glob(os.path.join(kernel_dir, "nearmiss_*.c")))
+
+
+def validate_dir(kernel_dir: str) -> list[str]:
+    """Return a list of problems. Empty means valid. Never raises."""
+    problems: list[str] = []
+
+    if not os.path.isdir(kernel_dir):
+        return [f"{kernel_dir} is not a directory"]
+
+    for name in REQUIRED_FILES:
+        if not os.path.isfile(os.path.join(kernel_dir, name)):
+            problems.append(f"missing required file: {name}")
+
+    if not nearmiss_files(kernel_dir):
+        problems.append(
+            "missing near-miss: at least one nearmiss_*.c is required, so the "
+            "harness is shown to reject a plausible wrong implementation"
+        )
+
+    try:
+        spec = load_spec(kernel_dir)
+    except ValueError as e:
+        problems.append(str(e))
+        return problems
+
+    expected_id = os.path.basename(os.path.normpath(kernel_dir))
+    if spec.task_id != expected_id:
+        problems.append(
+            f"spec.json task_id is {spec.task_id!r} but the directory is "
+            f"{expected_id!r}; they must match"
+        )
+    for cap in spec.caps:
+        if cap not in KNOWN_CAPS:
+            problems.append(f"unknown cap {cap!r}; known caps: {sorted(KNOWN_CAPS)}")
+    for mech in spec.mechanisms:
+        if mech not in KNOWN_MECHANISMS:
+            problems.append(
+                f"unknown mechanism {mech!r}; known: {sorted(KNOWN_MECHANISMS)}"
+            )
+    return problems
+
+
+_SPEC_TEMPLATE = {
+    "task_id": "",
+    "dtype": "fp16",
+    "caps": [],
+    "mechanisms": ["hvx"],
+    "params": {},
+    "expert_kernel_cycles": None,
+    "tolerance": "hexlib_close_f16",
+    "tags": [],
+}
+
+_STUBS = {
+    "kernel.c": (
+        '#include "kernel_api.h"\n\n'
+        "/* Your kernel. Must be extern \"C\" — without it the symbol mangles and\n"
+        " * both harness linkage and the anti-cheat's symbol scoping break. */\n"
+        'extern "C" void {name}(void) {{\n}}\n'
+    ),
+    "kernel_api.h": (
+        "#ifndef HEXLIB_KERNEL_API_H\n#define HEXLIB_KERNEL_API_H\n"
+        "typedef __fp16 hexlib_hf;\n\n"
+        "/* Document the exact mathematical contract here, including shapes,\n"
+        " * dtypes, and where the reference rounds. */\n"
+        'extern "C" void {name}(void);\n'
+        "#endif\n"
+    ),
+    "baseline.c": (
+        '#include "kernel_api.h"\n\n'
+        "/* Scalar reference. Correct and obvious, never fast. */\n"
+        'extern "C" void {name}_baseline(void) {{\n}}\n'
+    ),
+    "harness.c": (
+        '#include "hexlib/hexlib_harness.h"\n#include "kernel_api.h"\n\n'
+        "int main(void) {{\n    return 0;\n}}\n"
+    ),
+    "nearmiss_plausible_bug.c": (
+        '#include "kernel_api.h"\n\n'
+        "/* A plausible WRONG implementation the harness must reject. Model it on a\n"
+        " * real mistake — a skipped rescale, a wrong axis, a missing epsilon. */\n"
+        'extern "C" void {name}(void) {{\n}}\n'
+    ),
+    "README.md": "# {name}\n\nWhat this kernel computes, and why it is fast.\n",
+}
+
+
+def scaffold(kernels_root: str, name: str) -> str:
+    """Create a conforming kernel directory. Refuses to overwrite."""
+    target = os.path.join(kernels_root, name)
+    if os.path.exists(target):
+        raise FileExistsError(f"{target} already exists")
+    os.makedirs(target)
+
+    for filename, template in _STUBS.items():
+        with open(os.path.join(target, filename), "w", encoding="utf-8") as f:
+            f.write(template.format(name=name))
+
+    spec = dict(_SPEC_TEMPLATE)
+    spec["task_id"] = name
+    with open(os.path.join(target, "spec.json"), "w", encoding="utf-8") as f:
+        json.dump(spec, f, indent=2)
+        f.write("\n")
+    return target
