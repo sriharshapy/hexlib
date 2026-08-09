@@ -15,6 +15,47 @@ def test_tensor_is_frozen():
         t.name = "y"
 
 
+def test_op_coerces_list_inputs_to_tuple():
+    """Op coerces list inputs/outputs to tuple and is immune to list mutation."""
+    inputs_list = ["x", "y"]
+    outputs_list = ["z"]
+    op = Op(id=0, kind="add", inputs=inputs_list, outputs=outputs_list, attrs={})
+
+    # Original lists can be mutated without affecting the op
+    inputs_list.append("mutated")
+    outputs_list[0] = "also_mutated"
+
+    # Op still has the original values as a tuple
+    assert op.inputs == ("x", "y")
+    assert op.outputs == ("z",)
+
+
+def test_graph_coerces_list_fields_to_tuple():
+    """Graph coerces ops/inputs/outputs lists to tuples and is immune to list mutation."""
+    ops_list = [Op(id=0, kind="scale", inputs=("x",), outputs=("y",), attrs={"factor": 2.0})]
+    inputs_list = ["x"]
+    outputs_list = ["y"]
+
+    x = _t("x", (4,))
+    y = _t("y", (4,))
+    g = Graph(
+        tensors={"x": x, "y": y},
+        ops=ops_list,
+        inputs=inputs_list,
+        outputs=outputs_list,
+    )
+
+    # Original lists can be mutated without affecting the graph
+    ops_list.append(Op(id=1, kind="scale", inputs=("y",), outputs=("z",), attrs={}))
+    inputs_list.append("mutated")
+    outputs_list[0] = "also_mutated"
+
+    # Graph still has the original values as tuples
+    assert len(g.ops) == 1
+    assert g.inputs == ("x",)
+    assert g.outputs == ("y",)
+
+
 def test_tensor_rejects_unknown_dtype():
     with pytest.raises(ValueError) as e:
         _t("x", (4,), dtype="bfloat16")

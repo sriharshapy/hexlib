@@ -93,6 +93,21 @@ class Op:
     def __post_init__(self) -> None:
         if not self.kind:
             raise ValueError(f"op {self.id} requires a non-empty kind")
+
+        # Coerce and validate inputs to tuple of strings
+        inputs_tuple = tuple(self.inputs) if not isinstance(self.inputs, tuple) else self.inputs
+        for i, val in enumerate(inputs_tuple):
+            if not isinstance(val, str):
+                raise TypeError(f"op {self.id}: inputs[{i}] must be str, got {type(val).__name__}")
+        object.__setattr__(self, "inputs", inputs_tuple)
+
+        # Coerce and validate outputs to tuple of strings
+        outputs_tuple = tuple(self.outputs) if not isinstance(self.outputs, tuple) else self.outputs
+        for i, val in enumerate(outputs_tuple):
+            if not isinstance(val, str):
+                raise TypeError(f"op {self.id}: outputs[{i}] must be str, got {type(val).__name__}")
+        object.__setattr__(self, "outputs", outputs_tuple)
+
         for key, value in self.attrs.items():
             _check_attr_value(key, value)
         object.__setattr__(self, "attrs", MappingProxyType(dict(self.attrs)))
@@ -107,6 +122,27 @@ class Graph:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tensors", MappingProxyType(dict(self.tensors)))
+
+        # Coerce and validate ops to tuple of Op instances
+        ops_tuple = tuple(self.ops) if not isinstance(self.ops, tuple) else self.ops
+        for i, val in enumerate(ops_tuple):
+            if not isinstance(val, Op):
+                raise TypeError(f"ops[{i}] must be Op, got {type(val).__name__}")
+        object.__setattr__(self, "ops", ops_tuple)
+
+        # Coerce and validate inputs to tuple of strings
+        inputs_tuple = tuple(self.inputs) if not isinstance(self.inputs, tuple) else self.inputs
+        for i, val in enumerate(inputs_tuple):
+            if not isinstance(val, str):
+                raise TypeError(f"inputs[{i}] must be str, got {type(val).__name__}")
+        object.__setattr__(self, "inputs", inputs_tuple)
+
+        # Coerce and validate outputs to tuple of strings
+        outputs_tuple = tuple(self.outputs) if not isinstance(self.outputs, tuple) else self.outputs
+        for i, val in enumerate(outputs_tuple):
+            if not isinstance(val, str):
+                raise TypeError(f"outputs[{i}] must be str, got {type(val).__name__}")
+        object.__setattr__(self, "outputs", outputs_tuple)
 
     def tensor(self, name: str) -> Tensor:
         try:
