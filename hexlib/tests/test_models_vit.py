@@ -88,6 +88,31 @@ def test_no_standalone_prenorm_or_postnorm():
     assert kinds[last_ln - 1] == "add", "a standalone post-norm crept in after the blocks"
 
 
+def test_residual_adds_read_the_block_input_not_the_norm_output():
+    # Both operands of a residual add have the same shape, so add(a, proj)
+    # (the normalized tensor) instead of add(x, proj) (the block's actual
+    # input) passes every shape/structural check and the finite-output
+    # end-to-end test, and would only surface later as an unexplained
+    # numerical mismatch. Pin the wiring directly, on the op's inputs.
+    cfg = _tiny()
+    g = build_vision_encoder(cfg)
+    ops_by_output = {op.outputs[0]: op for op in g.ops}
+
+    attn_resid = ops_by_output["blk0.resid1"]
+    assert attn_resid.kind == "add"
+    assert "x0" in attn_resid.inputs, "attention residual must add block 0's own input"
+    assert "blk0.ln1.out" not in attn_resid.inputs, (
+        "attention residual reads the normalized tensor instead of the block input"
+    )
+
+    mlp_resid = ops_by_output["blk0.resid2"]
+    assert mlp_resid.kind == "add"
+    assert "blk0.resid1" in mlp_resid.inputs, "MLP residual must add the post-attention stream"
+    assert "blk0.ln2.out" not in mlp_resid.inputs, (
+        "MLP residual reads the normalized tensor instead of the post-attention stream"
+    )
+
+
 def test_qkv_is_three_separate_matmuls_not_one():
     cfg = _tiny()
     g = build_vision_encoder(cfg)
@@ -152,6 +177,30 @@ def test_non_divisible_grid_is_an_err_not_a_crash():
     result = build_vision_encoder(cfg)
     assert isinstance(result, Err)
     assert "merge" in result.detail or "divisible" in result.detail
+
+
+def test_zero_patch_size_is_an_err_not_a_zerodivisionerror():
+    cfg = VitConfig(**{**_tiny().__dict__, "patch_size": 0})
+    result = build_vision_encoder(cfg)
+    assert isinstance(result, Err)
+    assert "patch_size" in result.detail
+    assert "0" in result.detail
+
+
+def test_zero_num_heads_is_an_err_not_a_zerodivisionerror():
+    cfg = VitConfig(**{**_tiny().__dict__, "num_heads": 0})
+    result = build_vision_encoder(cfg)
+    assert isinstance(result, Err)
+    assert "num_heads" in result.detail
+    assert "0" in result.detail
+
+
+def test_zero_spatial_merge_size_is_an_err_not_a_zerodivisionerror():
+    cfg = VitConfig(**{**_tiny().__dict__, "spatial_merge_size": 0})
+    result = build_vision_encoder(cfg)
+    assert isinstance(result, Err)
+    assert "spatial_merge_size" in result.detail
+    assert "0" in result.detail
 
 
 def test_qwen35_config_matches_the_checkpoint():

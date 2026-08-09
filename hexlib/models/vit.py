@@ -214,18 +214,28 @@ def _layernorm(
 
 def _config_problems(cfg: VitConfig) -> list[str]:
     problems: list[str] = []
+    # Guard every divisor before it is used in a %, so a zero or negative
+    # field is a reported Err, never a raw ZeroDivisionError. `build_vision_encoder`
+    # must never raise on a bad config.
+    if cfg.patch_size <= 0:
+        problems.append(f"patch_size {cfg.patch_size} must be positive")
+        return problems
     if cfg.image_size % cfg.patch_size:
         problems.append(
             f"image_size {cfg.image_size} is not divisible by patch_size {cfg.patch_size}"
         )
         return problems
-    if cfg.grid % cfg.spatial_merge_size:
+    if cfg.spatial_merge_size <= 0:
+        problems.append(f"spatial_merge_size {cfg.spatial_merge_size} must be positive")
+    elif cfg.grid % cfg.spatial_merge_size:
         problems.append(
             f"patch grid {cfg.grid}x{cfg.grid} is not divisible by spatial_merge_size "
             f"{cfg.spatial_merge_size}; the merger is a pure reshape and needs whole "
             "merge blocks"
         )
-    if cfg.hidden_size % cfg.num_heads:
+    if cfg.num_heads <= 0:
+        problems.append(f"num_heads {cfg.num_heads} must be positive")
+    elif cfg.hidden_size % cfg.num_heads:
         problems.append(
             f"hidden_size {cfg.hidden_size} is not divisible by num_heads {cfg.num_heads}"
         )
