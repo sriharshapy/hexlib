@@ -15,8 +15,10 @@ def test_headers_are_present():
 
 
 def test_no_header_references_ggml():
+    headers = list(HVX_DIR.glob("*.h"))
+    assert headers, f"no headers found in {HVX_DIR} — the vendored set is missing"
     offenders = [
-        p.name for p in HVX_DIR.glob("*.h")
+        p.name for p in headers
         if "ggml" in p.read_text(encoding="utf-8", errors="replace").lower()
     ]
     assert offenders == [], f"vendored headers must stay ggml-free: {offenders}"
