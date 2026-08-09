@@ -1,18 +1,15 @@
 # Attribution
 
-## The license question is unresolved
+## hexlib is MIT licensed
 
-hexlib's own license has not been chosen. The open question (MIT versus Apache-2.0,
-recorded in the design spec's open questions) is the maintainer's to decide and is
-still open. There is deliberately **no `LICENSE` file in this repository**, and no
-source file carries a license header. Do not read the absence of a `LICENSE` file as
-"unlicensed and therefore free to use however you like," and do not read anything in
-this repository as implying a license has been chosen.
+See [`LICENSE`](LICENSE). MIT was chosen over Apache-2.0 for compatibility with the
+code hexlib vendors — llama.cpp's ggml-hexagon headers are MIT, and matching licenses
+keeps contributions able to flow back upstream, which is a stated goal of the project.
+The trade accepted in doing so is that MIT carries no explicit patent grant.
 
-That said, hexlib **vendors MIT-licensed code, which requires attribution regardless
-of what hexlib's own license ends up being.** MIT's attribution requirement travels
-with the code; it does not go away because the surrounding project's license is
-undecided. The rest of this document is that attribution.
+hexlib **vendors MIT-licensed code, which requires attribution independently of
+hexlib's own license.** MIT's attribution requirement travels with the code. The rest
+of this document is that attribution.
 
 ## Vendored: ggml-hexagon HVX headers (MIT)
 

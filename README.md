@@ -90,7 +90,6 @@ docs/hardware/     measured hardware notes (HMX int8, simulator accuracy)
 
 ## License
 
-Unresolved. hexlib vendors MIT-licensed code (see `ATTRIBUTION.md`) and no license
-has been chosen for hexlib's own code yet. There is no `LICENSE` file in this
-repository; do not treat the absence of one as permission, and do not treat any
-license as decided.
+[MIT](LICENSE). hexlib also vendors MIT-licensed code from llama.cpp's ggml-hexagon
+backend, which carries its own attribution requirement — see
+[`ATTRIBUTION.md`](ATTRIBUTION.md).
