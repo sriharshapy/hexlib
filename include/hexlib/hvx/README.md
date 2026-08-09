@@ -48,3 +48,15 @@ internal dependencies:
 - hex-fastdiv.h
 - hex-dump.h
 - hex-common.h
+
+## These headers are GNU C
+
+`hex-utils.h` uses the `asm` keyword and `void *` arithmetic. Both are GNU C
+extensions and both are hard errors in C++, so these headers cannot be compiled
+by a C++ driver. hexlib builds kernels with `hexagon-clang -std=gnu11`, which is
+what they were written for.
+
+They also need the SDK's qurt and `incs` directories on the include path
+(`toolchain.sdk_include_dirs`). Including them does not create a QuRT runtime
+dependency: a standalone simulator ELF using `hvx-norm.h` links and runs with no
+QuRT present, verified on `hexagon-sim`.

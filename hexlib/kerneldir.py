@@ -147,22 +147,22 @@ _SPEC_TEMPLATE = {
 _STUBS = {
     "kernel.c": (
         '#include "kernel_api.h"\n\n'
-        "/* Your kernel. Must be extern \"C\" — without it the symbol mangles and\n"
-        " * both harness linkage and the anti-cheat's symbol scoping break. */\n"
-        'extern "C" void {name}(void) {{\n}}\n'
+        "/* Your kernel. Kernels are GNU C: no name mangling, so the harness\n"
+        " * links against exactly the symbol you declare here. */\n"
+        "void {name}(void) {{\n}}\n"
     ),
     "kernel_api.h": (
         "#ifndef HEXLIB_KERNEL_API_H\n#define HEXLIB_KERNEL_API_H\n"
         "typedef __fp16 hexlib_hf;\n\n"
         "/* Document the exact mathematical contract here, including shapes,\n"
         " * dtypes, and where the reference rounds. */\n"
-        'extern "C" void {name}(void);\n'
+        "void {name}(void);\n"
         "#endif\n"
     ),
     "baseline.c": (
         '#include "kernel_api.h"\n\n'
         "/* Scalar reference. Correct and obvious, never fast. */\n"
-        'extern "C" void {name}_baseline(void) {{\n}}\n'
+        "void {name}_baseline(void) {{\n}}\n"
     ),
     "harness.c": (
         '#include "hexlib/hexlib_harness.h"\n#include "kernel_api.h"\n\n'
@@ -172,7 +172,7 @@ _STUBS = {
         '#include "kernel_api.h"\n\n'
         "/* A plausible WRONG implementation the harness must reject. Model it on a\n"
         " * real mistake — a skipped rescale, a wrong axis, a missing epsilon. */\n"
-        'extern "C" void {name}(void) {{\n}}\n'
+        "void {name}(void) {{\n}}\n"
     ),
     "README.md": "# {name}\n\nWhat this kernel computes, and why it is fast.\n",
 }

@@ -32,12 +32,18 @@ TIMING_MODE = True
 BUS_PENALTY = 75
 BUS_RATIO = 2
 
-CXX_STD = "c++17"
-COMPILER = "hexagon-clang++"
+# GNU C, not C++. The pin here was inherited from a benchmark harness and was
+# never load-bearing: all 351 experts in the source corpus are plain C, and
+# building one both ways produces an identical instruction stream (only the
+# mangled symbol name differs). Meanwhile the vendored ggml-hexagon headers
+# REQUIRE GNU C -- hex-utils.h uses the `asm` keyword and void* arithmetic,
+# which are errors in C++ -- so C is what makes that silicon-proven math
+# library usable at all. C also removes name mangling, and with it the whole
+# class of harness-linkage bugs that `extern "C"` exists to avoid.
+STD = "gnu11"
+COMPILER = "hexagon-clang"
 
-# Shared by the harness+kernel link and the kernel-only object used for ELF
-# detection, so the two compiles cannot drift and disagree about what was judged.
-HVX_CFLAGS = [f"-m{DSP_ARCH}", "-mhvx", "-mhvx-length=128B", f"-std={CXX_STD}", "-O2"]
+HVX_CFLAGS = [f"-m{DSP_ARCH}", "-mhvx", "-mhvx-length=128B", f"-std={STD}", "-O2"]
 
 SIM_TIMEOUT_S = 60
 # An XL kernel gets more time, but this still kills genuine infinite loops.
@@ -64,6 +70,33 @@ def cflags_for_caps(caps: list[str]) -> list[str]:
 
 def sim_flags_for_caps(caps: list[str]) -> list[str]:
     return ["--mhmx", "2"] if "hmx" in caps else []
+
+
+def sdk_include_dirs(sdk_root: str, arch: str = DSP_ARCH) -> list[str]:
+    """Include directories the vendored ggml-hexagon headers need.
+
+    `hex-utils.h` includes <qurt.h> and <qurt_memory.h>, and `hex-dump.h`
+    includes <HAP_farf.h>. These resolve inside the SDK but outside the
+    toolchain bin directory, and the qurt path is arch-specific. Including them
+    does NOT drag in a QuRT runtime dependency: a standalone simulator ELF using
+    hvx-norm.h links and runs with no QuRT present.
+    """
+    qurt = os.path.join(sdk_root, "rtos", "qurt", f"compute{arch}", "include")
+    dirs = [
+        os.path.join(qurt, "qurt"),
+        os.path.join(qurt, "posix"),
+        os.path.join(sdk_root, "incs"),
+        os.path.join(sdk_root, "incs", "stddef"),
+    ]
+    missing = [d for d in dirs if not os.path.isdir(d)]
+    if missing:
+        raise FileNotFoundError(
+            "Hexagon SDK is missing include directories the vendored HVX headers "
+            f"need:\n" + "\n".join(f"  {d}" for d in missing) +
+            f"\nChecked under {sdk_root!r}. Set HEXAGON_SDK_ROOT to a full SDK "
+            "installation."
+        )
+    return dirs
 
 
 def find_toolchain_bin(sdk_root: str) -> str:

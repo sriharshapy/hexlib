@@ -7,8 +7,33 @@ from hexlib import toolchain as tc
 
 def test_base_flags_are_pinned():
     assert tc.HVX_CFLAGS == [
-        "-mv75", "-mhvx", "-mhvx-length=128B", "-std=c++17", "-O2",
+        "-mv75", "-mhvx", "-mhvx-length=128B", "-std=gnu11", "-O2",
     ]
+
+
+def test_compiler_is_the_c_driver():
+    """Kernels are GNU C. The vendored ggml-hexagon headers use the `asm`
+    keyword and void* arithmetic, which are errors in C++; and every v6 expert
+    is plain C already, so nothing wanted C++."""
+    assert tc.COMPILER == "hexagon-clang"
+    assert tc.STD == "gnu11"
+    assert not hasattr(tc, "CXX_STD")
+
+
+def test_sdk_include_dirs_names_what_is_missing(tmp_path):
+    with pytest.raises(FileNotFoundError) as e:
+        tc.sdk_include_dirs(str(tmp_path))
+    assert "qurt" in str(e.value)
+
+
+def test_sdk_include_dirs_are_arch_specific(tmp_path):
+    for sub in (("rtos", "qurt", "computev75", "include", "qurt"),
+                ("rtos", "qurt", "computev75", "include", "posix"),
+                ("incs",), ("incs", "stddef")):
+        (tmp_path.joinpath(*sub)).mkdir(parents=True)
+    dirs = tc.sdk_include_dirs(str(tmp_path))
+    assert any("computev75" in d for d in dirs)
+    assert len(dirs) == 4
 
 
 def test_hmx_cap_adds_compiler_and_sim_flags():

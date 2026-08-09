@@ -61,7 +61,8 @@ def build_kernel(
     `impl` selects which implementation to build, so the same function builds the
     kernel, a near-miss variant, or a rival candidate during a bake-off.
     """
-    bin_dir = tc.find_toolchain_bin(sdk_root or tc.default_sdk_root())
+    root = sdk_root or tc.default_sdk_root()
+    bin_dir = tc.find_toolchain_bin(root)
     version = tc.toolchain_version(bin_dir)
     if version != tc.TOOLCHAIN_VERSION:
         raise BuildError(
@@ -75,7 +76,7 @@ def build_kernel(
     os.makedirs(out_dir, exist_ok=True)
 
     repo_include = os.path.join(os.path.dirname(os.path.dirname(__file__)), "include")
-    includes = [kernel_dir, repo_include]
+    includes = [kernel_dir, repo_include] + tc.sdk_include_dirs(root)
 
     stem = os.path.splitext(impl)[0]
     elf = os.path.join(out_dir, f"{stem}.elf")

@@ -22,13 +22,13 @@ def test_build_error_carries_compiler_output():
 def test_command_includes_pinned_flags_and_include_path(tmp_path):
     """The compile command is assembled purely, so it can be asserted without an SDK."""
     cmd = build.compile_command(
-        compiler="hexagon-clang++",
+        compiler="hexagon-clang",
         sources=["kernel.c", "harness.c"],
         output="out.elf",
         caps=[],
         include_dirs=["include"],
     )
-    for flag in ("-mv75", "-mhvx", "-mhvx-length=128B", "-std=c++17", "-O2"):
+    for flag in ("-mv75", "-mhvx", "-mhvx-length=128B", "-std=gnu11", "-O2"):
         assert flag in cmd
     assert "-Iinclude" in cmd
     assert cmd[-2:] == ["-o", "out.elf"] or "out.elf" in cmd
@@ -44,10 +44,10 @@ def test_builds_a_trivial_kernel(tmp_path):
     kdir = tmp_path / "trivial"
     kdir.mkdir()
     (kdir / "kernel_api.h").write_text(
-        '#ifndef K\n#define K\nextern "C" void trivial(int *o);\n#endif\n'
+        '#ifndef K\n#define K\nvoid trivial(int *o);\n#endif\n'
     )
     (kdir / "kernel.c").write_text(
-        '#include "kernel_api.h"\nextern "C" void trivial(int *o) { *o = 7; }\n'
+        '#include "kernel_api.h"\nvoid trivial(int *o) { *o = 7; }\n'
     )
     (kdir / "harness.c").write_text(
         '#include "kernel_api.h"\n#include <stdio.h>\n'
@@ -73,10 +73,10 @@ def test_harness_header_compiles_with_fp16_compare_calls(tmp_path):
     kdir = tmp_path / "fp16harness"
     kdir.mkdir()
     (kdir / "kernel_api.h").write_text(
-        '#ifndef K\n#define K\nextern "C" void trivial(int *o);\n#endif\n'
+        '#ifndef K\n#define K\nvoid trivial(int *o);\n#endif\n'
     )
     (kdir / "kernel.c").write_text(
-        '#include "kernel_api.h"\nextern "C" void trivial(int *o) { *o = 7; }\n'
+        '#include "kernel_api.h"\nvoid trivial(int *o) { *o = 7; }\n'
     )
     (kdir / "harness.c").write_text(
         '#include "kernel_api.h"\n'
@@ -132,10 +132,10 @@ def test_time_kernel_does_not_shadow_a_caller_local_named_c0(tmp_path):
     kdir = tmp_path / "shadow"
     kdir.mkdir()
     (kdir / "kernel_api.h").write_text(
-        '#ifndef K\n#define K\nextern "C" void trivial(int *o);\n#endif\n'
+        '#ifndef K\n#define K\nvoid trivial(int *o);\n#endif\n'
     )
     (kdir / "kernel.c").write_text(
-        '#include "kernel_api.h"\nextern "C" void trivial(int *o) { *o = 7; }\n'
+        '#include "kernel_api.h"\nvoid trivial(int *o) { *o = 7; }\n'
     )
     (kdir / "harness.c").write_text(
         '#include "kernel_api.h"\n'
@@ -159,6 +159,39 @@ def test_time_kernel_does_not_shadow_a_caller_local_named_c0(tmp_path):
     assert "SHADOW_CHECK seen=99" in sim_output
     assert "HEXLIB_VERDICT correct=1" in sim_output
     assert "HEXLIB_KCYCLES" in sim_output
+
+
+@pytest.mark.sdk
+def test_vendored_hvx_norm_header_builds_and_links(tmp_path):
+    """Proves the Task 10 vendoring is actually usable: a kernel that includes
+    hexlib/hvx/hvx-norm.h and calls hvx_fast_rms_norm_f32 must compile and link
+    into an ELF through the real build.build_kernel path. Without this test, a
+    future flag change (back to C++, or a dropped include dir) could silently
+    make the vendored headers unusable again while every other test still
+    passes, since none of them touch hvx/*.h.
+    """
+    kdir = tmp_path / "rmsnorm_vendor"
+    kdir.mkdir()
+    (kdir / "kernel_api.h").write_text(
+        "#ifndef K\n#define K\n"
+        "void rmsnorm_vendor(const float *src, float *dst, int n, float eps);\n"
+        "#endif\n"
+    )
+    (kdir / "kernel.c").write_text(
+        '#include "kernel_api.h"\n'
+        '#include "hexlib/hvx/hvx-norm.h"\n'
+        "#include <stdint.h>\n\n"
+        "void rmsnorm_vendor(const float *src, float *dst, int n, float eps) {\n"
+        "    hvx_fast_rms_norm_f32((const uint8_t *) src, (uint8_t *) dst, n, eps);\n"
+        "}\n"
+    )
+    (kdir / "harness.c").write_text(
+        '#include "kernel_api.h"\n'
+        "int main(void) { return 0; }\n"
+    )
+    out = build.build_kernel(str(kdir), str(tmp_path / "_work"), caps=[])
+    assert os.path.isfile(out.elf)
+    assert os.path.isfile(out.obj)
 
 
 @pytest.mark.sdk
