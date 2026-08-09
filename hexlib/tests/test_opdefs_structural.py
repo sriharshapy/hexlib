@@ -130,6 +130,29 @@ def test_patchify_infer():
     assert shapes == (((4, 3 * 2 * 16 * 16), "fp32"),)
 
 
+def test_patchify_infer_rejects_a_grid_not_divisible_by_merge():
+    # image is 3x2x48x32, tiling correctly into a 3x2 patch grid at patch=16 --
+    # but grid_h=3 is not divisible by merge=2, so merge-block ordering is
+    # undefined.
+    with pytest.raises(ValueError) as e:
+        get("patchify").infer(
+            (Tensor("img", "fp32", (3, 2, 48, 32)),),
+            {"patch": 16, "temporal_patch": 2, "merge": 2, "grid_h": 3, "grid_w": 2},
+        )
+    assert "merge" in str(e.value)
+    assert "3" in str(e.value)
+
+
+def test_patchify_infer_rejects_a_temporal_patch_mismatch():
+    with pytest.raises(ValueError) as e:
+        get("patchify").infer(
+            (Tensor("img", "fp32", (3, 2, 32, 32)),),
+            {"patch": 16, "temporal_patch": 5, "merge": 2, "grid_h": 2, "grid_w": 2},
+        )
+    assert "temporal_patch" in str(e.value)
+    assert "5" in str(e.value)
+
+
 def test_rope_2d_matches_the_reference_formula():
     rs = np.random.RandomState(7)
     n, heads, d = 6, 3, 8
@@ -161,6 +184,27 @@ def test_rope_2d_infer_preserves_shape():
         {},
     )
     assert shapes == (((64, 12, 64), "fp16"),)
+
+
+def test_rope_2d_infer_rejects_cos_sin_shape_mismatch():
+    with pytest.raises(ValueError) as e:
+        get("rope_2d").infer(
+            (Tensor("q", "fp16", (64, 12, 64)), Tensor("c", "fp32", (64, 64)),
+             Tensor("s", "fp32", (64, 32))),
+            {},
+        )
+    assert "cos" in str(e.value) and "sin" in str(e.value)
+
+
+def test_rope_2d_infer_rejects_table_shape_mismatch_with_x():
+    # cos/sin agree with each other but not with (tokens, head_dim) from x.
+    with pytest.raises(ValueError) as e:
+        get("rope_2d").infer(
+            (Tensor("q", "fp16", (64, 12, 64)), Tensor("c", "fp32", (32, 64)),
+             Tensor("s", "fp32", (32, 64))),
+            {},
+        )
+    assert "64" in str(e.value)
 
 
 @pytest.mark.parametrize("kind", ["matmul", "transpose", "reshape", "rope_2d"])
