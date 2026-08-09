@@ -11,7 +11,8 @@ import os
 import sys
 
 from hexlib import kerneldir as kd
-from hexlib.result import is_ok
+from hexlib.graph.plan import V75_VTCM_TOTAL_BYTES
+from hexlib.result import Err, is_ok
 from hexlib.verify import verify
 
 DEVICES = ("sim", "local", "qdc")
@@ -69,6 +70,54 @@ def _cmd_test(args) -> int:
     return 0
 
 
+def _compiled(value: object) -> bool:
+    """True unless `value` is an `Err`.
+
+    Distinct from `hexlib.result.is_ok`, which tests membership in that
+    module's `Ok`/`Err` `Result` type (used by `verify`). The graph passes use
+    a different convention -- `Graph | Err`, `Plan | Err` -- where success is
+    the value itself, not a wrapper. This checks that convention.
+    """
+    return not isinstance(value, Err)
+
+
+def _cmd_plan(args) -> int:
+    import hexlib.graph.opdefs  # noqa: F401  -- registers the op definitions
+    from hexlib.graph.pipeline import compile_graph
+    from hexlib.graph.plan import render, to_json
+    from hexlib.models.qwen35 import qwen35_at
+    from hexlib.models.vit import build_vision_encoder
+
+    if args.model != "qwen35":
+        print(f"error: unknown model {args.model!r}; known: qwen35", file=sys.stderr)
+        return 2
+
+    graph = build_vision_encoder(qwen35_at(args.image_size))
+    if not _compiled(graph):
+        print(f"error: {graph.reason}", file=sys.stderr)
+        print(graph.detail, file=sys.stderr)
+        return 1
+
+    plan = compile_graph(
+        graph,
+        budget=args.vtcm_bytes,
+        order_policy=args.order_policy,
+        alloc_policy=args.alloc_policy,
+    )
+    if not _compiled(plan):
+        print(f"error: {plan.reason}", file=sys.stderr)
+        print(plan.detail, file=sys.stderr)
+        return 1
+
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write(to_json(plan))
+        print(f"wrote {args.out}")
+    if args.print_plan or not args.out:
+        print(render(plan))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="hexlib")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -87,6 +136,23 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--device", choices=DEVICES, default="sim")
     t.add_argument("--out", default="_work")
     t.set_defaults(func=_cmd_test)
+
+    pl = sub.add_parser("plan", help="compile a model's encoder to a VTCM/DMA plan")
+    pl.add_argument("model", choices=("qwen35",))
+    pl.add_argument("--image-size", type=int, default=256)
+    pl.add_argument(
+        "--vtcm-bytes",
+        type=int,
+        default=V75_VTCM_TOTAL_BYTES,
+        help="VTCM budget in bytes. The default is the v75 PART TOTAL, which is "
+             "not what a process necessarily gets — pass the runtime's number "
+             "when planning for real hardware.",
+    )
+    pl.add_argument("--order-policy", default="min_peak")
+    pl.add_argument("--alloc-policy", default="linear_scan")
+    pl.add_argument("--print", dest="print_plan", action="store_true")
+    pl.add_argument("--out", default="")
+    pl.set_defaults(func=_cmd_plan)
 
     try:
         args = p.parse_args(argv)

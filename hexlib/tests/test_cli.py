@@ -43,3 +43,39 @@ def test_device_backends_not_in_this_plan_say_so(tmp_path, capsys):
     rc = cli.main(["test", str(tmp_path / "k"), "--device", "local"])
     assert rc != 0
     assert "not implemented" in capsys.readouterr().err.lower()
+
+
+def test_plan_prints_a_vtcm_map(capsys):
+    from hexlib.cli import main
+
+    assert main(["plan", "qwen35", "--image-size", "256", "--print"]) == 0
+    out = capsys.readouterr().out
+    assert "VTCM" in out
+    assert "high water" in out
+    assert "not implemented" in out.lower()
+
+
+def test_plan_writes_json(tmp_path, capsys):
+    import json
+
+    from hexlib.cli import main
+
+    target = tmp_path / "plan.json"
+    assert main(["plan", "qwen35", "--out", str(target)]) == 0
+    parsed = json.loads(target.read_text(encoding="utf-8"))
+    assert parsed["vtcm_high_water"] > 0
+    assert parsed["predicted_bytes_moved"] > 0
+
+
+def test_plan_with_a_tiny_budget_fails_loudly(capsys):
+    from hexlib.cli import main
+
+    assert main(["plan", "qwen35", "--vtcm-bytes", "4096"]) == 1
+    err = capsys.readouterr().err
+    assert "4096" in err
+
+
+def test_plan_rejects_an_unknown_model(capsys):
+    from hexlib.cli import main
+
+    assert main(["plan", "not-a-model"]) != 0

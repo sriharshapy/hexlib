@@ -52,3 +52,36 @@ a *quantizing* kernel design, not a literal int8 GEMM.
 elementwise state together, on the hardest and highest-value kernel. Deliberately
 last: making it first would conflate "does the pipeline work" with "is the hardest
 kernel correct."
+
+## The vision encoder's op kinds
+
+`hexlib plan qwen35 --print` compiles the Qwen3.5-0.8B vision encoder (M1) to a plan
+and lists every op kind with `kernel: None` in its `unimplemented` field — that list
+is this table. Unlike the backlog above, these are graph-IR op *kinds* (one entry
+covers every op of that kind across all 12 blocks), not individual promoted kernels;
+a kind needs at least one kernel clearing the six gates in `CONTRIBUTING.md` before it
+can leave this list. Ordered by `predicted_bytes_moved` from the bake-off
+(`python -m pytest hexlib/tests/test_policy_bakeoff.py -q -s`, `qwen35@256`,
+`min_peak`/`linear_scan`) — the highest-value kernel to write is at the top, because it
+is the one moving the most DDR traffic and therefore the one most likely to be
+memory-bound in practice. Kinds tied at zero bytes moved (their inputs are already
+VTCM-resident; they cost compute cycles, not DMA) are broken by step count, descending.
+
+| op kind | steps | predicted bytes moved | status | related backlog kernel |
+|---|---|---|---|---|
+| `matmul_epilogue` | 75 | 55,868,416 | `kernel: None` | fused matmul+bias, closest to `matmul_i8_hmx` |
+| `add` | 25 | 786,432 | `kernel: None` | residual add, elementwise |
+| `layernorm` | 25 | 153,600 | `kernel: None` | reduction, adjacent to `rmsnorm_fp16`/`rmsnorm_f32` |
+| `rope_2d` | 24 | 131,072 | `kernel: None` | 2D variant of `rope_fp16` |
+| `transpose` | 60 | 0 | `kernel: None` | layout op, no DDR traffic once resident |
+| `reshape` | 49 | 0 | `kernel: None` | layout op, no DDR traffic once resident |
+| `matmul` | 24 | 0 | `kernel: None` | unfused QK^T / attn·V, compute-bound not DMA-bound |
+| `scale` | 12 | 0 | `kernel: None` | elementwise |
+| `softmax` | 12 | 0 | `kernel: None` | same subsystem checkpoint as `softmax_fp16` |
+| `patchify` | 1 | 0 | `kernel: None` | runs once, at the input |
+| `cast` | 1 | 0 | `kernel: None` | runs once, at the input |
+
+Total across all eleven kinds: `predicted_bytes_moved = 56,939,520` at 256x256, against
+the measured `vtcm_high_water = 5,111,808` of an 8,388,608-byte budget — see
+`.superpowers/sdd/2026-08-09-vlm-encoder-m1-pass-pipeline/task-9-report.md` for the full
+plan.
