@@ -132,6 +132,11 @@ class Plan:
                     "predicted cost cannot be computed is an error, not a plan with a "
                     "zero cost field."
                 )
+        if self.vtcm_budget <= 0:
+            raise ValueError(
+                f"vtcm_budget must be positive, got {self.vtcm_budget}; a plan targeting "
+                "zero or negative fast memory is not a plan"
+            )
         if self.vtcm_high_water > self.vtcm_budget:
             raise ValueError(
                 f"vtcm_high_water {self.vtcm_high_water} exceeds the budget "
@@ -206,8 +211,22 @@ def from_json(text: str) -> Plan | Err:
             unimplemented=tuple(raw["unimplemented"]),
             target=raw["target"],
         )
-    except (TypeError, ValueError) as e:
+    except (TypeError, ValueError, AttributeError, KeyError) as e:
         return Err("plan failed validation", str(e))
+
+
+def _lists_to_tuples(obj: Any) -> Any:
+    """Recursively convert lists to tuples in a nested structure.
+
+    This is needed because JSON has no tuple type, so tuples become lists
+    during serialization. We need to restore them when deserializing.
+    """
+    if isinstance(obj, dict):
+        return {k: _lists_to_tuples(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return tuple(_lists_to_tuples(v) for v in obj)
+    else:
+        return obj
 
 
 def _step_from_dict(raw: dict[str, Any]) -> Step:
@@ -219,7 +238,7 @@ def _step_from_dict(raw: dict[str, Any]) -> Step:
             kind=o["kind"],
             inputs=tuple(o["inputs"]),
             outputs=tuple(o["outputs"]),
-            attrs=dict(o["attrs"]),
+            attrs=_lists_to_tuples(o["attrs"]),
         )
     return Step(
         op=op,

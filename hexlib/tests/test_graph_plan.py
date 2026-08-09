@@ -156,3 +156,77 @@ def test_render_shows_the_tiling_loop_rather_than_unrolling_it():
     text = render(_plan())
     assert "96" in text  # the iteration count
     assert text.count("Transfer") < 10, "the render unrolled the loop"
+
+
+def test_from_json_on_non_dict_steps_entry_is_an_err():
+    # A steps entry that is not a dict (e.g., a string) should not raise AttributeError
+    out = from_json(json.dumps({
+        "steps": ["not_a_dict"],
+        "vtcm": [],
+        "vtcm_high_water": 0,
+        "predicted_bytes_moved": 0,
+        "vtcm_budget": 100,
+        "unimplemented": [],
+        "target": "hexagon-v75",
+    }))
+    assert isinstance(out, Err)
+
+
+def test_from_json_on_op_dict_missing_key_is_an_err():
+    # An op dict missing a required key should not raise KeyError
+    out = from_json(json.dumps({
+        "steps": [{"op": {"id": 0}, "dma_in": [], "dma_wait": [], "dma_out": []}],
+        "vtcm": [],
+        "vtcm_high_water": 0,
+        "predicted_bytes_moved": 0,
+        "vtcm_budget": 100,
+        "unimplemented": [],
+        "target": "hexagon-v75",
+    }))
+    assert isinstance(out, Err)
+
+
+def test_from_json_on_tiling_that_is_not_an_object_is_an_err():
+    # A tiling value that is a string (not an object) should not raise
+    out = from_json(json.dumps({
+        "steps": [{
+            "op": None,
+            "dma_in": [],
+            "dma_wait": [],
+            "dma_out": [],
+            "tiling": "not_an_object"
+        }],
+        "vtcm": [],
+        "vtcm_high_water": 0,
+        "predicted_bytes_moved": 0,
+        "vtcm_budget": 100,
+        "unimplemented": [],
+        "target": "hexagon-v75",
+    }))
+    assert isinstance(out, Err)
+
+
+def test_tuple_attrs_survive_json_round_trip():
+    # Tuple attrs should survive the round trip, not become lists
+    plan = _plan(steps=(
+        Step(
+            op=Op(id=0, kind="reshape", inputs=("x",), outputs=("y",), attrs={"shape": (3072, 3072)}),
+            dma_in=(),
+            dma_wait=(),
+            dma_out=(),
+        ),
+    ))
+    back = from_json(to_json(plan))
+    assert not isinstance(back, Err)
+    assert back.steps[0].op.attrs["shape"] == (3072, 3072)
+    assert isinstance(back.steps[0].op.attrs["shape"], tuple)
+    assert back == plan
+
+
+def test_vtcm_budget_must_be_positive():
+    # A plan with zero or negative budget cannot be constructed
+    with pytest.raises(ValueError) as e:
+        _plan(vtcm_budget=0)
+    assert "budget" in str(e.value).lower()
+    with pytest.raises(ValueError):
+        _plan(vtcm_budget=-1)
