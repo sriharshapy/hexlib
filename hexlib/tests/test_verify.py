@@ -92,6 +92,19 @@ def test_inconclusive_nearmiss_fails_the_gate():
     assert "INCONCLUSIVE" in r.to_table()
 
 
+def test_inconclusive_nearmiss_is_not_shown_with_a_doubled_label():
+    """Ledger #2: the stored state already carries the 'inconclusive: ' prefix
+    from NEARMISS_INCONCLUSIVE, so naively prefixing 'INCONCLUSIVE -- ' again
+    rendered 'INCONCLUSIVE -- inconclusive: did not build -- ...' in the
+    PR-facing evidence table."""
+    r = _report(
+        nearmiss={"nearmiss_no_eps.c": "inconclusive: did not build -- syntax error"}
+    )
+    table = r.to_table()
+    assert "INCONCLUSIVE -- did not build -- syntax error" in table
+    assert "INCONCLUSIVE -- inconclusive" not in table
+
+
 def test_no_nearmiss_at_all_fails_the_gate():
     """all({}) is True; gate_passed must not depend on an upstream check that
     a near-miss exists at all."""

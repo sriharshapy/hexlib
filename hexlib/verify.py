@@ -96,7 +96,13 @@ class VerifyReport:
             elif state == NEARMISS_ACCEPTED:
                 shown = "WRONGLY ACCEPTED"
             else:
-                shown = f"INCONCLUSIVE -- {state}"
+                # `state` already carries the "inconclusive: " prefix from
+                # NEARMISS_INCONCLUSIVE (e.g. "inconclusive: did not build --
+                # ..."), so prefixing "INCONCLUSIVE -- " again would render
+                # "INCONCLUSIVE -- inconclusive: did not build -- ...". Strip
+                # it before display.
+                reason = state.split(":", 1)[1].strip() if ":" in state else state
+                shown = f"INCONCLUSIVE -- {reason}"
             lines.append(f"| near-miss `{name}` | {shown} |")
         lines += [
             f"| **gate** | **{'PASS' if self.gate_passed() else 'FAIL'}** |",
