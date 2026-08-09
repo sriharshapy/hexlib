@@ -96,11 +96,17 @@ class _Builder:
         return self.emit("add", (h, b), out, rows + (n,))
 
 
-def weight_names(cfg: VitConfig) -> tuple[str, ...]:
-    """Every const tensor the graph needs, in a stable order."""
+def weight_names(cfg: VitConfig) -> tuple[str, ...] | Err:
+    """Every const tensor the graph needs, in a stable order.
+
+    Returns the `Err` a bad config produces, never `()`. A caller doing
+    `for name in weight_names(cfg): load(name)` must not silently load zero
+    weights and proceed as if it had succeeded -- absence read as success is
+    exactly the hazard this project's fail-closed rule exists to rule out.
+    """
     graph = build_vision_encoder(cfg)
     if isinstance(graph, Err):
-        return ()
+        return graph
     return tuple(sorted(t.name for t in graph.tensors.values() if t.const))
 
 
@@ -223,35 +229,54 @@ def _layernorm(
     return b.emit("layernorm", (x, w, bias), out_name, shape, {"eps": eps})
 
 
+# Every int field that is a count, a dimension, or a divisor somewhere in
+# `build_vision_encoder`. `Tensor.__post_init__` raises on a non-positive
+# shape dim, and a plain `%` raises `ZeroDivisionError` on a zero divisor, so
+# any field in this list left unguarded turns a bad config into a crash
+# instead of an `Err`. Checked by name, in a loop, rather than field by field:
+# a field added to `VitConfig` later and left out of a hand-written chain of
+# `if`s is exactly how `image_size` slipped through (`-32 % 16 == 0` passes
+# the divisibility check even though the field itself is nonsense).
+_POSITIVE_INT_FIELDS: tuple[str, ...] = (
+    "depth",
+    "hidden_size",
+    "num_heads",
+    "intermediate_size",
+    "patch_size",
+    "temporal_patch_size",
+    "in_channels",
+    "spatial_merge_size",
+    "out_hidden_size",
+    "image_size",
+)
+
+
 def _config_problems(cfg: VitConfig) -> list[str]:
     problems: list[str] = []
-    # Guard every divisor before it is used in a %, so a zero or negative
-    # field is a reported Err, never a raw ZeroDivisionError. `build_vision_encoder`
-    # must never raise on a bad config.
-    if cfg.patch_size <= 0:
-        problems.append(f"patch_size {cfg.patch_size} must be positive")
+    for name in _POSITIVE_INT_FIELDS:
+        value = getattr(cfg, name)
+        if value <= 0:
+            problems.append(f"{name} {value} must be positive")
+    if problems:
+        # Every check below divides by one of these fields, directly or
+        # through a derived property like `grid`. With one already reported
+        # non-positive, doing so would raise instead of reporting.
         return problems
+
     if cfg.image_size % cfg.patch_size:
         problems.append(
             f"image_size {cfg.image_size} is not divisible by patch_size {cfg.patch_size}"
         )
-        return problems
-    if cfg.spatial_merge_size <= 0:
-        problems.append(f"spatial_merge_size {cfg.spatial_merge_size} must be positive")
     elif cfg.grid % cfg.spatial_merge_size:
         problems.append(
             f"patch grid {cfg.grid}x{cfg.grid} is not divisible by spatial_merge_size "
             f"{cfg.spatial_merge_size}; the merger is a pure reshape and needs whole "
             "merge blocks"
         )
-    if cfg.num_heads <= 0:
-        problems.append(f"num_heads {cfg.num_heads} must be positive")
-    elif cfg.hidden_size % cfg.num_heads:
+    if cfg.hidden_size % cfg.num_heads:
         problems.append(
             f"hidden_size {cfg.hidden_size} is not divisible by num_heads {cfg.num_heads}"
         )
     elif cfg.head_dim % 2:
         problems.append(f"head_dim {cfg.head_dim} must be even for 2D RoPE")
-    if cfg.depth < 1:
-        problems.append(f"depth {cfg.depth} must be at least 1")
     return problems

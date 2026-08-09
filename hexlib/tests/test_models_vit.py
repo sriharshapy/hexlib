@@ -203,6 +203,51 @@ def test_zero_spatial_merge_size_is_an_err_not_a_zerodivisionerror():
     assert "0" in result.detail
 
 
+def test_negative_image_size_is_an_err_not_a_slip_through_divisibility():
+    # -32 % 16 == 0, so a divisibility-only guard on image_size lets a
+    # negative value slip through and reach Tensor.__post_init__, which
+    # raises. `_config_problems` must reject it on its own, before any %.
+    cfg = VitConfig(**{**_tiny().__dict__, "image_size": -32})
+    result = build_vision_encoder(cfg)
+    assert isinstance(result, Err)
+    assert "image_size" in result.detail
+    assert "-32" in result.detail
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("hidden_size", 0),
+        ("hidden_size", -64),
+        ("in_channels", 0),
+        ("temporal_patch_size", 0),
+        ("intermediate_size", 0),
+        ("out_hidden_size", 0),
+        ("depth", 0),
+        ("depth", -1),
+    ],
+)
+def test_every_dimension_bearing_field_is_guarded_not_just_the_three_divisors(field, value):
+    # _config_problems previously only guarded the three fields used directly
+    # as divisors (patch_size, spatial_merge_size, num_heads). Every other
+    # dimension-bearing field reached Tensor.__post_init__ unguarded and
+    # raised ValueError instead of returning Err.
+    cfg = VitConfig(**{**_tiny().__dict__, field: value})
+    result = build_vision_encoder(cfg)
+    assert isinstance(result, Err), f"{field}={value} should be Err, was {result!r}"
+    assert field in result.detail
+    assert str(value) in result.detail
+
+
+def test_weight_names_on_a_bad_config_is_an_err_not_an_empty_tuple():
+    # A caller doing `for name in weight_names(cfg): load(name)` on a bad
+    # config must not silently load zero weights and proceed as if it had
+    # succeeded -- () and Err must not be interchangeable here.
+    cfg = VitConfig(**{**_tiny().__dict__, "image_size": 0})
+    result = weight_names(cfg)
+    assert isinstance(result, Err)
+
+
 def test_qwen35_config_matches_the_checkpoint():
     cfg = QWEN35_08B_VISION
     assert cfg.depth == 12
