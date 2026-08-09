@@ -60,6 +60,44 @@ def test_builds_a_trivial_kernel(tmp_path):
 
 
 @pytest.mark.sdk
+def test_harness_header_compiles_with_fp16_compare_calls(tmp_path):
+    """Regression test: hexlib_close_f16 used to take __fp16 by value, which
+    hexagon-clang++ rejects on the declaration alone ("parameters cannot have
+    __fp16 type"), so any translation unit that merely included
+    hexlib_harness.h failed to build. Task 4's other tests never include the
+    header, so that break went uncaught. This test builds a real translation
+    unit that includes the header and calls both compare functions with
+    __fp16 arguments, through build.build_kernel so it goes through the real
+    pinned-flag path rather than a hand-rolled compiler invocation.
+    """
+    kdir = tmp_path / "fp16harness"
+    kdir.mkdir()
+    (kdir / "kernel_api.h").write_text(
+        '#ifndef K\n#define K\nextern "C" void trivial(int *o);\n#endif\n'
+    )
+    (kdir / "kernel.c").write_text(
+        '#include "kernel_api.h"\nextern "C" void trivial(int *o) { *o = 7; }\n'
+    )
+    (kdir / "harness.c").write_text(
+        '#include "kernel_api.h"\n'
+        '#include "hexlib/hexlib_harness.h"\n'
+        "int main(void) {\n"
+        "    int o = 0;\n"
+        "    trivial(&o);\n"
+        "    __fp16 a = (__fp16) 1.0f, b = (__fp16) 1.0f;\n"
+        "    int ok16 = hexlib_close_f16(a, b, 0.01f, 0.001f);\n"
+        "    int ok32 = hexlib_close_f32((float) a, (float) b, 0.01f, 0.001f);\n"
+        "    int correct = (o == 7) && ok16 && ok32;\n"
+        "    hexlib_report(correct, correct ? 0 : 1, 0.0, 0ULL);\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    out = build.build_kernel(str(kdir), str(tmp_path / "_work"), caps=[])
+    assert os.path.isfile(out.elf)
+    assert os.path.isfile(out.obj)
+
+
+@pytest.mark.sdk
 def test_compile_failure_reports_the_compiler_message(tmp_path):
     kdir = tmp_path / "broken"
     kdir.mkdir()

@@ -49,14 +49,29 @@ static inline unsigned long long hexlib_rdpcyc(void) {
 /* ---- tolerance compares ----
  * HVX float is the non-IEEE qf16 path and float operations reorder, so fp16
  * results are compared with a tolerance, never bit-exactly.
+ *
+ * WHY THESE TAKE float AND NOT __fp16. hexagon-clang++ rejects __fp16 as a
+ * by-value parameter outright:
+ *
+ *     error: parameters cannot have __fp16 type; did you forget * ?
+ *
+ * and it fires on the DECLARATION, so a header with such a signature cannot
+ * even be included. Callers pass __fp16 values and the promotion to float
+ * happens at the call site, which is what the compiler wants; the body
+ * converted to float on its first line anyway, so nothing about the comparison
+ * changes. This is also why every fp16 kernel in the v6 corpus passes __fp16 by
+ * POINTER and never by value.
+ *
+ * The alternative -- adding -Xclang -fnative-half-arguments-and-returns -- was
+ * rejected: it changes the pinned flag set, and every recorded cycle number was
+ * measured without it.
  */
-static inline int hexlib_close_f16(__fp16 a, __fp16 b, float rel, float abs_tol) {
-    float fa = (float) a, fb = (float) b;
-    float d = fa - fb;
+static inline int hexlib_close_f16(float a, float b, float rel, float abs_tol) {
+    float d = a - b;
     if (d < 0.0f) d = -d;
     if (d <= abs_tol) return 1;
-    float m = fa < 0.0f ? -fa : fa;
-    float mb = fb < 0.0f ? -fb : fb;
+    float m = a < 0.0f ? -a : a;
+    float mb = b < 0.0f ? -b : b;
     if (mb > m) m = mb;
     return d <= rel * m;
 }
