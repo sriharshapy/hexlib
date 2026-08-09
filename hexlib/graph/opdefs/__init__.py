@@ -5,6 +5,6 @@ with its first definition module so it never exists in an unimportable state.
 """
 from __future__ import annotations
 
-from hexlib.graph.opdefs import elementwise  # noqa: F401
+from hexlib.graph.opdefs import elementwise, structural  # noqa: F401
 
-__all__ = ["elementwise"]
+__all__ = ["elementwise", "structural"]

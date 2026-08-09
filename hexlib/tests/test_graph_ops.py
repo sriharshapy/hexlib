@@ -84,3 +84,25 @@ def test_reference_receives_arrays_and_returns_a_tuple():
     out = reg.get("mine").reference((np.array([1.0, 2.0], dtype=np.float32),), {})
     assert isinstance(out, tuple)
     np.testing.assert_allclose(out[0], [2.0, 4.0])
+
+
+def test_module_registry_is_populated_and_not_empty():
+    # Importing the definitions package must actually register something. A
+    # registry that registered nothing, passing "every OpDef is complete"
+    # vacuously, is the "absence read as success" hazard CONTRIBUTING.md names.
+    import hexlib.graph.opdefs  # noqa: F401
+
+    assert len(opsmod.REGISTRY.all_kinds()) >= 11
+
+
+def test_every_registered_opdef_is_complete():
+    import hexlib.graph.opdefs  # noqa: F401
+
+    kinds = opsmod.REGISTRY.all_kinds()
+    assert kinds, "registry is empty; this test would otherwise pass vacuously"
+    for kind in kinds:
+        d = opsmod.REGISTRY.get(kind)
+        assert callable(d.infer), kind
+        assert callable(d.working_set), kind
+        assert callable(d.reference), kind
+        assert d.kind == kind
