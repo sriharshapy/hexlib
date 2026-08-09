@@ -33,10 +33,9 @@ kernel's R=8 batch shape.
 ## Files
 
 - `kernel_api.h` — the contract.
-- `baseline.c` — scalar reference (`rmsnorm_fp16_baseline`), included directly
-  by `harness.c` (see the comment there for why: `build_kernel` links only
-  `<impl>.c` + `harness.c`, so `baseline.c` is pulled in as a source include
-  rather than a third link input, while remaining its own readable file).
+- `baseline.c` — scalar reference (`rmsnorm_fp16_baseline`), compiled and
+  linked as a third source alongside `<impl>.c` and `harness.c`
+  (`hexlib/build.py`'s `build_kernel`), which calls it for its reference.
 - `harness.c` — builds inputs, runs the baseline for reference, times only the
   kernel call, and prints the verdict the driver parses.
 - `nearmiss_no_eps.c` — plausible bug: `eps` dropped from the denominator.

@@ -1,10 +1,14 @@
-/* WINNER of the bake-off recorded in BAKEOFF.md: 2021 kernel cycles vs the
- * scalar baseline's 69443 (34.36x) and vs the other HVX candidate's 10498
- * (5.19x). (Fix round 1 moved this from 2020/69438 by 1 and 5 cycles
- * respectively after hexlib/build.py started linking baseline.c as its own
- * object instead of it being #included into harness.c's translation unit --
- * see BAKEOFF.md's "Fix round 1" note. Same source, same flags; the code the
- * cycle-approximate simulator times shifted by a byte or two of link layout.)
+/* WINNER of the bake-off recorded in BAKEOFF.md: 2231 kernel cycles vs the
+ * scalar baseline's 69443 (31.13x) and vs the other HVX candidate's 10498
+ * (4.71x). (Fix round 1 moved this from 2020/69438 to 2021/69443 -- a
+ * link-layout shift, see below. Fix round 2 moved it again, from 2021 to
+ * 2231, when the dead-and-unsafe `else` branch below the sum-of-squares loop
+ * was removed and its `if (nb > 0)` guard was hoisted above the row loop as
+ * an early `return`: same instructions per row, but the code the
+ * cycle-approximate simulator times shifted enough to move the number by
+ * ~10%, not the ~0.05% link-layout noise seen in round 1 -- see BAKEOFF.md's
+ * "Fix round 2" note for why that is plausible for a real codegen change
+ * rather than noise.)
  * Adapted from HVX-clean/data/v6/tasks/rmsnorm_gain_fp16/expert.c
  * (solutions/s2.c: vector-native ror-shift horizontal reduce for
  * sum-of-squares, R=6 C=80, recorded 9798 kernel cycles, 2.741x).
@@ -14,9 +18,10 @@
  * bake-off is how the 64-lane qf16 accumulator is collapsed to one scalar.
  * This kernel finishes the horizontal reduction entirely IN THE VECTOR UNIT:
  * a six-step ror-shift butterfly (`hreduce_qf16`, rotate-by 64/32/16/8/4/2
- * lanes with a qf16 add at each step) leaves every lane holding the full sum,
- * so reading lane 0 into a scalar is the only vector-to-scalar transition in
- * the whole reduction. The losing candidate (fp16_rmsnorm's expert, see
+ * BYTES -- 32/16/8/4/2/1 fp16 lanes -- with a qf16 add at each step) leaves
+ * every lane holding the full sum, so reading lane 0 into a scalar is the
+ * only vector-to-scalar transition in the whole reduction. The losing
+ * candidate (fp16_rmsnorm's expert, see
  * BAKEOFF.md) instead unpacks the accumulator to memory and finishes with a
  * 64-iteration SCALAR add loop, once per row. That scalar loop is the
  * expert.c-reported difference between the two mechanisms in the original
@@ -83,6 +88,10 @@ static inline HVX_Vector hreduce_qf16(HVX_Vector v) {
 void rmsnorm_fp16(const hexlib_hf *x, const hexlib_hf *w,
                   hexlib_hf *y, int R, int C, float eps) {
     int nb = C / BLK;   /* RMSNORM_C=128 -> nb=2, no remainder */
+    if (nb <= 0) {
+        return;   /* C < 64: no full vector to read. The contract in
+                   * kernel_api.h requires C to be a multiple of 64. */
+    }
 
     const HVX_Vector *wv = (const HVX_Vector *) w;
 
@@ -90,17 +99,11 @@ void rmsnorm_fp16(const hexlib_hf *x, const hexlib_hf *w,
         const HVX_Vector *xv = (const HVX_Vector *) (x + (long) r * C);
         HVX_Vector *ov       = (HVX_Vector *) (y + (long) r * C);
 
-        HVX_Vector accSq;
-        if (nb > 0) {
-            HVX_Vector v0 = xv[0];
-            accSq = Q6_Vqf16_vmpy_VhfVhf(v0, v0);
-            for (int b = 1; b < nb; ++b) {
-                HVX_Vector v = xv[b];
-                HVX_Vector sq = Q6_Vqf16_vmpy_VhfVhf(v, v);
-                accSq = Q6_Vqf16_vadd_Vqf16Vqf16(accSq, sq);
-            }
-        } else {
-            accSq = Q6_Vqf16_vmpy_VhfVhf(xv[0], xv[0]); /* never hit: C multiple of 64 */
+        HVX_Vector accSq = Q6_Vqf16_vmpy_VhfVhf(xv[0], xv[0]);
+        for (int b = 1; b < nb; ++b) {
+            HVX_Vector v = xv[b];
+            HVX_Vector sq = Q6_Vqf16_vmpy_VhfVhf(v, v);
+            accSq = Q6_Vqf16_vadd_Vqf16Vqf16(accSq, sq);
         }
 
         HVX_Vector red   = hreduce_qf16(accSq);
