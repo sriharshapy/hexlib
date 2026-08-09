@@ -51,8 +51,10 @@ def test_every_policy_satisfies_every_invariant_on_random_intervals():
             assert high_water <= BUDGET
             assert {s.tensor for s in slots} == {iv.tensor for iv in intervals}
             checked += 1
-    assert checked > 100, f"only {checked} allocations actually succeeded; the "
-    "generator is producing overflow-only cases and proves nothing"
+    assert checked > 100, (
+        f"only {checked} allocations actually succeeded; the generator is "
+        "producing overflow-only cases and proves nothing"
+    )
 
 
 def test_a_deliberately_broken_allocator_is_caught_by_the_invariants():

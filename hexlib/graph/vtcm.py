@@ -34,7 +34,7 @@ def _linear_scan(intervals: Sequence[Interval]) -> dict[str, int]:
         busy = sorted(
             (off, end)
             for off, end, other in placed
-            if _live_together(other, iv)
+            if other.overlaps(iv)
         )
         offset = 0
         for start, end in busy:
@@ -46,17 +46,15 @@ def _linear_scan(intervals: Sequence[Interval]) -> dict[str, int]:
     return offsets
 
 
-def _live_together(a: Interval, b: Interval) -> bool:
-    """Inclusive on both ends -- see Interval.overlaps.
+def _largest_first(intervals: Sequence[Interval]) -> dict[str, int]:
+    """First-fit placement, largest interval first.
 
-    a(0,1) and b(1,2) are both live during op 1, which reads a and writes b.
-    A strict `<` would call them disjoint and alias their storage.
+    This is NOT best-fit (smallest-sufficient-gap) despite the name this
+    policy briefly had here. The only difference from `_linear_scan` is visitation
+    order -- largest `nbytes` first rather than earliest `first_use` first --
+    which is still a real, distinct placement and can pack differently, just
+    not by the "best-fit" mechanism the term of art implies.
     """
-    return a.first_use <= b.last_use and b.first_use <= a.last_use
-
-
-def _best_fit(intervals: Sequence[Interval]) -> dict[str, int]:
-    """Largest first, then lowest gap. Often packs better than first-fit."""
     placed: list[tuple[int, int, Interval]] = []
     offsets: dict[str, int] = {}
     for iv in sorted(intervals, key=lambda i: (-i.nbytes, i.first_use, i.tensor)):
@@ -64,7 +62,7 @@ def _best_fit(intervals: Sequence[Interval]) -> dict[str, int]:
         busy = sorted(
             (off, end)
             for off, end, other in placed
-            if _live_together(other, iv)
+            if other.overlaps(iv)
         )
         offset = 0
         for start, end in busy:
@@ -78,7 +76,7 @@ def _best_fit(intervals: Sequence[Interval]) -> dict[str, int]:
 
 ALLOC_POLICIES: Mapping[str, Callable[[Sequence[Interval]], dict[str, int]]] = {
     "linear_scan": _linear_scan,
-    "best_fit": _best_fit,
+    "largest_first": _largest_first,
 }
 
 
@@ -95,6 +93,20 @@ def allocate(
         )
     if budget <= 0:
         return Err("invalid VTCM budget", f"budget must be positive, got {budget}")
+
+    for iv in intervals:
+        if iv.nbytes <= 0:
+            return Err(
+                "malformed interval",
+                f"tensor {iv.tensor!r} has nbytes={iv.nbytes}; nbytes must be "
+                "positive",
+            )
+        if iv.last_use < iv.first_use:
+            return Err(
+                "malformed interval",
+                f"tensor {iv.tensor!r} has last_use={iv.last_use} before "
+                f"first_use={iv.first_use}",
+            )
 
     place = ALLOC_POLICIES.get(policy)
     if place is None:
@@ -182,7 +194,7 @@ def allocation_problems(
             if b.offset >= a.end:
                 break
             ia, ib = by_interval.get(a.tensor), by_interval.get(b.tensor)
-            if ia is not None and ib is not None and _live_together(ia, ib):
+            if ia is not None and ib is not None and ia.overlaps(ib):
                 problems.append(
                     f"slots for {a.tensor!r} [{a.offset}, {a.end}) and {b.tensor!r} "
                     f"[{b.offset}, {b.end}) overlap while both are live"

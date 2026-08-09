@@ -77,6 +77,22 @@ def test_a_zero_budget_is_an_err():
     assert isinstance(allocate(_ivs(("a", 0, 1, 64)), budget=0), Err)
 
 
+def test_a_non_positive_nbytes_interval_is_an_err_not_a_raise():
+    # Interval has no __post_init__ validation, unlike every other value type
+    # in this codebase, so a malformed nbytes can reach allocate() -- from a
+    # fuzzer, or a future caller that builds intervals by hand. It must come
+    # back as an Err naming the tensor, not a raw ValueError out of Slot.
+    out = allocate(_ivs(("bad", 0, 1, 0)), budget=4096)
+    assert isinstance(out, Err)
+    assert "bad" in out.detail
+
+
+def test_a_last_use_before_first_use_interval_is_an_err_not_a_raise():
+    out = allocate(_ivs(("bad", 3, 1, 64)), budget=4096)
+    assert isinstance(out, Err)
+    assert "bad" in out.detail
+
+
 def test_an_unknown_policy_is_an_err_naming_the_known_ones():
     out = allocate(_ivs(("a", 0, 1, 64)), budget=4096, policy="magic")
     assert isinstance(out, Err)
