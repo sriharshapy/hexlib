@@ -21,6 +21,16 @@ def test_add_broadcasts_a_bias_row():
     np.testing.assert_allclose(out, [[10, 21, 32], [13, 24, 35]])
 
 
+def test_add_preserves_first_input_dtype_with_mixed_inputs():
+    # The encoder's bias adds: fp16 activations + fp32 biases -> fp16.
+    # Output dtype must match the first input (fp16), not numpy's promotion rules.
+    a = np.array([1.0, 2.0], dtype=np.float16)
+    b = np.array([0.5, 0.5], dtype=np.float32)
+    (out,) = _ref("add", (a, b))
+    assert out.dtype == np.float16, f"Expected fp16, got {out.dtype}"
+    np.testing.assert_allclose(out, [1.5, 2.5], rtol=1e-3)
+
+
 def test_add_infers_broadcast_shape():
     shapes = get("add").infer(
         (Tensor("a", "fp32", (2, 3)), Tensor("b", "fp32", (3,))), {}

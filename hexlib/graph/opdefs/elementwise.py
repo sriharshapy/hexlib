@@ -7,11 +7,11 @@ different functions used in two different places, not one op with a flag.
 from __future__ import annotations
 
 import math
-from typing import Any, Mapping, Sequence
+from typing import Sequence
 
 import numpy as np
 
-from hexlib.graph.ir import Tensor, nbytes
+from hexlib.graph.ir import Tensor
 from hexlib.graph.ops import OpDef, register
 
 _SQRT_2_OVER_PI = math.sqrt(2.0 / math.pi)
@@ -37,6 +37,15 @@ def _broadcast_shape(a: tuple[int, ...], b: tuple[int, ...]) -> tuple[int, ...]:
 
 # --- add ---------------------------------------------------------------
 
+def _add_reference(arrays, attrs):
+    """Element-wise addition with numpy broadcasting.
+
+    Output dtype matches the first input, regardless of the second input's dtype.
+    This is crucial for bias adds: activations (fp16) + biases (fp32) -> fp16.
+    """
+    return ((arrays[0] + arrays[1]).astype(arrays[0].dtype),)
+
+
 register(
     OpDef(
         kind="add",
@@ -44,18 +53,26 @@ register(
             (_broadcast_shape(inputs[0].shape, inputs[1].shape), inputs[0].dtype),
         ),
         working_set=_elementwise_working_set,
-        reference=lambda arrays, attrs: (arrays[0] + arrays[1],),
+        reference=_add_reference,
     )
 )
 
 # --- scale -------------------------------------------------------------
+
+def _scale_reference(arrays, attrs):
+    """Element-wise multiplication by a scalar factor.
+
+    Output dtype matches the input, independent of factor type.
+    """
+    return ((arrays[0] * attrs["factor"]).astype(arrays[0].dtype),)
+
 
 register(
     OpDef(
         kind="scale",
         infer=lambda inputs, attrs: ((inputs[0].shape, inputs[0].dtype),),
         working_set=_elementwise_working_set,
-        reference=lambda arrays, attrs: (arrays[0] * attrs["factor"],),
+        reference=_scale_reference,
     )
 )
 
