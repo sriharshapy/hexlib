@@ -15,3 +15,29 @@ jobs:
           python-version: "3.11"
       - run: pip install -e ".[dev]" || pip install -e . pytest
       - run: python -m pytest -q -m "not sdk"
+
+  kernel-contract:
+    # CI has no Hexagon SDK, so it cannot re-run the gate. It refuses a PR that
+    # claims a pass it did not attach.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e .
+      - name: Check every kernel directory
+        run: |
+          python - <<'PY'
+          import pathlib, sys
+          from hexlib.contract import check_kernel_contract
+          failed = False
+          for d in sorted(pathlib.Path("kernels").glob("*/")):
+              problems = check_kernel_contract(str(d))
+              if problems:
+                  failed = True
+                  print(f"::error::{d}")
+                  for p in problems:
+                      print(f"  - {p}")
+          sys.exit(1 if failed else 0)
+          PY
