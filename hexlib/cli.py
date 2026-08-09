@@ -70,13 +70,15 @@ def _cmd_test(args) -> int:
     return 0
 
 
-def _compiled(value: object) -> bool:
+def _succeeded(value: object) -> bool:
     """True unless `value` is an `Err`.
 
     Distinct from `hexlib.result.is_ok`, which tests membership in that
     module's `Ok`/`Err` `Result` type (used by `verify`). The graph passes use
     a different convention -- `Graph | Err`, `Plan | Err` -- where success is
-    the value itself, not a wrapper. This checks that convention.
+    the value itself, not a wrapper. This checks that convention, for
+    whichever value in it `_cmd_plan` is holding at the time (a `Graph` right
+    after `build_vision_encoder`, a `Plan` right after `compile_graph`).
     """
     return not isinstance(value, Err)
 
@@ -93,7 +95,7 @@ def _cmd_plan(args) -> int:
         return 2
 
     graph = build_vision_encoder(qwen35_at(args.image_size))
-    if not _compiled(graph):
+    if not _succeeded(graph):
         print(f"error: {graph.reason}", file=sys.stderr)
         print(graph.detail, file=sys.stderr)
         return 1
@@ -104,7 +106,7 @@ def _cmd_plan(args) -> int:
         order_policy=args.order_policy,
         alloc_policy=args.alloc_policy,
     )
-    if not _compiled(plan):
+    if not _succeeded(plan):
         print(f"error: {plan.reason}", file=sys.stderr)
         print(plan.detail, file=sys.stderr)
         return 1
