@@ -7,7 +7,7 @@ mechanism (spec 4.3.1).
 """
 from __future__ import annotations
 
-from hexlib.graph.ir import Graph, Op, Tensor
+from hexlib.graph.ir import Graph, Op
 from hexlib.result import Err
 
 FUSABLE_ACTS = ("gelu_tanh", "gelu_erf")
@@ -24,8 +24,6 @@ def fuse(graph: Graph) -> Graph | Err:
             consumers[name] = consumers.get(name, 0) + 1
     protected = set(graph.outputs)
 
-    producer = {op.outputs[0]: op for op in graph.ops if len(op.outputs) == 1}
-    by_id = {op.id: op for op in graph.ops}
     consumed: set[int] = set()
     rewritten: dict[int, Op] = {}
     dropped_tensors: set[str] = set()
@@ -43,11 +41,19 @@ def fuse(graph: Graph) -> Graph | Err:
         add_op = _sole_consumer(graph, mm_out, consumed)
         if add_op is None or add_op.kind != "add":
             continue
-        # The second operand must be a const 1-D bias, not another activation:
-        # a residual add(x, proj) has the same shape signature and must not fuse.
-        bias_name = add_op.inputs[1] if add_op.inputs[0] == mm_out else None
+        # The bias operand can sit on either side of the add -- add(mm, bias)
+        # or add(bias, mm) -- so the discriminator is which operand IS the
+        # matmul output, not position. `Graph.problems()` does not check
+        # arity per op kind, so a malformed add (e.g. one input) must be
+        # reported as an Err here rather than raising when indexed.
+        try:
+            bias_name = _bias_operand(add_op, mm_out)
+        except ValueError as e:
+            return Err("malformed add op", f"op {add_op.id} (add) {e}")
         if bias_name is None:
             continue
+        # The bias itself must be const and 1-D, not another activation: a
+        # residual add(x, proj) has the same shape signature and must not fuse.
         bias = graph.tensors.get(bias_name)
         if bias is None or not bias.const or len(bias.shape) != 1:
             continue
@@ -89,3 +95,23 @@ def fuse(graph: Graph) -> Graph | Err:
 def _sole_consumer(graph: Graph, name: str, skip: set[int]) -> Op | None:
     found = [op for op in graph.ops if name in op.inputs and op.id not in skip]
     return found[0] if len(found) == 1 else None
+
+
+def _bias_operand(add_op: Op, mm_out: str) -> str | None:
+    """The add's non-matmul operand, or None if `mm_out` is not one of it.
+
+    Raises ValueError if `add_op` does not have exactly two inputs -- `add` is
+    a binary op, but `Graph.problems()` validates tensor declaration and
+    read/write ordering, never op arity per kind, so a malformed add op (one
+    input instead of two) reaches here structurally "valid".
+    """
+    if len(add_op.inputs) != 2:
+        raise ValueError(
+            f"has {len(add_op.inputs)} input(s); a bias add takes exactly two"
+        )
+    lhs, rhs = add_op.inputs
+    if lhs == mm_out:
+        return rhs
+    if rhs == mm_out:
+        return lhs
+    return None

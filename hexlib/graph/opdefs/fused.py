@@ -6,11 +6,8 @@ answer -- an annotation-only fusion pass could not be checked that way.
 """
 from __future__ import annotations
 
-from typing import Sequence
-
 import numpy as np
 
-from hexlib.graph.ir import Tensor
 from hexlib.graph.ops import OpDef, get, register
 
 ACTIVATIONS = ("none", "gelu_tanh", "gelu_erf")

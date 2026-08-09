@@ -166,3 +166,22 @@ def test_reference_dtype_matches_what_infer_declared(kind):
         assert tuple(value.shape) == shape, (
             f"{kind}: infer declared shape {shape} but reference returned {value.shape}"
         )
+
+
+def test_matmul_epilogue_gelu_tanh_delegation_preserves_declared_dtype():
+    # The table case above uses act="none", so it never reaches the one path
+    # that is unique to this op: delegating to the unfused activation's own
+    # `reference` (`get(act).reference((out,), {})`). Pin that path under the
+    # same fp16-activation / q4_0-weight / fp32-bias mix.
+    tensors, arrays, _ = _CASES["matmul_epilogue"]
+    attrs = {"act": "gelu_tanh"}
+    opdef = get("matmul_epilogue")
+
+    declared = opdef.infer(tensors, attrs)
+    results = opdef.reference(arrays, attrs)
+
+    assert len(results) == len(declared) == 1
+    shape, dtype = declared[0]
+    value = np.asarray(results[0])
+    assert value.dtype == _expected_numpy_dtype("matmul_epilogue", dtype)
+    assert tuple(value.shape) == shape

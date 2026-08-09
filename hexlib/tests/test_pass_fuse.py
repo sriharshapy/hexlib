@@ -81,6 +81,55 @@ def test_the_fused_graph_computes_the_same_answer():
     np.testing.assert_allclose(a["y"], b["y"], rtol=1e-6, atol=1e-6)
 
 
+def test_bias_add_with_operands_reversed_still_fuses():
+    # add(bias, mm) is the same op as add(mm, bias); the pass must not be
+    # order-lucky about which side carries the matmul output.
+    tensors = {
+        "x": Tensor("x", "fp32", (4, 8)),
+        "w": Tensor("w", "fp32", (8, 16), const=True),
+        "b": Tensor("b", "fp32", (16,), const=True),
+        "mm": Tensor("mm", "fp32", (4, 16)),
+        "y": Tensor("y", "fp32", (4, 16)),
+    }
+    g = Graph(
+        tensors=tensors,
+        ops=(
+            Op(id=0, kind="matmul", inputs=("x", "w"), outputs=("mm",), attrs={}),
+            Op(id=1, kind="add", inputs=("b", "mm"), outputs=("y",), attrs={}),
+        ),
+        inputs=("x",),
+        outputs=("y",),
+    )
+    out = fuse(g)
+    assert [op.kind for op in out.ops] == ["matmul_epilogue"]
+    assert out.ops[0].attrs["act"] == "none"
+    assert out.ops[0].inputs == ("x", "w", "b")
+
+
+def test_a_malformed_add_returns_err_not_an_exception():
+    # `Graph.problems()` checks tensor declaration and read/write ordering,
+    # never op arity per kind, so an `add` with one input reaches the pass
+    # structurally "valid". The pass must report this as an Err, not raise.
+    tensors = {
+        "x": Tensor("x", "fp32", (4, 8)),
+        "w": Tensor("w", "fp32", (8, 16), const=True),
+        "mm": Tensor("mm", "fp32", (4, 16)),
+        "y": Tensor("y", "fp32", (4, 16)),
+    }
+    g = Graph(
+        tensors=tensors,
+        ops=(
+            Op(id=0, kind="matmul", inputs=("x", "w"), outputs=("mm",), attrs={}),
+            Op(id=1, kind="add", inputs=("mm",), outputs=("y",), attrs={}),
+        ),
+        inputs=("x",),
+        outputs=("y",),
+    )
+    assert g.problems() == []
+    out = fuse(g)
+    assert isinstance(out, Err)
+
+
 def test_a_residual_add_is_not_mistaken_for_a_bias_add():
     # add(x, proj) where both are activations must NOT fuse into the matmul.
     tensors = {
