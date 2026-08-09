@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+import hexlib.graph.opdefs  # noqa: F401 - registers all op kinds as a side effect
 from hexlib.graph.layout import (
     ACCEPTED_LAYOUTS,
     HMX_TILE,
@@ -11,6 +12,7 @@ from hexlib.graph.layout import (
     check_layouts,
     layout_nbytes,
 )
+from hexlib.graph.ops import all_kinds
 
 
 def test_hmx_fp16_tile_is_32x32_and_2048_bytes():
@@ -61,6 +63,12 @@ def test_placement_rejects_a_negative_offset():
         Placement(layout=Layout.DENSE, perm=(0,), buffer=Buffer.VTCM, offset=-1)
 
 
+def test_placement_rejects_an_invalid_permutation():
+    with pytest.raises(ValueError) as e:
+        Placement(layout=Layout.DENSE, perm=(1, 2), buffer=Buffer.VTCM, offset=0)
+    assert "permutation" in str(e.value)
+
+
 def test_matmul_weight_must_be_repacked_not_blocked():
     blocked = (
         Placement(Layout.DENSE, (0, 1), Buffer.VTCM, 0),
@@ -108,3 +116,17 @@ def test_int8_hmx_layouts_exist_and_are_asymmetric():
     assert Layout.HMX_ACT_TILE_I8 is not Layout.HMX_WGT_TILE_I8
     assert layout_nbytes((32, 32), "int32", Layout.HMX_ACT_TILE_I8) == 2048
     assert layout_nbytes((32, 32), "int32", Layout.HMX_WGT_TILE_I8) == 1024
+
+
+def test_every_registered_op_kind_has_accepted_layouts_entry():
+    # Ensures no registered op is silently accepted without layout checking.
+    # Direction: registered_kinds ⊆ table_keys (not equality).
+    # matmul_epilogue is in the table but not yet registered (Task 3);
+    # an equality check would fail for the wrong reason.
+    registered = all_kinds()
+    assert registered, "registered op kinds list is empty; this test would pass vacuously"
+    for kind in registered:
+        assert kind in ACCEPTED_LAYOUTS, (
+            f"op kind {kind!r} is registered but has no entry in ACCEPTED_LAYOUTS; "
+            "check_layouts would call it an unknown kind and report a problem"
+        )

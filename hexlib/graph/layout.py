@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Mapping, Sequence
 
-from hexlib.graph.ir import Q4_0_BLOCK, Q4_0_BLOCK_BYTES, nbytes
+from hexlib.graph.ir import nbytes
 
 
 class Layout(Enum):
@@ -129,8 +129,12 @@ def layout_nbytes(shape: tuple[int, ...], dtype: str, layout: Layout) -> int:
         return _tiled_bytes(shape, bytes_per_element=2)
 
     if layout is Layout.HMX_ACT_TILE_I8:
+        # No dtype validation: these layouts are unused (spec 4.3: hexlib uses HMX fp16
+        # mode). When int8 activation quantization is taken up, dtype enforcement should
+        # be added here to match HMX_TILE_F16's pattern.
         return _tiled_bytes(shape, bytes_per_element=2)
     if layout is Layout.HMX_WGT_TILE_I8:
+        # No dtype validation: see HMX_ACT_TILE_I8 comment.
         return _tiled_bytes(shape, bytes_per_element=1)
 
     raise ValueError(f"no size rule for layout {layout!r}")
@@ -159,6 +163,7 @@ ACCEPTED_LAYOUTS: Mapping[str, tuple[tuple[Layout, ...], ...]] = {
         (Layout.DENSE,),
     ),
     "add": ((Layout.DENSE,), (Layout.DENSE,)),
+    "cast": ((Layout.DENSE,),),
     "scale": ((Layout.DENSE,),),
     "layernorm": ((Layout.DENSE,), (Layout.DENSE,), (Layout.DENSE,)),
     "gelu_tanh": ((Layout.DENSE,),),
