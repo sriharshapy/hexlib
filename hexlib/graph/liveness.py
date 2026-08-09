@@ -21,7 +21,9 @@ class Interval:
     nbytes: int
 
     def overlaps(self, other: "Interval") -> bool:
-        return self.first_use < other.last_use and other.first_use < self.last_use
+        # Over-reporting overlap wastes space; under-reporting corrupts data (allocator could alias
+        # storage). Inclusive boundaries are the safe direction when intervals touch at a boundary.
+        return self.first_use <= other.last_use and other.first_use <= self.last_use
 
     def covers(self, step: int) -> bool:
         return self.first_use <= step <= self.last_use

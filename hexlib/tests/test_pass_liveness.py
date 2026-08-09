@@ -108,8 +108,47 @@ def test_invalid_graph_is_an_err():
     assert isinstance(live_intervals(Graph(tensors={}, ops=(), inputs=(), outputs=())), Err)
 
 
+def test_overlaps_adjacent_intervals_that_share_a_boundary():
+    # Adjacent intervals [0,1] and [1,2] ARE simultaneously live at step 1,
+    # where op 1 reads the first and writes the second. Overlaps must report
+    # True to prevent the allocator from aliasing their storage.
+    a = Interval(tensor="a", first_use=0, last_use=1, nbytes=64)
+    b = Interval(tensor="b", first_use=1, last_use=2, nbytes=64)
+    assert a.overlaps(b), "adjacent intervals must overlap to prevent data corruption"
+    # Verify overlaps() and live_at() agree on which intervals are live at step 1.
+    assert a.covers(1) and b.covers(1), "both must cover step 1"
+    assert a.overlaps(b), "overlaps() must agree that both are simultaneously live"
+
+
+def test_overlaps_disjoint_intervals():
+    a = Interval(tensor="a", first_use=0, last_use=1, nbytes=64)
+    c = Interval(tensor="c", first_use=2, last_use=3, nbytes=64)
+    assert not a.overlaps(c), "disjoint intervals must not overlap"
+
+
+def test_overlaps_nested_intervals():
+    outer = Interval(tensor="outer", first_use=0, last_use=3, nbytes=64)
+    inner = Interval(tensor="inner", first_use=1, last_use=2, nbytes=64)
+    assert outer.overlaps(inner), "nested intervals must overlap"
+
+
 def test_the_whole_encoder_produces_one_interval_per_activation():
     g = order(build_vision_encoder(qwen35_at(256)))
     ivs = live_intervals(g)
     activations = {t.name for t in g.tensors.values() if not t.const}
+    # Names must match activations.
     assert {iv.tensor for iv in ivs} == activations
+    # Every interval must be valid (first_use <= last_use).
+    assert all(iv.first_use <= iv.last_use for iv in ivs), "all intervals must have first_use <= last_use"
+    # Every graph output must stay live to the end.
+    for name in g.outputs:
+        if not g.tensor(name).const:
+            output_iv = next(iv for iv in ivs if iv.tensor == name)
+            assert output_iv.last_use == len(g.ops), f"output {name} must stay live to len(ops)"
+    # Pick a known first op output and verify its interval starts at 0.
+    if g.ops:
+        first_op = g.ops[0]
+        for out_name in first_op.outputs:
+            if not g.tensor(out_name).const:
+                out_iv = next(iv for iv in ivs if iv.tensor == out_name)
+                assert out_iv.first_use == 0, f"output {out_name} of first op must have first_use == 0"
