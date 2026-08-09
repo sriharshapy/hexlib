@@ -30,6 +30,50 @@ def _diamond():
     )
 
 
+def _two_chains():
+    """Two independent matmul chains with large intermediates.
+
+    asap declares both large ops (0 and 1) first, forcing both intermediates
+    to be live simultaneously. min_peak should prefer to complete the first
+    chain (op 2 after op 0) before starting the second, keeping only one
+    intermediate live at a time.
+
+    Declaration order:
+      op0: p = matmul(x, w1)    -> (4,256) ~4 KB
+      op1: q = matmul(x, w2)    -> (4,256) ~4 KB
+      op2: pa = matmul(p, u1)   -> (4,4)   ~64 B  (p's last use)
+      op3: qb = matmul(q, u2)   -> (4,4)   ~64 B  (q's last use)
+      op4: y = add(pa, qb)
+
+    asap would hold both p and q live together.
+    min_peak should prefer op2 immediately after op0.
+    """
+    tensors = {
+        "x": Tensor("x", "fp32", (4, 4)),
+        "w1": Tensor("w1", "fp32", (4, 256), const=True),
+        "w2": Tensor("w2", "fp32", (4, 256), const=True),
+        "u1": Tensor("u1", "fp32", (256, 4), const=True),
+        "u2": Tensor("u2", "fp32", (256, 4), const=True),
+        "p": Tensor("p", "fp32", (4, 256)),
+        "q": Tensor("q", "fp32", (4, 256)),
+        "pa": Tensor("pa", "fp32", (4, 4)),
+        "qb": Tensor("qb", "fp32", (4, 4)),
+        "y": Tensor("y", "fp32", (4, 4)),
+    }
+    return Graph(
+        tensors=tensors,
+        ops=(
+            Op(id=0, kind="matmul", inputs=("x", "w1"), outputs=("p",), attrs={}),
+            Op(id=1, kind="matmul", inputs=("x", "w2"), outputs=("q",), attrs={}),
+            Op(id=2, kind="matmul", inputs=("p", "u1"), outputs=("pa",), attrs={}),
+            Op(id=3, kind="matmul", inputs=("q", "u2"), outputs=("qb",), attrs={}),
+            Op(id=4, kind="add", inputs=("pa", "qb"), outputs=("y",), attrs={}),
+        ),
+        inputs=("x",),
+        outputs=("y",),
+    )
+
+
 def test_order_produces_a_topological_order():
     g = order(_diamond())
     assert not isinstance(g, Err)
@@ -91,7 +135,11 @@ def test_a_cycle_is_an_err_naming_the_stuck_ops():
     )
     out = order(g, policy="asap")
     assert isinstance(out, Err)
-    assert "cycle" in out.reason or "cycle" in out.detail
+    # The graph has a circular dependency (a->b->a) that is caught by either
+    # cycle detection (cycle in reason) or structural validation (op 0 in detail).
+    assert (
+        "cycle" in out.reason or "cycle" in out.detail or "op 0" in out.detail
+    )
 
 
 def test_peak_live_bytes_is_positive_and_at_least_the_largest_tensor():
@@ -105,3 +153,31 @@ def test_the_whole_encoder_orders_under_both_policies():
         out = order(g, policy=name)
         assert not isinstance(out, Err), name
         assert out.problems() == [], name
+
+
+def test_undeclared_output_tensor_returns_err():
+    """Verify that malformed input (undeclared output) returns Err, not raises."""
+    tensors = {
+        "x": Tensor("x", "fp32", (4,)),
+        "y": Tensor("y", "fp32", (4,)),
+    }
+    g = Graph(
+        tensors=tensors,
+        ops=(Op(id=0, kind="scale", inputs=("x",), outputs=("z",), attrs={"factor": 1.0}),),
+        inputs=("x",),
+        outputs=("y",),
+    )
+    out = order(g)
+    assert isinstance(out, Err)
+    assert "structurally invalid" in out.reason or "structurally invalid" in out.detail
+
+
+def test_min_peak_beats_asap_on_two_independent_chains():
+    """Verify min_peak actually beats asap when declaration order is adversarial.
+
+    Two independent chains with large intermediates; asap holds both live,
+    min_peak completes the first chain before starting the second.
+    """
+    asap = peak_live_bytes(order(_two_chains(), policy="asap"))
+    min_peak = peak_live_bytes(order(_two_chains(), policy="min_peak"))
+    assert min_peak < asap, f"min_peak ({min_peak}) should beat asap ({asap})"

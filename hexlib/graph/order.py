@@ -32,6 +32,13 @@ def _ready_min_peak(ready: list[Op], live_bytes: Mapping[str, int], graph: Graph
 
 
 def _last_use(graph: Graph, name: str, op: Op) -> bool:
+    """Whether this op is the last use of a tensor.
+
+    Uses op.id ordering as an approximation: ids reflect the order the builder
+    emitted, not the order being chosen. This is acceptable for tie-breaking in
+    net_freed() because correctness of the resulting order is guaranteed
+    independently by the ready-set logic.
+    """
     later = [o for o in graph.ops if o.id > op.id and name in o.inputs]
     return not later and name not in graph.outputs
 
@@ -43,6 +50,10 @@ ORDER_POLICIES: Mapping[str, Callable[[list[Op], Mapping[str, int], Graph], Op]]
 
 
 def order(graph: Graph, policy: str = "min_peak") -> Graph | Err:
+    problems = graph.problems()
+    if problems:
+        return Err("graph is structurally invalid", "\n".join(problems))
+
     choose = ORDER_POLICIES.get(policy)
     if choose is None:
         return Err(
@@ -65,6 +76,7 @@ def order(graph: Graph, policy: str = "min_peak") -> Graph | Err:
                 f"no op is ready but {len(remaining)} remain; first stuck: {stuck}",
             )
         chosen = choose(ready, live_bytes, graph)
+        assert chosen in ready, f"policy {policy!r} returned op not in ready set"
         remaining.remove(chosen)
         scheduled.append(chosen)
         for name in chosen.outputs:
