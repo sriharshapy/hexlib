@@ -27,6 +27,12 @@ from hexlib.build import BuildError, build_kernel
 from hexlib.result import Err, Measurements, Ok, Result
 from hexlib.sim import SimError, run_sim
 
+# A near-miss outcome. Three states, not two, because "the near-miss did not
+# run" is not evidence of anything and must never be counted as rejection.
+NEARMISS_REJECTED = "rejected"       # built, ran, harness marked it INCORRECT
+NEARMISS_ACCEPTED = "accepted"       # built, ran, harness marked it CORRECT
+NEARMISS_INCONCLUSIVE = "inconclusive"  # never got a verdict; prefix of a reason
+
 
 @dataclass(frozen=True)
 class VerifyReport:
@@ -34,7 +40,7 @@ class VerifyReport:
     correct: bool
     kernel_cycles: int
     accel: AccelProof
-    nearmiss: dict[str, bool]  # filename -> True if it correctly FAILED
+    nearmiss: dict[str, str]  # filename -> NEARMISS_* (or an inconclusive reason)
     toolchain_version: str
     sdk_version: str
     host: str
@@ -48,11 +54,22 @@ class VerifyReport:
         # while the arithmetic stayed in scalar registers.
         if not (self.accel.used_hvx_compute or self.accel.used_hmx):
             return False
-        return all(self.nearmiss.values())
+        # No near-misses means the harness was never shown to discriminate.
+        # validate_dir already requires one, but gate_passed must not depend on
+        # a caller having run that check -- all({}) is True, which would be a
+        # silent pass.
+        if not self.nearmiss:
+            return False
+        # Every near-miss must have BUILT, RUN, and been rejected. An
+        # inconclusive one proves nothing: a near-miss that fails to compile
+        # because of an unrelated typo was never offered to the harness at all,
+        # so counting it as rejection would let a broken near-miss green the
+        # gate -- the exact failure this mechanism exists to prevent.
+        return all(v == NEARMISS_REJECTED for v in self.nearmiss.values())
 
     def to_table(self) -> str:
         speedup = ""
-        if self.expert_kernel_cycles:
+        if self.expert_kernel_cycles and self.kernel_cycles:
             ratio = self.expert_kernel_cycles / self.kernel_cycles
             speedup = f" ({ratio:.2f}x vs recorded {self.expert_kernel_cycles})"
         mechs = [
@@ -73,11 +90,14 @@ class VerifyReport:
             f"| kernel_cycles | {self.kernel_cycles}{speedup} |",
             f"| accel (ELF-proven) | {', '.join(mechs) if mechs else 'NONE'} |",
         ]
-        for name, rejected in sorted(self.nearmiss.items()):
-            lines.append(
-                f"| near-miss `{name}` | "
-                f"{'correctly rejected' if rejected else 'WRONGLY ACCEPTED'} |"
-            )
+        for name, state in sorted(self.nearmiss.items()):
+            if state == NEARMISS_REJECTED:
+                shown = "correctly rejected"
+            elif state == NEARMISS_ACCEPTED:
+                shown = "WRONGLY ACCEPTED"
+            else:
+                shown = f"INCONCLUSIVE -- {state}"
+            lines.append(f"| near-miss `{name}` | {shown} |")
         lines += [
             f"| **gate** | **{'PASS' if self.gate_passed() else 'FAIL'}** |",
             "",
@@ -123,20 +143,35 @@ def verify(kernel_dir: str, out_dir: str, sdk_root: str | None = None) -> Result
 
     accel = prove_accel(built.obj, built.bin_dir)
 
-    # Every near-miss must FAIL. A near-miss that builds and passes means the
-    # harness does not discriminate.
-    nearmiss: dict[str, bool] = {}
+    # Every near-miss must build, run, and be REJECTED by the harness.
+    #
+    # A near-miss that fails to build or never produces a verdict is
+    # INCONCLUSIVE, not rejected. It was never offered to the harness, so it
+    # demonstrates nothing about whether the harness discriminates -- and
+    # counting it as rejection would mean a single typo in a near-miss silently
+    # turns the gate green, which is precisely the failure this mechanism
+    # exists to catch.
+    nearmiss: dict[str, str] = {}
     for path in kd.nearmiss_files(kernel_dir):
         name = os.path.basename(path)
         try:
             nm_built = build_kernel(kernel_dir, out_dir, spec.caps, impl=name,
                                     sdk_root=root)
+        except BuildError as e:
+            first = (e.compiler_output or str(e)).strip().splitlines()
+            nearmiss[name] = (
+                f"{NEARMISS_INCONCLUSIVE}: did not build -- "
+                f"{first[0] if first else 'no compiler output'}"
+            )
+            continue
+        try:
             nm_outcome = run_sim(nm_built, spec.caps)
-            nearmiss[name] = not nm_outcome.correct
-        except (BuildError, SimError):
-            # A near-miss that does not build or run has been rejected, which is
-            # the outcome we require of it.
-            nearmiss[name] = True
+        except SimError as e:
+            nearmiss[name] = f"{NEARMISS_INCONCLUSIVE}: did not run -- {e}"
+            continue
+        nearmiss[name] = (
+            NEARMISS_ACCEPTED if nm_outcome.correct else NEARMISS_REJECTED
+        )
 
     report = VerifyReport(
         task_id=spec.task_id,
