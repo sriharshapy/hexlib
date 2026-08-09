@@ -7,13 +7,19 @@ name = "hexlib"
 version = "0.1.0"
 description = "Kernel library and programming model for Qualcomm Hexagon NPUs"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["numpy>=1.24"]
 
 [project.scripts]
 hexlib = "hexlib.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["hexlib*"]
+
+[project.optional-dependencies]
+oracle = ["torch>=2.0", "transformers>=5.10"]
+
+[tool.setuptools.package-data]
+"hexlib.tests" = ["data/*.npz"]
 
 [tool.pytest.ini_options]
 markers = [
