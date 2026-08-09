@@ -1,6 +1,7 @@
 # hexlib/tests/test_contract.py
 import json
 import os
+import pathlib
 
 from hexlib import contract, kerneldir as kd
 
@@ -11,6 +12,7 @@ GOOD_TABLE = """### hexlib verify — rmsnorm_fp16
 | correct | PASS |
 | kernel_cycles | 9798 |
 | accel (ELF-proven) | hvx, hvx-compute |
+| near-miss `nearmiss_x.c` | correctly rejected |
 | **gate** | **PASS** |
 
 target `v75` · toolchain `19.0.04` · SDK `6.4.0.2` · host `me@box` · `2026-08-09T00:00:00Z`
@@ -92,6 +94,28 @@ def test_binary_garbage_result_is_rejected(tmp_path):
     (d / "RESULT.md").write_bytes(bytes([0xFF, 0xFE, 0x00, 0x80, 0x81]))
     problems = contract.check_kernel_contract(str(d))
     assert problems != []
+
+
+def test_result_from_another_kernel_is_rejected(tmp_path):
+    """A table copied from a different kernel is evidence about that kernel,
+    not this one."""
+    problems = contract.check_kernel_contract(
+        _kernel(tmp_path, name="softmax_fp16")
+    )
+    assert any("rmsnorm_fp16" in p and "softmax_fp16" in p for p in problems)
+
+
+def test_nearmiss_not_in_the_table_is_rejected(tmp_path):
+    d = _kernel(tmp_path)
+    (pathlib.Path(d) / "nearmiss_added_later.c").write_text("")
+    problems = contract.check_kernel_contract(d)
+    assert any("nearmiss_added_later.c" in p for p in problems)
+
+
+def test_wrongly_accepted_nearmiss_in_the_table_is_rejected(tmp_path):
+    bad = GOOD_TABLE.replace("correctly rejected", "WRONGLY ACCEPTED")
+    problems = contract.check_kernel_contract(_kernel(tmp_path, table=bad))
+    assert any("nearmiss_x.c" in p for p in problems)
 
 
 def test_corrupted_prose_outside_matched_regions_is_rejected(tmp_path):
