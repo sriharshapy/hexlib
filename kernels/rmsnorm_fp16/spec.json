@@ -1,0 +1,10 @@
+{
+  "task_id": "rmsnorm_fp16",
+  "dtype": "fp16",
+  "caps": [],
+  "mechanisms": ["hvx"],
+  "params": { "R": 8, "C": 128, "eps": 1e-5 },
+  "expert_kernel_cycles": null,
+  "tolerance": "hexlib_close_f16",
+  "tags": ["rmsnorm", "normalization", "fp16", "hvx", "llm", "reduction"]
+}
