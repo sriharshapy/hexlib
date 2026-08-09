@@ -26,6 +26,16 @@ def test_matmul_batched():
     np.testing.assert_allclose(out, a @ b, rtol=1e-5)
 
 
+def test_matmul_with_mixed_dtypes_returns_activation_dtype():
+    # Weights (second input) are fp32 but activation is fp16. The output must be
+    # fp16, not promoted to fp32. This catches numpy's dtype promotion.
+    a = np.arange(6, dtype=np.float16).reshape(2, 3)
+    b = np.arange(12, dtype=np.float32).reshape(3, 4)
+    (out,) = _ref("matmul", (a, b))
+    assert out.dtype == np.float16, f"expected fp16 but got {out.dtype}"
+    np.testing.assert_allclose(out, a.astype(np.float32) @ b, rtol=1e-2)
+
+
 def test_matmul_infer_2d():
     shapes = get("matmul").infer(
         (Tensor("a", "fp16", (8, 768)), Tensor("b", "q4_0", (768, 3072))), {}

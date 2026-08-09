@@ -7,7 +7,7 @@ transpose op ever appears for a projection.
 from __future__ import annotations
 
 import math
-from typing import Any, Mapping, Sequence
+from typing import Sequence
 
 import numpy as np
 
@@ -48,7 +48,7 @@ register(
         kind="matmul",
         infer=_matmul_infer,
         working_set=_default_working_set,
-        reference=lambda arrays, attrs: (arrays[0] @ arrays[1],),
+        reference=lambda arrays, attrs: ((arrays[0] @ arrays[1]).astype(arrays[0].dtype),),
     )
 )
 
@@ -193,6 +193,7 @@ def _rope_2d_reference(arrays, attrs):
     The reference casts q, k, cos and sin to float32 before the rotation and
     casts the result back, so the arithmetic is float regardless of the
     activation dtype. cos/sin are unsqueezed on the head axis (:897).
+    rotate_half is modeling_qwen3_5.py:562.
     """
     x, cos, sin = arrays[0], arrays[1], arrays[2]
     xf = x.astype(np.float32)
