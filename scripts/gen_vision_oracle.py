@@ -37,7 +37,16 @@ TINY = dict(
     in_channels=3,
     spatial_merge_size=2,
     out_hidden_size=32,
-    num_position_embeddings=64,     # an 8x8 learned grid
+    # Deliberately mismatched with GRID (8x8 patches): a 5x5 learned grid
+    # forces the bilinear resample in `pos_embed` to hit non-trivial
+    # fractional weights on every corner. An 8x8-vs-8x8 grid (the previous
+    # value here) makes np.linspace(0, 7, 8) land on exact integers, so
+    # h_frac/w_frac are zero everywhere and the four-corner weighted sum
+    # degenerates to a single-index lookup -- a bug in the weight formula
+    # itself (swapped h_frac/w_frac, wrong corner pairing, a sign error)
+    # would be multiplied by zero and vanish. See docs/research/
+    # oracle-provenance.md for the h_frac evidence this was checked against.
+    num_position_embeddings=25,     # a 5x5 learned grid, mismatched on purpose
     hidden_act="gelu_pytorch_tanh",
 )
 GRID = 8                             # 8x8 patches -> 64 tokens -> 16 merged

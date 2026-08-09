@@ -35,10 +35,6 @@ TINY_CFG = VitConfig(
     weight_dtype="fp32",
 )
 
-# The tiny config's learned position-embedding grid. Must match
-# scripts/gen_vision_oracle.py's TINY["num_position_embeddings"] (64 == 8x8).
-NUM_POSITION_EMBEDDINGS = 64
-
 
 def test_golden_file_exists_and_is_not_empty():
     # If the golden is missing, every test below would skip and the M0 gate
@@ -55,6 +51,36 @@ def test_golden_carries_every_array_the_test_needs():
     for key in ("image", "patches", "expected_merged", "expected_last_hidden"):
         assert key in z, f"golden is missing {key!r}"
     assert any(k.startswith("param::") for k in z.files), "golden carries no weights"
+
+
+def test_pos_embed_grid_is_mismatched_with_the_patch_grid_on_purpose():
+    """The learned position-embedding grid must NOT equal the patch grid.
+
+    If they matched (as an earlier version of this golden did, at 8x8 learned
+    vs 8x8 patches), `np.linspace(0, side - 1, grid)` lands on exact integers,
+    so `h_frac`/`w_frac` are zero for every one of the 64 tokens and the
+    four-corner bilinear weighted sum in `_pos_embed_table` degenerates to a
+    single-index lookup (`[1, 0, 0, 0]` corner weights). A bug in the weight
+    formula itself -- swapped `h_frac`/`w_frac`, wrong corner pairing, a sign
+    error, wrong summation order -- would then be multiplied by zero and
+    vanish, passing the encoder differential at full precision while proving
+    nothing about the interpolation. This asserts the non-degenerate case
+    directly, with the actual fractional values, rather than assuming it.
+    """
+    z = np.load(VISION_NPZ)
+    side = int(z["param::pos_embed.weight"].shape[0] ** 0.5)
+    grid = TINY_CFG.grid
+    assert side != grid, (
+        f"learned grid side {side} equals patch grid {grid}; the bilinear "
+        "interpolation is only exercised at its degenerate, zero-fractional "
+        "-weight corner -- see the docstring"
+    )
+    h_grid = np.linspace(0, side - 1, grid)
+    h_frac = h_grid - h_grid.astype(np.int64)
+    assert np.count_nonzero(h_frac) > 0, (
+        f"h_frac is all zero for side={side}, grid={grid}: {h_frac.tolist()} -- "
+        "the interpolation math cannot be wrong in this configuration"
+    )
 
 
 def test_patchify_matches_the_image_processor():
@@ -200,8 +226,22 @@ def _pos_embed_table(cfg: VitConfig, table: np.ndarray) -> np.ndarray:
     reproduced on the host: bilinearly resample the learned
     `num_grid_per_side x num_grid_per_side` grid onto this config's patch grid,
     in merge-block token order.
+
+    `num_grid_per_side` is derived from `table.shape[0]` (the golden's own
+    `pos_embed.weight` row count), not hardcoded, exactly as
+    `self.num_grid_per_side = int(config.num_position_embeddings**0.5)`
+    (modeling_qwen3_5.py:1039) computes it from the config. A hardcoded
+    constant here would let a future regeneration with a different learned
+    grid size leave `side` silently wrong while `table`'s shape still passes
+    every shape check -- shape-correct but numerically wrong, the exact
+    failure class this oracle otherwise eliminates.
     """
-    side = int(round(NUM_POSITION_EMBEDDINGS**0.5))
+    side = int(table.shape[0] ** 0.5)
+    if side * side != table.shape[0]:
+        raise ValueError(
+            f"pos_embed table has {table.shape[0]} rows, which is not a perfect "
+            "square; num_grid_per_side is undefined"
+        )
     indices, weights = _vision_bilinear_indices_and_weights(cfg.grid, side, cfg.spatial_merge_size)
     out = np.zeros((indices.shape[1], table.shape[1]), dtype=np.float64)
     for i in range(4):
