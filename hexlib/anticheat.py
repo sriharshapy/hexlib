@@ -100,7 +100,7 @@ def disassemble(obj: str, bin_dir: str) -> str:
     failure, which denies credit rather than assuming it."""
     objdump = os.path.join(bin_dir, tc.exe("hexagon-llvm-objdump"))
     env = tc.toolchain_env(bin_dir)
-    rc, out, err, timed_out = tc.run(
+    rc, out, _err, timed_out = tc.run(
         [objdump, "-d", obj], env, timeout=tc.SIM_TIMEOUT_S
     )
     if timed_out or rc != 0:

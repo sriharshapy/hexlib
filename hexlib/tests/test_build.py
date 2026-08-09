@@ -6,14 +6,6 @@ import pytest
 from hexlib import build, toolchain
 
 
-def _have_sdk() -> bool:
-    try:
-        toolchain.find_toolchain_bin(toolchain.default_sdk_root())
-        return True
-    except FileNotFoundError:
-        return False
-
-
 def test_build_error_carries_compiler_output():
     e = build.BuildError("compile failed", "kernel.c:3:1: error: expected ';'")
     assert "expected ';'" in e.compiler_output
@@ -62,7 +54,7 @@ def test_builds_a_trivial_kernel(tmp_path):
 @pytest.mark.sdk
 def test_harness_header_compiles_with_fp16_compare_calls(tmp_path):
     """Regression test: hexlib_close_f16 used to take __fp16 by value, which
-    hexagon-clang++ rejects on the declaration alone ("parameters cannot have
+    hexagon-clang rejects on the declaration alone ("parameters cannot have
     __fp16 type"), so any translation unit that merely included
     hexlib_harness.h failed to build. Task 4's other tests never include the
     header, so that break went uncaught. This test builds a real translation
@@ -199,7 +191,7 @@ def test_compile_failure_reports_the_compiler_message(tmp_path):
     kdir = tmp_path / "broken"
     kdir.mkdir()
     (kdir / "kernel_api.h").write_text("#ifndef K\n#define K\n#endif\n")
-    (kdir / "kernel.c").write_text("this is not c++\n")
+    (kdir / "kernel.c").write_text("this is not c\n")
     (kdir / "harness.c").write_text("int main(void) { return 0; }\n")
     with pytest.raises(build.BuildError) as e:
         build.build_kernel(str(kdir), str(tmp_path / "_work"), caps=[])

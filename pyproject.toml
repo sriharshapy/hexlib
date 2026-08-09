@@ -17,5 +17,5 @@ include = ["hexlib*"]
 
 [tool.pytest.ini_options]
 markers = [
-    "sdk: requires the Hexagon SDK (hexagon-clang++, hexagon-sim). Not run in CI.",
+    "sdk: requires the Hexagon SDK (hexagon-clang, hexagon-sim). Not run in CI.",
 ]

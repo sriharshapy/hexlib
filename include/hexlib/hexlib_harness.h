@@ -55,7 +55,7 @@ static inline unsigned long long hexlib_rdpcyc(void) {
  * HVX float is the non-IEEE qf16 path and float operations reorder, so fp16
  * results are compared with a tolerance, never bit-exactly.
  *
- * WHY THESE TAKE float AND NOT __fp16. hexagon-clang++ rejects __fp16 as a
+ * WHY THESE TAKE float AND NOT __fp16. hexagon-clang rejects __fp16 as a
  * by-value parameter outright:
  *
  *     error: parameters cannot have __fp16 type; did you forget * ?
