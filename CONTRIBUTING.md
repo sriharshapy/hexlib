@@ -7,6 +7,11 @@ You run `hexlib test` on your own machine and attach the result table it prints 
 your pull request. Nobody runs the gates for you, and CI cannot — see "What CI checks
 and what it cannot" below.
 
+`hexlib test` writes the table to `_work/<name>.result.md` **and**, on a pass, to
+`kernels/<name>/RESULT.md`. Commit the `RESULT.md` — CI has no Hexagon SDK, so that
+committed file is the only evidence it can check. Paste the same table into your pull
+request description for reviewers.
+
 This is a deliberate trade, not an oversight: building anything for Hexagon requires
 `hexagon-clang`, so **the SDK is required to use hexlib at all, not merely to
 contribute to it.** Anyone who would deploy a hexlib kernel to a Hexagon NSP needs the
@@ -77,6 +82,16 @@ answer, byte for byte. A tolerance on an integer path would hide wrong results i
 of accommodating the hardware. `validate_dir` enforces this: any `spec.json` whose
 `dtype` contains no floating-point token (`fp16`, `fp32`, `f16`, `f32`, `float`,
 `half`, `bf16`) must declare `"tolerance": "exact"`, or validation fails.
+
+## `spec.json`'s `mechanisms` and `params`
+
+`mechanisms` is checked against the ELF: `hexlib test` rejects a declared `hvx` or
+`hmx` claim the compiled object does not actually show (the two mechanisms that are
+ELF-provable; `dma`, `vtcm`, `l2fetch`, and `scalar` are not, so they are not checked).
+`params` is descriptive metadata only — nothing cross-checks it against
+`kernel_api.h`'s `#define`s, which are what actually gets compiled and are the
+authoritative source of truth for shapes and constants. Keep `params` accurate for
+readers, but do not rely on it being enforced.
 
 ## The bake-off
 
