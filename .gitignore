@@ -1,5 +1,118 @@
-__pycache__/
-*.egg-info/
-.pytest_cache/
-build/
+# ---- hexlib build and verification output ----
+# `hexlib test` writes ELFs, objects, disassembly, and result tables here.
 _work/
+*.result.json
+*.result.md
+
+# Hexagon toolchain artifacts. Kernel sources are tracked; nothing the
+# compiler or simulator produces from them is.
+*.elf
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dll
+*.dylib
+*.lib
+*.d
+*.dwo
+*.disasm
+
+# Simulator side-channel output: --pmu_statsfile dumps and --packet_analyze
+# JSON. Large, machine-specific, and regenerated on every run.
+pmu_stats*.txt
+packet_analyze*.json
+
+# FastRPC / qaic generated sources (silicon path). These are generated from
+# the IDL at build time; the IDL is the source of truth.
+*_stub.c
+*_skel.c
+
+# The Hexagon SDK is license-restricted and is NEVER vendored, bundled, or
+# fetched. It is discovered through HEXAGON_SDK_ROOT. These guard against an
+# accidental copy landing in the repository.
+Hexagon_SDK/
+hexagon_sdk/
+tools/HEXAGON_Tools/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+sdist/
+wheels/
+*.whl
+.installed.cfg
+MANIFEST
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Test and type-checker caches
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+.hypothesis/
+
+# ---- CMake (silicon path) ----
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+build-*/
+
+# ---- Credentials ----
+# QDC device access is personal and local. No credential belongs in this
+# repository, in CI, or in anyone else's hands.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+qdc_credentials*
+**/secrets.json
+
+# ---- Agent workspace ----
+# Plan-scoped scratch: ledgers, briefs, reports, review packages. Git history
+# is the durable record.
+.superpowers/
+
+# ---- Editors ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cache/
+*.code-workspace
+
+# ---- OS ----
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ---- Windows / MSYS ----
+*.stackdump
