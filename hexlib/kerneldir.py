@@ -116,7 +116,14 @@ def validate_dir(kernel_dir: str) -> list[str]:
             problems.append(
                 f"unknown mechanism {mech!r}; known: {sorted(KNOWN_MECHANISMS)}"
             )
-    if isinstance(spec.dtype, str) and is_integer_dtype(spec.dtype) and spec.tolerance != EXACT_TOLERANCE:
+    # A malformed dtype is its own problem, and must be reported rather than
+    # skipped: `is_integer_dtype(None)` would raise on `.lower()`, and silently
+    # passing over it would let a spec with dtype 123 validate completely clean.
+    if not isinstance(spec.dtype, str) or not spec.dtype:
+        problems.append(
+            f"spec.json dtype must be a non-empty string, got {spec.dtype!r}"
+        )
+    elif is_integer_dtype(spec.dtype) and spec.tolerance != EXACT_TOLERANCE:
         problems.append(
             f"dtype {spec.dtype!r} is an integer pipeline, so tolerance must be "
             f"{EXACT_TOLERANCE!r} (bit-exact), not {spec.tolerance!r}. Integer "

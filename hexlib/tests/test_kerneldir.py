@@ -150,3 +150,27 @@ def test_float_kernel_may_also_be_exact(tmp_path):
     spec["dtype"] = "fp32"
     spec["tolerance"] = kd.EXACT_TOLERANCE
     assert kd.validate_dir(_make_kernel(tmp_path, spec)) == []
+
+
+def test_dtype_must_be_string(tmp_path):
+    """dtype must be a string, not an int or other type."""
+    spec = _good_spec()
+    spec["dtype"] = 123
+    problems = kd.validate_dir(_make_kernel(tmp_path, spec))
+    assert any("dtype must be a non-empty string" in p for p in problems)
+
+
+def test_dtype_must_not_be_none(tmp_path):
+    """dtype cannot be None."""
+    spec = _good_spec()
+    spec["dtype"] = None
+    problems = kd.validate_dir(_make_kernel(tmp_path, spec))
+    assert any("dtype must be a non-empty string" in p for p in problems)
+
+
+def test_dtype_must_not_be_empty(tmp_path):
+    """dtype cannot be an empty string."""
+    spec = _good_spec()
+    spec["dtype"] = ""
+    problems = kd.validate_dir(_make_kernel(tmp_path, spec))
+    assert any("dtype must be a non-empty string" in p for p in problems)
