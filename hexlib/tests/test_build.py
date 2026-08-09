@@ -97,6 +97,70 @@ def test_harness_header_compiles_with_fp16_compare_calls(tmp_path):
     assert os.path.isfile(out.obj)
 
 
+def _run_on_sim(bin_dir: str, elf: str) -> str:
+    """Run ELF under hexagon-sim with the project's pinned bus/timing knobs and
+    return combined stdout+stderr. Used only to prove runtime behaviour for the
+    HEXLIB_TIME_KERNEL shadowing regression test below."""
+    sim = os.path.join(bin_dir, toolchain.exe("hexagon-sim"))
+    cmd = [
+        sim,
+        f"-m{toolchain.DSP_ARCH}",
+        "--timing",
+        "--buspenalty",
+        str(toolchain.BUS_PENALTY),
+        "--busratio",
+        str(toolchain.BUS_RATIO),
+        elf,
+    ]
+    env = toolchain.toolchain_env(bin_dir)
+    rc, out, err, timed_out = toolchain.run(cmd, env, timeout=toolchain.SIM_TIMEOUT_S)
+    assert not timed_out, f"hexagon-sim timed out: {cmd}"
+    assert rc == 0, f"hexagon-sim exited {rc}: {(out + err)}"
+    return out + err
+
+
+@pytest.mark.sdk
+def test_time_kernel_does_not_shadow_a_caller_local_named_c0(tmp_path):
+    """Regression test: HEXLIB_TIME_KERNEL used to declare its cycle-counter
+    temporaries as `_c0`/`_c1` in the same block STMT expands into. A caller
+    with its own local named `_c0`, referenced inside the timed statement,
+    got it silently shadowed by the cycle counter -- no compile error, wrong
+    runtime behaviour. This harness declares its own `_c0 = 99`, passes it
+    through a `use()` call inside HEXLIB_TIME_KERNEL, and the simulator run
+    proves `use()` still saw 99 and not a cycle count.
+    """
+    kdir = tmp_path / "shadow"
+    kdir.mkdir()
+    (kdir / "kernel_api.h").write_text(
+        '#ifndef K\n#define K\nextern "C" void trivial(int *o);\n#endif\n'
+    )
+    (kdir / "kernel.c").write_text(
+        '#include "kernel_api.h"\nextern "C" void trivial(int *o) { *o = 7; }\n'
+    )
+    (kdir / "harness.c").write_text(
+        '#include "kernel_api.h"\n'
+        '#include "hexlib/hexlib_harness.h"\n'
+        "static unsigned long long g_seen = 0;\n"
+        "static void use(unsigned long long v) { g_seen = v; }\n"
+        "int main(void) {\n"
+        "    int o = 0;\n"
+        "    trivial(&o);\n"
+        "    unsigned long long _c0 = 99;\n"
+        "    unsigned long long kcyc = 0;\n"
+        "    HEXLIB_TIME_KERNEL(kcyc, use(_c0));\n"
+        "    int shadow_intact = (g_seen == 99);\n"
+        '    printf("SHADOW_CHECK seen=%llu\\n", g_seen);\n'
+        "    hexlib_report(shadow_intact, shadow_intact ? 0 : 1, 0.0, kcyc);\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    out = build.build_kernel(str(kdir), str(tmp_path / "_work"), caps=[])
+    sim_output = _run_on_sim(out.bin_dir, out.elf)
+    assert "SHADOW_CHECK seen=99" in sim_output
+    assert "HEXLIB_VERDICT correct=1" in sim_output
+    assert "HEXLIB_KCYCLES" in sim_output
+
+
 @pytest.mark.sdk
 def test_compile_failure_reports_the_compiler_message(tmp_path):
     kdir = tmp_path / "broken"

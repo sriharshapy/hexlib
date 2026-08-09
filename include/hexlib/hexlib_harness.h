@@ -36,14 +36,19 @@ static inline unsigned long long hexlib_rdpcyc(void) {
     return ((unsigned long long) hi << 32) | lo;
 }
 
-/* Time STMT into OUT (unsigned long long). */
-#define HEXLIB_TIME_KERNEL(OUT, STMT)                    \
-    do {                                                 \
-        hexlib_enable_pcycle();                          \
-        unsigned long long _c0 = hexlib_rdpcyc();        \
-        STMT;                                            \
-        unsigned long long _c1 = hexlib_rdpcyc();        \
-        (OUT) = _c1 - _c0;                               \
+/* Time STMT into OUT (unsigned long long).
+ *
+ * The temporaries are reserved-prefixed because STMT is expanded INSIDE this
+ * block: a caller with its own local named `_c0` would have it silently
+ * shadowed within the timed statement, substituting a cycle counter for the
+ * caller's variable with no compile error. */
+#define HEXLIB_TIME_KERNEL(OUT, STMT)                          \
+    do {                                                       \
+        hexlib_enable_pcycle();                                \
+        unsigned long long __hexlib_c0 = hexlib_rdpcyc();      \
+        STMT;                                                  \
+        unsigned long long __hexlib_c1 = hexlib_rdpcyc();      \
+        (OUT) = __hexlib_c1 - __hexlib_c0;                     \
     } while (0)
 
 /* ---- tolerance compares ----
