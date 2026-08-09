@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import numpy as np
-
 import hexlib.graph.opdefs  # noqa: F401
 from hexlib.graph.ir import Graph, Op, Tensor
 from hexlib.graph.shapes import infer_shapes
@@ -30,12 +28,10 @@ def test_a_consistent_graph_passes_unchanged():
     assert out.tensors["y"].shape == (2, 4)
 
 
-def test_the_pass_does_not_mutate_its_input():
+def test_the_pass_returns_the_same_graph_object_on_success():
     g = _g()
-    before = {n: (t.shape, t.dtype) for n, t in g.tensors.items()}
-    infer_shapes(g)
-    after = {n: (t.shape, t.dtype) for n, t in g.tensors.items()}
-    assert before == after
+    out = infer_shapes(g)
+    assert out is g
 
 
 def test_declared_shape_disagreeing_with_infer_is_an_err():
@@ -105,6 +101,30 @@ def test_output_count_mismatch_is_an_err():
 def test_structurally_invalid_graph_is_an_err_before_inference():
     g = Graph(tensors={}, ops=(), inputs=(), outputs=())
     assert isinstance(infer_shapes(g), Err)
+
+
+def test_malformed_infer_return_is_an_err():
+    from hexlib.graph.ops import OpDef, Registry
+
+    reg = Registry()
+    # infer returns a 3-tuple instead of (shape, dtype) pair
+    reg.register(
+        OpDef(
+            kind="bad_infer",
+            infer=lambda inputs, attrs: (((2,), "fp32", "extra"),),
+            working_set=lambda i, o, a: 1,
+            reference=lambda arrays, attrs: (arrays[0],),
+        )
+    )
+    g = Graph(
+        tensors={"x": Tensor("x", "fp32", (2,)), "y": Tensor("y", "fp32", (2,))},
+        ops=(Op(id=0, kind="bad_infer", inputs=("x",), outputs=("y",), attrs={}),),
+        inputs=("x",),
+        outputs=("y",),
+    )
+    out = infer_shapes(g, registry=reg)
+    assert isinstance(out, Err)
+    assert "op 0" in out.detail and "bad_infer" in out.detail
 
 
 def test_the_whole_qwen35_encoder_at_256_infers_clean():
