@@ -79,6 +79,16 @@ def test_run_never_raises_on_nonzero_exit():
     assert rc == 3 and timed_out is False
 
 
+def test_run_never_raises_on_a_missing_binary():
+    """A missing or unexecutable binary must come back as a nonzero rc with a
+    diagnostic, not as an OSError through every caller."""
+    rc, out, err, timed_out = tc.run(
+        ["hexlib-no-such-binary-anywhere"], dict(os.environ)
+    )
+    assert rc != 0 and timed_out is False
+    assert "hexlib-no-such-binary-anywhere" in err
+
+
 def test_run_decodes_non_utf8_without_dying():
     """Locale decoding (cp1252 on Windows) used to kill subprocess's reader thread
     on a single out-of-codepage byte, surfacing as a bogus compile failure."""

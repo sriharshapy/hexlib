@@ -135,6 +135,12 @@ def verify(kernel_dir: str, out_dir: str, sdk_root: str | None = None) -> Result
         built = build_kernel(kernel_dir, out_dir, spec.caps, sdk_root=root)
     except BuildError as e:
         return Err(f"{spec.task_id}: build failed", e.compiler_output)
+    except (FileNotFoundError, ValueError) as e:
+        # Toolchain discovery: no SDK, an incomplete SDK, or an unreadable
+        # version path. These raise directly out of build_kernel (before any
+        # subprocess is even invoked), so they are not BuildErrors and must be
+        # caught here rather than crashing to a raw traceback.
+        return Err(f"{spec.task_id}: Hexagon SDK is not usable", str(e))
 
     try:
         outcome = run_sim(built, spec.caps)

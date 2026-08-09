@@ -1,7 +1,12 @@
 import json
 
+import pytest
+
+from hexlib import verify as verify_mod
 from hexlib.anticheat import AccelProof
-from hexlib.verify import NEARMISS_ACCEPTED, NEARMISS_REJECTED, VerifyReport
+from hexlib.kerneldir import KernelSpec
+from hexlib.result import is_ok
+from hexlib.verify import NEARMISS_ACCEPTED, NEARMISS_REJECTED, VerifyReport, verify
 
 
 def _report(**over):
@@ -105,3 +110,25 @@ def test_zero_kernel_cycles_does_not_crash_the_table():
 def test_json_round_trips_with_string_valued_nearmiss():
     d = json.loads(_report().to_json())
     assert d["nearmiss"]["nearmiss_no_eps.c"] == NEARMISS_REJECTED
+
+
+def test_missing_sdk_is_reported_not_raised(monkeypatch, tmp_path):
+    """Finding 4: build_kernel raises FileNotFoundError/ValueError directly
+    (toolchain discovery happens before any subprocess call), so verify() must
+    catch those alongside BuildError -- otherwise a missing or partially
+    installed SDK crashes to a raw traceback instead of an Err result."""
+    monkeypatch.setattr(verify_mod.kd, "validate_dir", lambda d: [])
+    monkeypatch.setattr(
+        verify_mod.kd,
+        "load_spec",
+        lambda d: KernelSpec(task_id="k", dtype="fp16"),
+    )
+
+    def _boom(*a, **k):
+        raise FileNotFoundError("No Hexagon toolchain found under '/nope'")
+
+    monkeypatch.setattr(verify_mod, "build_kernel", _boom)
+
+    result = verify(str(tmp_path), str(tmp_path / "_work"))
+    assert not is_ok(result)
+    assert "SDK" in result.reason or "SDK" in (result.detail or "")

@@ -146,7 +146,8 @@ def toolchain_env(bin_dir: str, base_env: Optional[dict] = None) -> dict:
 def run(
     cmd: list, env: dict, timeout: Optional[float] = None
 ) -> tuple[Union[int, None], str, str, bool]:
-    """Run a command, capture stdout+stderr, never raise on nonzero exit or timeout.
+    """Run a command, capture stdout+stderr, never raise on nonzero exit,
+    timeout, or a missing binary.
 
     Returns (returncode | None if timed out, stdout, stderr, timed_out).
 
@@ -176,3 +177,10 @@ def run(
         if isinstance(err, bytes):
             err = err.decode(errors="replace")
         return None, out, err, True
+    except OSError as e:
+        # A missing or unexecutable binary. Returning a nonzero rc rather than
+        # propagating means every existing "if rc != 0" branch handles it
+        # correctly and without change: build.py raises BuildError with this
+        # text, and anticheat.disassemble returns '' -- which is what its
+        # docstring already promises.
+        return 127, "", f"cannot execute {cmd[0]!r}: {e}", False

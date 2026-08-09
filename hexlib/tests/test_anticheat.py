@@ -53,3 +53,15 @@ def test_empty_disassembly_grants_nothing():
     assert not ac.disasm_has_hvx("")
     assert not ac.disasm_has_hvx_compute("")
     assert not ac.disasm_has_hmx("")
+
+
+def test_disassemble_returns_empty_when_objdump_is_missing(tmp_path):
+    """The documented contract: '' on any failure, which denies credit.
+    Before finding 4's fix, a missing objdump binary raised FileNotFoundError
+    straight out of subprocess.run instead of coming back as a failing rc."""
+    assert ac.disassemble("nosuch.o", str(tmp_path / "no_such_bin")) == ""
+
+
+def test_prove_accel_grants_nothing_when_objdump_is_missing(tmp_path):
+    proof = ac.prove_accel("nosuch.o", str(tmp_path / "no_such_bin"))
+    assert not proof.used_hvx and not proof.used_hvx_compute and not proof.used_hmx
