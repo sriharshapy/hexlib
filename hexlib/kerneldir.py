@@ -28,6 +28,25 @@ REQUIRED_FILES: tuple[str, ...] = (
 KNOWN_CAPS = frozenset({"hmx"})
 KNOWN_MECHANISMS = frozenset({"hvx", "hmx", "dma", "vtcm", "l2fetch", "scalar"})
 
+EXACT_TOLERANCE = "exact"
+
+# Any of these appearing anywhere in a dtype string means some part of the
+# pipeline is floating point. Substring matching is deliberate: dtypes in the
+# wild look like "uint8xint8->int32" and "int8->fp16", not like clean enums.
+_FLOAT_DTYPE_TOKENS = ("fp16", "fp32", "f16", "f32", "float", "half", "bf16")
+
+
+def is_integer_dtype(dtype: str) -> bool:
+    """True when no stage of the dtype pipeline is floating point.
+
+    Tolerance comparison exists because HVX float is the non-IEEE qf16 path and
+    float operations reorder, so an fp16 result cannot be compared bit-exactly.
+    An integer path has neither property -- there is exactly one right answer,
+    byte for byte -- so a tolerance there hides wrong results instead of
+    accommodating the hardware.
+    """
+    return not any(tok in dtype.lower() for tok in _FLOAT_DTYPE_TOKENS)
+
 
 @dataclass(frozen=True)
 class KernelSpec:
@@ -97,6 +116,13 @@ def validate_dir(kernel_dir: str) -> list[str]:
             problems.append(
                 f"unknown mechanism {mech!r}; known: {sorted(KNOWN_MECHANISMS)}"
             )
+    if isinstance(spec.dtype, str) and is_integer_dtype(spec.dtype) and spec.tolerance != EXACT_TOLERANCE:
+        problems.append(
+            f"dtype {spec.dtype!r} is an integer pipeline, so tolerance must be "
+            f"{EXACT_TOLERANCE!r} (bit-exact), not {spec.tolerance!r}. Integer "
+            "paths have no reordering and no representation error: a tolerance "
+            "there hides wrong results rather than accommodating the hardware."
+        )
     return problems
 
 
