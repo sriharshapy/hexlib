@@ -139,7 +139,7 @@ for _kind, _fn in (("gelu_tanh", _gelu_tanh_reference), ("gelu_erf", _gelu_erf_r
 
 
 def _softmax_reference(arrays, attrs):
-    axis = attrs.get("axis", -1)
+    axis = attrs["axis"]
     x = arrays[0].astype(np.float64)
     shifted = x - np.max(x, axis=axis, keepdims=True)
     e = np.exp(shifted)
