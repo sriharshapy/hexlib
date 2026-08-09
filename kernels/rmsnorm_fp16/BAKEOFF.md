@@ -14,13 +14,32 @@ compared.
 
 | candidate | source | correct | kernel_cycles | accel (ELF) | notes |
 |---|---|---|---|---|---|
-| scalar baseline | this repo, `baseline.c` copied to `kernel.c` for the Step 6 discrimination check | yes | 69438 | none | reference; both near-misses correctly rejected against it, confirming the harness discriminates before any HVX kernel existed |
-| v6 `rmsnorm_gain_fp16` (adapted) | HVX-clean v6, handwritten, `solutions/s2.c` (ror-shift butterfly reduce) | yes | 2020 | hvx, hvx-compute | **winner.** Original is R=6,C=80 with a PER-ROW scalar gain and recorded 9798 cycles at that shape/2.741x; adapted to R=8,C=128 with hexlib's PER-COLUMN gain (rewrote the scale epilogue as a real vector×vector `w[block]` multiply instead of a scalar-splat gain, since a per-row scalar cannot express a per-column vector) and generalized the reduction from reading only block 0 (correct only for the original's single-block C=80 shape) to accumulating qf16 sum-of-squares across all `nb=C/64` blocks before the one-time ror-shift reduce. eps threaded as a parameter instead of hardcoded `1e-3f`. |
-| v6 `fp16_rmsnorm` (adapted) | HVX-clean v6, handwritten, block-accumulate + unpack-once scalar sum | yes | 10498 | hvx, hvx-compute | Original is n=2048 (single row) and recorded 2311 cycles at that shape/60.53x. **Correction to this task's brief:** the brief describes this candidate as "no gain vector — you must add the w[] multiply", but the actual `expert.c` already multiplies by a per-feature `gamma[]` in the scale epilogue, structurally identical to hexlib's per-column `w[c]`; no gain multiply had to be added. Wrapped the original single-vector body in a `for r in [0,R)` loop (x/y offset by `r*C`, `w[]` reused unchanged every row, exactly like the original's `gamma` not varying by call). eps threaded as a parameter instead of hardcoded `1e-3f`. Loses to candidate A by 5.20x at this shape: its reduction unpacks the qf16 accumulator to memory and finishes with a 64-iteration scalar add loop — negligible when paid once for n=2048, but paid once PER ROW here (8x), while candidate A's ror-shift butterfly never leaves the vector unit. |
+| scalar baseline | this repo, `baseline.c` copied to `kernel.c` for the Step 6 discrimination check | yes | 69443 | none | reference; both near-misses correctly rejected against it, confirming the harness discriminates before any HVX kernel existed |
+| v6 `rmsnorm_gain_fp16` (adapted) | HVX-clean v6, handwritten, `solutions/s2.c` (ror-shift butterfly reduce) | yes | 2021 | hvx, hvx-compute | **winner.** Original is R=6,C=80 with a PER-ROW scalar gain and recorded 9798 cycles at that shape/2.741x; adapted to R=8,C=128 with hexlib's PER-COLUMN gain (rewrote the scale epilogue as a real vector×vector `w[block]` multiply instead of a scalar-splat gain, since a per-row scalar cannot express a per-column vector) and generalized the reduction from reading only block 0 (correct only for the original's single-block C=80 shape) to accumulating qf16 sum-of-squares across all `nb=C/64` blocks before the one-time ror-shift reduce. eps threaded as a parameter instead of hardcoded `1e-3f`. |
+| v6 `fp16_rmsnorm` (adapted) | HVX-clean v6, handwritten, block-accumulate + unpack-once scalar sum | yes | 10498 | hvx, hvx-compute | Original is n=2048 (single row) and recorded 2311 cycles at that shape/60.53x. **Correction to this task's brief:** the brief describes this candidate as "no gain vector — you must add the w[] multiply", but the actual `expert.c` already multiplies by a per-feature `gamma[]` in the scale epilogue, structurally identical to hexlib's per-column `w[c]`; no gain multiply had to be added. Wrapped the original single-vector body in a `for r in [0,R)` loop (x/y offset by `r*C`, `w[]` reused unchanged every row, exactly like the original's `gamma` not varying by call). eps threaded as a parameter instead of hardcoded `1e-3f`. Loses to candidate A by 5.19x at this shape: its reduction unpacks the qf16 accumulator to memory and finishes with a 64-iteration scalar add loop — negligible when paid once for n=2048, but paid once PER ROW here (8x), while candidate A's ror-shift butterfly never leaves the vector unit. |
 | ggml-hexagon `hvx-norm.h` | llama.cpp, MIT | — | — | — | **not evaluated: fp32 only.** `hvx_fast_rms_norm_mul_f32` (`include/hexlib/hvx/hvx-norm.h`) is an exact semantic match — RMSNorm with a per-column gain vector, reduction in `Vqf32`/`Vsf` — but there is no fp16 norm anywhere in the vendored ggml-hexagon set, and v6 has no fp32 norm at all (every v6 norm is fp16 or i8). Comparing an fp32 implementation against fp16 candidates would measure the dtype, not the implementation. Deferred to kernel #2, `rmsnorm_f32`, where it goes head to head with a hexlib implementation on identical fp32 shapes — the first direct measurement against production ggml-hexagon code. |
 
-**Winner:** v6 `rmsnorm_gain_fp16` (adapted) at 2020 cycles, 34.38x over the scalar
-baseline (69438 cycles) and 5.20x over the other HVX candidate (10498 cycles).
+**Fix round 1 (numbers above are post-fix).** `hexlib/build.py` originally linked
+only `[impl.c, harness.c]`, so this kernel's `harness.c` (which calls
+`rmsnorm_fp16_baseline` from `baseline.c` for its reference) could only link by
+`#include`-ing `baseline.c` directly into `harness.c`'s translation unit. That
+workaround was flagged as a blocking follow-up before it calcified into the
+convention every later kernel would copy, and `build_kernel` was fixed to link
+`baseline.c` as its own third source. Re-measuring after the fix: the scalar
+baseline moved 69438 -> 69443 (+5 cycles), the winner moved 2020 -> 2021
+(+1 cycle), and the losing HVX candidate did not move at all (10498 -> 10498).
+Same source, same compiler flags, same harness logic in every case — only the
+final ELF's link-time object layout changed (baseline.c compiles to its own
+object now instead of being merged into harness.o). A cycle-approximate
+simulator with a pinned bus/cache timing model is sensitive to exactly this kind
+of instruction-address/cache-line shift; the reviewer's original conclusion
+(the translation-unit merge could not affect the measurement, since there is no
+LTO and no cross-TU inlining either way) is consistent with a change this small
+and this inconsistent in direction across candidates. The bake-off's conclusion
+(candidate A wins, by roughly the same ~34x/~5x margins) is unaffected.
+
+**Winner:** v6 `rmsnorm_gain_fp16` (adapted) at 2021 cycles, 34.36x over the scalar
+baseline (69443 cycles) and 5.19x over the other HVX candidate (10498 cycles).
 
 **Why it wins:** both HVX candidates vectorize the sum-of-squares reduction and the
 scale epilogue the same way at the block level (`Q6_Vqf16_vmpy_VhfVhf` +

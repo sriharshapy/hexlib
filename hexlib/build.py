@@ -82,13 +82,19 @@ def build_kernel(
     elf = os.path.join(out_dir, f"{stem}.elf")
     obj = os.path.join(out_dir, f"{stem}.o")
 
-    link_cmd = compile_command(
-        compiler,
-        [os.path.join(kernel_dir, impl), os.path.join(kernel_dir, "harness.c")],
-        elf,
-        caps,
-        includes,
-    )
+    # The harness computes its reference by calling into baseline.c, so the ELF
+    # needs three sources, not two. Without this the only way to link is to
+    # `#include "baseline.c"` from harness.c, which works but would become the
+    # convention every kernel copies -- by accident rather than by decision.
+    # `impl` is excluded when it IS baseline.c, so a bake-off can measure the
+    # scalar reference as a candidate without linking it twice.
+    sources = [os.path.join(kernel_dir, impl)]
+    baseline = os.path.join(kernel_dir, "baseline.c")
+    if os.path.isfile(baseline) and os.path.basename(impl) != "baseline.c":
+        sources.append(baseline)
+    sources.append(os.path.join(kernel_dir, "harness.c"))
+
+    link_cmd = compile_command(compiler, sources, elf, caps, includes)
     rc, out, err, timed_out = tc.run(link_cmd, env, timeout=tc.SIM_TIMEOUT_S)
     if timed_out or rc != 0:
         raise BuildError(

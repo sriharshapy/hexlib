@@ -9,13 +9,8 @@
 #include "hexlib/hexlib_harness.h"
 #include "kernel_api.h"
 
-/* build_kernel() (hexlib/build.py) links exactly two sources: <impl>.c and
- * harness.c. baseline.c is never a third link input, so its definition is
- * pulled into THIS translation unit by #including the .c file directly --
- * baseline.c still exists as its own readable, standalone file (kerneldir's
- * REQUIRED_FILES check and human review both see it), it is simply compiled
- * as part of harness.c's object rather than as an independent one. */
-#include "baseline.c"
+void rmsnorm_fp16_baseline(const hexlib_hf *, const hexlib_hf *,
+                           hexlib_hf *, int, int, float);
 
 static hexlib_hf X[RMSNORM_R * RMSNORM_C] HEXLIB_ALIGN;
 static hexlib_hf W[RMSNORM_C]             HEXLIB_ALIGN;

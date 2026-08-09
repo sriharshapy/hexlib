@@ -1,6 +1,11 @@
-/* WINNER of the bake-off recorded in BAKEOFF.md: 2020 kernel cycles vs the
- * scalar baseline's 69438 (34.38x) and vs the other HVX candidate's 10498
- * (5.20x). Adapted from HVX-clean/data/v6/tasks/rmsnorm_gain_fp16/expert.c
+/* WINNER of the bake-off recorded in BAKEOFF.md: 2021 kernel cycles vs the
+ * scalar baseline's 69443 (34.36x) and vs the other HVX candidate's 10498
+ * (5.19x). (Fix round 1 moved this from 2020/69438 by 1 and 5 cycles
+ * respectively after hexlib/build.py started linking baseline.c as its own
+ * object instead of it being #included into harness.c's translation unit --
+ * see BAKEOFF.md's "Fix round 1" note. Same source, same flags; the code the
+ * cycle-approximate simulator times shifted by a byte or two of link layout.)
+ * Adapted from HVX-clean/data/v6/tasks/rmsnorm_gain_fp16/expert.c
  * (solutions/s2.c: vector-native ror-shift horizontal reduce for
  * sum-of-squares, R=6 C=80, recorded 9798 kernel cycles, 2.741x).
  *
