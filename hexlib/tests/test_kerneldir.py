@@ -174,3 +174,45 @@ def test_dtype_must_not_be_empty(tmp_path):
     spec["dtype"] = ""
     problems = kd.validate_dir(_make_kernel(tmp_path, spec))
     assert any("dtype must be a non-empty string" in p for p in problems)
+
+
+def test_non_list_caps_is_a_problem_not_an_exception(tmp_path):
+    """validate_dir promises never to raise; check_kernel_contract runs it
+    against directories supplied by a stranger."""
+    spec = _good_spec()
+    spec["caps"] = 7
+    problems = kd.validate_dir(_make_kernel(tmp_path, spec))
+    assert any("caps must be a list" in p for p in problems)
+
+
+def test_string_caps_is_not_iterated_as_characters(tmp_path):
+    spec = _good_spec()
+    spec["caps"] = "hmx"
+    problems = kd.validate_dir(_make_kernel(tmp_path, spec))
+    assert any("caps must be a list" in p for p in problems)
+    assert not any("'h'" in p for p in problems)
+
+
+def test_non_list_mechanisms_is_a_problem_not_an_exception(tmp_path):
+    spec = _good_spec()
+    spec["mechanisms"] = 7
+    problems = kd.validate_dir(_make_kernel(tmp_path, spec))
+    assert any("mechanisms must be a list" in p for p in problems)
+
+
+def test_non_list_tags_is_a_problem_not_an_exception(tmp_path):
+    spec = _good_spec()
+    spec["tags"] = 7
+    problems = kd.validate_dir(_make_kernel(tmp_path, spec))
+    assert any("tags must be a list" in p for p in problems)
+
+
+def test_spec_that_is_not_an_object_is_a_problem(tmp_path):
+    d = tmp_path / "rmsnorm_fp16"
+    d.mkdir()
+    for f in kd.REQUIRED_FILES:
+        _write(str(d), f)
+    _write(str(d), "nearmiss_no_eps.c")
+    _write(str(d), "spec.json", "42")
+    problems = kd.validate_dir(str(d))
+    assert any("JSON object" in p for p in problems)

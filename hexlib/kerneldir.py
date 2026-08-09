@@ -69,6 +69,10 @@ def load_spec(kernel_dir: str) -> KernelSpec:
         raise ValueError(f"{path} does not exist")
     except json.JSONDecodeError as e:
         raise ValueError(f"{path} is not valid JSON: {e}")
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"{path} must contain a JSON object, got {type(raw).__name__}"
+        )
     if "task_id" not in raw or "dtype" not in raw:
         raise ValueError(f"{path} must contain 'task_id' and 'dtype'")
     known = {f.name for f in KernelSpec.__dataclass_fields__.values()}
@@ -108,14 +112,27 @@ def validate_dir(kernel_dir: str) -> list[str]:
             f"spec.json task_id is {spec.task_id!r} but the directory is "
             f"{expected_id!r}; they must match"
         )
-    for cap in spec.caps:
-        if cap not in KNOWN_CAPS:
-            problems.append(f"unknown cap {cap!r}; known caps: {sorted(KNOWN_CAPS)}")
-    for mech in spec.mechanisms:
-        if mech not in KNOWN_MECHANISMS:
+    # A malformed list field must be reported, not raised: validate_dir promises
+    # never to raise, and check_kernel_contract runs it against directories
+    # supplied by a stranger. `for cap in 7` is a TypeError, and a bare string
+    # would iterate its characters and report three phantom problems.
+    for field_name, known in (("caps", KNOWN_CAPS), ("mechanisms", KNOWN_MECHANISMS)):
+        value = getattr(spec, field_name)
+        if not isinstance(value, list):
             problems.append(
-                f"unknown mechanism {mech!r}; known: {sorted(KNOWN_MECHANISMS)}"
+                f"spec.json {field_name} must be a list of strings, got {value!r}"
             )
+            continue
+        for item in value:
+            if not isinstance(item, str) or item not in known:
+                problems.append(
+                    f"unknown {field_name[:-1]} {item!r}; known "
+                    f"{field_name}: {sorted(known)}"
+                )
+    if not isinstance(spec.tags, list) or not all(
+        isinstance(t, str) for t in spec.tags
+    ):
+        problems.append(f"spec.json tags must be a list of strings, got {spec.tags!r}")
     # A malformed dtype is its own problem, and must be reported rather than
     # skipped: `is_integer_dtype(None)` would raise on `.lower()`, and silently
     # passing over it would let a spec with dtype 123 validate completely clean.
