@@ -83,6 +83,19 @@ _CASES = {
         (Tensor("a", "fp16", (2, 3)), Tensor("b", "fp32", (3, 4))),
         (np.arange(6, dtype=np.float16).reshape(2, 3), np.arange(12, dtype=np.float32).reshape(3, 4)),
     ),
+    "matmul_epilogue": _case(
+        (
+            Tensor("a", "fp16", (2, 3)),
+            Tensor("b", "q4_0", (3, 4)),
+            Tensor("bias", "fp32", (4,)),
+        ),
+        (
+            np.arange(6, dtype=np.float16).reshape(2, 3),
+            np.arange(12, dtype=np.float32).reshape(3, 4),
+            np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
+        ),
+        {"act": "none"},
+    ),
     "patchify": _case(
         (Tensor("img", "fp32", (1, 1, 4, 4)),),
         (np.arange(16, dtype=np.float32).reshape(1, 1, 4, 4),),
