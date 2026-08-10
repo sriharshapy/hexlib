@@ -1,38 +1,57 @@
 /* hexlib/runtime/simhost/simhost.c -- the host side, for the simulator.
  *
+ * TASK 7B UPDATE: this file is now compiled into a QuRT-hosted SHARED OBJECT
+ * (build_sim_so, hexlib/runtime/build.py), dlopen'd by the SDK's own prebuilt
+ * `run_main_on_hexagon_sim` under a real booted QuRT kernel, instead of a
+ * standalone `--force-dynamic` qexe (task 7's build_sim_qexe, retired -- see
+ * build.py's module docstring for why). This file's OWN code did not change;
+ * only how it gets packaged and launched did. It still has a plain `main()`
+ * that `run_main_on_hexagon`'s own dsp-side driver calls after dlopen.
+ *
  * ============================================================================
  * WHAT A SIMULATOR RUN OF THIS FILE DOES NOT PROVE -- READ THIS FIRST.
  *
  * This file calls hexlib_iface_open/_start/_mmap/_invoke/_stop/_close as
- * PLAIN C FUNCTIONS, bound by the linker DIRECTLY to skel.c's definitions.
+ * PLAIN C FUNCTIONS, bound by the linker DIRECTLY to skel.c's definitions --
+ * simhost.o and the skel archive are both compiled into the SAME .so, so
+ * this is still an ordinary intra-module call, not a qaic-marshalled one.
  * The qaic-generated stub (hexlib_iface_stub.c) -- the code that would
  * actually marshal these calls into a `remote_arg` scalar/buffer list and
  * drive them through `remote_handle64_open`/`_invoke` -- is DELIBERATELY NOT
- * LINKED INTO THIS QEXE AT ALL. It defines the exact same function names as
+ * LINKED INTO THIS .SO AT ALL. It defines the exact same function names as
  * skel.c's DSP-side implementation (confirmed by running qaic and reading
- * both generated files back), so linking both into one address space is a
+ * both generated files back), so linking both into one module is a
  * duplicate-symbol error, not merely redundant. The SDK's own calculator
  * example makes the identical choice: `calculator_q_C_SRCS` in
  * examples/calculator/hexagon.min never includes calculator_stub.c either.
+ * Packaging this file as a shared object rather than a standalone executable
+ * does NOT change this -- it changes how VTCM's own weak symbols get
+ * resolved (dynamically, against the host process, at dlopen time -- see
+ * build_sim_so's comment in build.py), not whether the qaic stub is linked
+ * (it still is not).
  *
  * CONSEQUENCE: a simulator run through this file exercises hexlib's OWN
  * code -- batch parsing (hexlib_dispatch_batch), the buffer table
  * (hexlib_bufs_register/_map), the kernel dispatch table
- * (hexlib_kernel_table), kernel correctness, and PCYCLE accounting -- but it
- * does NOT exercise qaic's argument marshaling/demarshaling at all. That is
- * a real gap against this project's own design spec, which describes the
- * simulator path as exercising "a qaic stub/skel invoke": what actually
- * happens here is a plain function call, and the marshaling layer is
- * completely bypassed. Marshaling is only exercised on a real device, where
- * the stub and skel genuinely live in separate processes and the call
- * cannot avoid the wire.
+ * (hexlib_kernel_table), kernel correctness, PCYCLE accounting, and now (as
+ * of task 7b) real VTCM acquisition -- but it does NOT exercise qaic's
+ * argument marshaling/demarshaling at all. That is a real gap against this
+ * project's own design spec, which describes the simulator path as
+ * exercising "a qaic stub/skel invoke": what actually happens here is a
+ * plain function call, and the marshaling layer is completely bypassed.
+ * Marshaling is only exercised on a real device, where the stub and skel
+ * genuinely live in separate processes and the call cannot avoid the wire.
  * ============================================================================
  *
  * WHY THIS EXISTS. On a device the host is an aarch64 Android binary. On the
- * simulator there is no aarch64, so the "host" is Hexagon code in the same ELF
- * as the skel. That is the SDK's own BUILD_QEXES pattern (examples/calculator's
- * calculator_q), verified directly against that example at v75 on this
- * toolchain: it prints "Sum = 32640 / Pass: 2 Fail: 0" and exits 0.
+ * simulator there is no aarch64, so the "host" is Hexagon code in the same
+ * module as the skel. Originally (task 7) that module was a monolithic
+ * standalone qexe, the SDK's own BUILD_QEXES pattern (examples/calculator's
+ * calculator_q). As of task 7b it is a shared object instead, because a
+ * standalone qexe can never satisfy VTCM's real client/server manager (real
+ * QuRT thread/clock primitives it structurally cannot host) -- see
+ * .superpowers/sdd/2026-08-10-silicon-path-runtime/
+ * investigation-sim-vtcm-and-marshalling.md.
  *
  * WHY THIS FILE CALLS hexlib_iface_open/start/mmap/invoke/stop/close DIRECTLY,
  * NOT THROUGH THE QAIC-GENERATED STUB. Reading calculator_q's own link line and
@@ -41,7 +60,7 @@
  * (hexlib_iface_open, _start, _mmap, _invoke, ...) as the DEVELOPER'S skel-side
  * implementation in skel.c -- on a device these live in two different ELFs
  * (host APK vs. DSP .so) so the names never collide, but statically linking
- * both into ONE qexe would be a duplicate-symbol error. calculator's own
+ * both into ONE module would be a duplicate-symbol error. calculator's own
  * hexagon.min never compiles calculator_stub.c into calculator_q either: only
  * the generated *_skel.c (an unused, harmless archive member here) and the
  * developer's *_imp.c (which implements calculator_open/_close/_sum/_max
@@ -49,15 +68,29 @@
  * calculator_open/_sum resolve straight to that developer implementation --
  * there is no marshaling, no remote_handle64_open/_invoke, on this path at all
  * (confirmed by `hexagon-nm` on rtld.a/test_util.a/atomic.a: none of them
- * define remote_handle64_open/_close/_invoke). hexlib_q follows the same
- * shape: this file calls hexlib_iface_open/etc. as plain C functions, which
- * the linker binds directly to skel.c's definitions.
+ * define remote_handle64_open/_close/_invoke). This file follows the same
+ * shape: it calls hexlib_iface_open/etc. as plain C functions, which the
+ * linker binds directly to skel.c's definitions.
  *
- * IT SPEAKS THE PROTOCOL THAT ALREADY EXISTS. hexlib_in.bin / hexlib_out.bin,
- * the same files `hexlib/exec/hexagon.py` already writes and reads for the
- * standalone-ELF path -- host file I/O works in a standalone sim ELF and was
- * verified directly. So the acceptance test is one that already passes by
- * another route, and any difference is the new path's fault.
+ * FILE I/O UNDER THE QURT-HOSTED PACKAGING -- READS AND WRITES ARE NOT
+ * SYMMETRIC, CONFIRMED EMPIRICALLY (task 7b). Under task 7's standalone qexe,
+ * relative fopen() paths resolved through hexagon-sim's own `--usefs <dir>`
+ * angel-mode redirection for both reads and writes, so hexlib_in.bin/
+ * hexlib_batch.bin/hexlib_out.bin/hexlib_rsp.bin all lived in one place. Under
+ * this file's new QuRT-hosted packaging, relative fopen() READS of
+ * hexlib_batch.bin/hexlib_in.bin still resolve through --usefs correctly
+ * (verified: a batch that exists ONLY under --usefs's directory, nowhere
+ * else, is read and executed correctly). But relative fopen(..., "wb") WRITES
+ * of hexlib_rsp.bin/hexlib_out.bin land in the REAL launching process's own
+ * working directory instead -- QuRT's own POSIX filesystem layer, not the
+ * simulator's angel-mode redirection, appears to own file creation once a
+ * real QuRT kernel is booted, and it does not consult --usefs the same way.
+ * CONSEQUENCE FOR CALLERS (Task 8): a harness that wants the response/output
+ * files to land next to the batch/input files it wrote MUST launch the
+ * hexagon-sim subprocess with its OWN working directory set to the same
+ * directory passed as --usefs (e.g. Python's subprocess `cwd=` kwarg) --
+ * this file cannot fix this from its own side, because it does not know at
+ * compile time what directory a future caller will use as --usefs.
  *
  * THE ONE THING TO BE CAREFUL ABOUT. Host and DSP are one address space here.
  * This file must never hand the skel a pointer; it registers an fd with
@@ -65,7 +98,11 @@
  * does. `--unmapped` exercises the negative case, which is the test that makes
  * a simulator pass transferable: it deliberately skips hexlib_iface_mmap, so
  * the skel must refuse (HEXLIB_DSP_ERR_UNMAPPED), not silently read the host's
- * address the way a shared-address-space bug would let it.
+ * address the way a shared-address-space bug would let it. THIS BEHAVIOR MUST
+ * NOT CHANGE: `--unmapped` is load-bearing for Task 8's own discriminator
+ * test, which proves a skel that leaned on the shared address space would
+ * pass a request whose buffer was never mapped -- do not "fix" this into
+ * mapping anyway.
  *
  * hexlib_iface_invoke HAS NO "resultLenOut" PARAMETER (see skel.c's own header
  * comment: `rout sequence<octet> result` marshals only a capacity). The

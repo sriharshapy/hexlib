@@ -1,14 +1,38 @@
 # hexlib/runtime/build.py
-"""Build the runtime: qaic, the DSP skel, the simulator qexe, the device binary.
+"""Build the runtime: qaic, the DSP skel, the simulator artifact, the device binary.
 
 `hexlib/build.py` is untouched — it builds standalone kernel ELFs and its
 contract is depended on by the whole existing gate. This is a second builder for
 a second kind of artifact, sharing only `toolchain.py`.
 
-THE LINK RECIPE IS NOT RECONSTRUCTED. The simulator flags and libraries below
-were recovered from the SDK calculator example's own `calculator_q_link.txt`
-after building and running it at v75 on this toolchain, where it printed
-`Sum = 32640 / Pass: 2 Fail: 0` at rev_id 0x00008c75. They are known to work.
+THE LINK RECIPES ARE NOT RECONSTRUCTED. They were recovered by actually
+building SDK reference examples on this toolchain and reading back the exact
+commands the SDK's own build system used, never guessed:
+
+- The (now-retired) standalone-qexe recipe was recovered from the SDK
+  calculator example's own `calculator_q_link.txt` at v75, where it printed
+  `Sum = 32640 / Pass: 2 Fail: 0` at rev_id 0x00008c75.
+- The QuRT-hosted `.so` recipe below (`build_sim_so`, `SIM_SO_LINK_FLAGS`) was
+  recovered from the SDK's own `libs/run_main_on_hexagon` example's
+  `test_main_so_link.txt`, `run_main_on_hexagon_sim_link.txt`, and
+  `sim_cmd_line.txt`, produced by `make hexagon BUILD=Debug DSP_ARCH=v75` in
+  that example directory (never inside this repo, never checked in — see
+  `.superpowers/sdd/2026-08-10-silicon-path-runtime/
+  investigation-sim-vtcm-and-marshalling.md`). That run demonstrated a real
+  8 MiB VTCM acquisition succeeding (`rc=0`, `ptr=0xd9000000`) under a real
+  QuRT kernel on `hexagon-sim`; the standalone qexe cannot do this (VTCM's
+  manager object needs real QuRT thread/clock primitives no standalone qexe
+  can provide — see the same investigation).
+
+WHY THE STANDALONE QEXE RECIPE IS GONE. `build_sim_qexe`/`SIM_LINK_FLAGS`/
+`SIM_LINK_EXTRAS` used to live here (task 7). They still link and still reach
+`hexlib_iface_open`, but `hexlib_iface_start` can NEVER succeed through that
+path — VTCM acquisition needs real QuRT, which a standalone
+`--force-dynamic` qexe structurally cannot host. Keeping a build path around
+that is permanently incapable of the one thing this runtime exists to prove
+is worse than removing it: a future reader would have to rediscover, by
+hitting the same wall again, that it is a dead end. The QuRT-hosted `.so`
+below is the only path that reaches a successful `start()` in simulation.
 """
 from __future__ import annotations
 
@@ -81,66 +105,12 @@ def run_qaic(idl: str, out_dir: str, sdk_root: str | None = None) -> QaicOutput:
 
 
 # ============================================================================
-# The simulator qexe: skel library + host, one Hexagon ELF.
-#
-# THE LINK RECIPE IS NOT RECONSTRUCTED. SIM_LINK_FLAGS and SIM_LINK_EXTRAS were
-# recovered from the SDK calculator example's own `calculator_q_link.txt` after
-# building and running it at v75 on toolchain 19.0.04, where it printed
-# `Sum = 32640 / Pass: 2 Fail: 0` at rev_id 0x00008c75. They are also directly
-# confirmable in the SDK's own make rules: EXE_LD_FLAGS in
-# build/make.d.ext/hexagon/defines_hexagon_1_9.min is exactly LD_FLAGS (-m<arch>
-# -G0, the two --defsym flags, --no-threads) plus --dynamic-linker=, -E, and
-# --force-dynamic,-u,main.
-#
-# THE GENERATED STUB IS NEVER COMPILED INTO THIS QEXE, ON PURPOSE. qaic's
-# generated hexlib_iface_stub.c defines hexlib_iface_open/_close/_start/_stop/
-# _mmap/_munmap/_hwinfo/_invoke as HOST-side wrappers that marshal and call
-# remote_handle64_open/_invoke/_close. hexlib/runtime/skel/skel.c defines the
-# SAME function names as the DSP-side developer implementation (confirmed by
-# running qaic and reading both generated files back). On a device these live
-# in two different ELFs (host APK vs. DSP .so) so the names never collide;
-# statically linking both into one qexe is a duplicate-symbol link error.
-# calculator_q's own hexagon.min settles how the SDK itself avoids this: it
-# never adds calculator_stub.c to calculator_q's sources, only the generated
-# *_skel.c (present but unused here -- nothing in this qexe references its one
-# exported symbol, hexlib_iface_skel_handle_invoke, so the archive's lazy
-# member extraction never pulls it in) and the developer's skel-side
-# implementation. `hexagon-nm` on rtld.a/test_util.a/atomic.a confirms none of
-# them define remote_handle64_open/_close/_invoke at all -- there would be
-# nothing for the stub to call even if it were linked. simhost.c therefore
-# calls hexlib_iface_open/_start/_mmap/_invoke/_stop/_close as plain C
-# functions, which the linker binds directly to skel.c's definitions: one
-# address space, one function table, no marshaling.
-SIM_LINK_FLAGS = [
-    "-G0",
-    "-Wl,--defsym=ISDB_TRUSTED_FLAG=2",
-    "-Wl,--defsym=ISDB_SECURE_FLAG=2",
-    "-Wl,--no-threads",
-    "-Wl,--dynamic-linker=",
-    "-Wl,-E",
-    "-Wl,--force-dynamic,-u,main",
-]
-
-
-def SIM_LINK_EXTRAS(sdk_root: str, tools_root: str) -> list[str]:
-    """Prebuilt libraries a standalone (NO_QURT_INC-style) qexe needs.
-
-    test_util.a and atomic.a ship only for v68 and link correctly against v75
-    (confirmed: `hexagon-nm test_util.a` resolves cleanly at v75 link time, and
-    the SDK's own calculator.min uses the identical v68 archives for a v75
-    qexe). test_util.a is also where rpcmem_alloc/rpcmem_to_fd/rpcmem_free are
-    actually DEFINED for a standalone Hexagon build -- rpcmem.h has no
-    inline/static implementation of them, and the only prebuilt `rpcmem.a` in
-    the SDK targets v68, not v75. Using test_util.a's rpcmem avoids that
-    mismatch entirely rather than risking it.
-    """
-    j = os.path.join
-    return [
-        j(sdk_root, "ipc", "fastrpc", "rtld", "ship", "hexagon_toolv19_v75", "rtld.a"),
-        j(sdk_root, "utils", "sim_utils", "prebuilt", "hexagon_toolv19_v68", "test_util.a"),
-        j(sdk_root, "libs", "atomic", "prebuilt", "hexagon_toolv19_v68", "atomic.a"),
-        j(tools_root, "Tools", "target", "hexagon", "lib", "v75", "G0", "libhexagon.a"),
-    ]
+# The historical standalone-qexe recipe (task 7's SIM_LINK_FLAGS/
+# SIM_LINK_EXTRAS/build_sim_qexe) lived here and is gone -- see the module
+# docstring's "WHY THE STANDALONE QEXE RECIPE IS GONE" for why. The recipe
+# below replaces it: a QuRT-hosted shared object (see "The simulator
+# artifact" further down).
+# ============================================================================
 
 
 def runtime_include_dirs(sdk_root: str, gen_dir: str) -> list[str]:
@@ -251,6 +221,14 @@ def build_skel_lib(kernels: list[str], out_dir: str,
         cmd = compile_command(
             compiler, [s], o, ["hvx"], common_includes + extra, compile_only=True
         )
+        # -fpic: this archive is only ever linked into build_sim_so's shared
+        # object below (a real device skel is ALSO always built as a shared
+        # object loaded by qaic's own dlopen machinery — this is not a
+        # simulator-only concession, it is the same code shape a device skel
+        # needs). PIC objects link into a --force-dynamic executable too, so
+        # this does not foreclose reusing the archive for a non-PIC link
+        # later if one is ever needed.
+        cmd.insert(1, "-fpic")
         rc, out, err, to = tc.run(cmd, env, timeout=tc.SIM_TIMEOUT_S)
         if to or rc != 0:
             raise RuntimeBuildError(f"compile failed: {s}", (out + err).strip())
@@ -264,56 +242,231 @@ def build_skel_lib(kernels: list[str], out_dir: str,
     return lib
 
 
-def build_sim_qexe(out_dir: str, sdk_root: str | None = None) -> str:
-    """Link the simulator host + skel + rtld into one runnable ELF.
+# ============================================================================
+# The simulator artifact: a QuRT-hosted shared object, dlopen'd by the SDK's
+# OWN prebuilt `run_main_on_hexagon_sim` under a real booted QuRT kernel.
+#
+# WHY A SHARED OBJECT, NOT A STANDALONE QEXE. Task 7's standalone
+# `--force-dynamic` qexe (gone now, see the module docstring) never links in
+# the VTCM manager's weak symbols with real definitions, and forcing that
+# object in demands real QuRT thread/clock primitives a standalone qexe
+# cannot provide (investigation-sim-vtcm-and-marshalling.md, Q1). The SDK's
+# OWN way to run arbitrary code under a real QuRT kernel on `hexagon-sim` is
+# `libs/run_main_on_hexagon`: a prebuilt host executable
+# (`run_main_on_hexagon_sim`, already shipped for this exact toolchain/arch
+# combination at
+# `$SDK/libs/run_main_on_hexagon/ship/hexagon_toolv19_v75/run_main_on_hexagon_sim`)
+# that links real `libqurt.a` + `rtld.a` + `test_util.a` + `atomic.a`
+# `--whole-archive` (confirmed by reading its own recovered link line), boots
+# a real QuRT kernel under `hexagon-sim` via `runelf.pbn` + `osam.cfg`, then
+# `dlopen()`s a user-supplied `.so` and calls its `main()`. `test_main.so` is
+# the SDK's own reference payload for this; `build_sim_so` below produces
+# hexlib's own payload the identical way, recovered from that same example's
+# `test_main_so_link.txt` (`-fpic -shared -Wl,-Bsymbolic -lc`, nothing else --
+# rtld/test_util/atomic/libqurt are NOT relinked into the .so, because they
+# are already inside the host process that dlopen's it, and its own -E/
+# --export-dynamic-equivalent link makes their symbols visible to the .so at
+# dlopen time). This is what makes VTCM acquisition, real: HAP_compute_res.h's
+# weak `compute_resource_query_VTCM` pointer, unresolved (null) in a
+# standalone qexe, resolves for real here against test_util.a's
+# sysmon_vtcm_mgr_client.o -- and its hard qurt_thread_get_id/
+# qurt_sysclock_get_hw_ticks/etc. dependencies resolve against the real
+# libqurt.a already linked into the host process. Demonstrated end to end in
+# the investigation: rc=0, an 8 MiB query, and a real acquired pointer
+# (0xd9000000) inside the QuRT kernel's own reported TCM_PHYSPOOL range.
+#
+# ==========================================================================
+# WHAT A SIMULATOR RUN OF THIS .SO DOES NOT PROVE -- READ THIS FIRST.
+#
+# simhost.c (compiled into this .so) still calls hexlib_iface_open/_start/
+# _mmap/_invoke/_stop/_close as PLAIN C FUNCTIONS, bound directly to skel.c's
+# definitions -- both are compiled into the SAME .so, so this is still an
+# ordinary intra-module call, not a qaic-marshalled one. The qaic-generated
+# stub (hexlib_iface_stub.c) is DELIBERATELY NOT ONE OF THE SOURCES LINKED
+# HERE, for the identical reason as before: it defines the exact same
+# function names as skel.c's DSP-side implementation (confirmed by running
+# qaic and reading both generated files back), so linking both into one
+# module is a duplicate-symbol error, not merely redundant. Packaging the
+# host as a shared object rather than a standalone executable does not
+# change this -- it changes HOW VTCM's own weak symbols get resolved (now
+# dynamically, against the host process, at dlopen time), not whether the
+# qaic stub is linked (it still is not).
+#
+# CONSEQUENCE: a simulator run through this .so exercises hexlib's OWN code
+# -- batch parsing, the buffer table, the kernel dispatch table, kernel
+# correctness, PCYCLE accounting, and now VTCM acquisition -- but it does NOT
+# exercise qaic's argument marshaling/demarshaling at all. That is a real gap
+# against this project's own design spec, which describes the simulator path
+# as exercising "a qaic stub/skel invoke": what actually happens is a plain
+# function call, and the marshaling layer is completely bypassed. Marshaling
+# is only exercised on a real device, where the stub and skel genuinely live
+# in separate processes and the call cannot avoid the wire.
+# ==========================================================================
 
-    ==========================================================================
-    WHAT A SIMULATOR RUN OF THIS ELF DOES NOT PROVE -- READ THIS FIRST.
+SIM_SO_LINK_FLAGS = [
+    "-G0",
+    "-Wl,--defsym=ISDB_TRUSTED_FLAG=2",
+    "-Wl,--defsym=ISDB_SECURE_FLAG=2",
+    "-Wl,--no-threads",
+    "-fpic",
+    "-shared",
+    "-Wl,-Bsymbolic",
+    "-lc",
+]
 
-    simhost.c calls hexlib_iface_open/_start/_mmap/_invoke/_stop/_close as
-    PLAIN C FUNCTIONS, bound by the linker DIRECTLY to skel.c's definitions.
-    The qaic-generated stub (hexlib_iface_stub.c) is DELIBERATELY NOT ONE OF
-    THE SOURCES LINKED HERE. It defines the exact same function names as
-    skel.c's DSP-side implementation, so linking both into one address space
-    is a duplicate-symbol error, not merely redundant (confirmed by running
-    qaic and reading both generated files back). The SDK's own calculator
-    example makes the identical choice: `calculator_q_C_SRCS` in
-    examples/calculator/hexagon.min never includes calculator_stub.c either.
+# SIM_V_ARCH: the SDK's OWN per-arch simulator revision string, recovered
+# verbatim from build/make.d.ext/hexagon/defines_hexagon_1_9.min -- NOT a
+# mechanical "<arch>na_1" suffix rule (v68 and v81 use different suffixes
+# entirely), so this is a lookup, not a format string.
+_SIM_V_ARCH = {
+    "v68": "v68n_1024",
+    "v69": "v69na",
+    "v73": "v73na_1",
+    "v75": "v75na_1",
+    "v79": "v79na_1",
+    "v81": "v81qa_1",
+}
 
-    CONSEQUENCE: a simulator run through this ELF exercises hexlib's OWN
-    code -- batch parsing, the buffer table, the kernel dispatch table,
-    kernel correctness, and PCYCLE accounting -- but it does NOT exercise
-    qaic's argument marshaling/demarshaling at all. That is a real gap
-    against this project's own design spec, which describes the simulator
-    path as exercising "a qaic stub/skel invoke": what actually happens is a
-    plain function call, and the marshaling layer is completely bypassed.
-    Marshaling is only exercised on a real device, where the stub and skel
-    genuinely live in separate processes and the call cannot avoid the wire.
-    ==========================================================================
+
+def sim_v_arch(arch: str = tc.DSP_ARCH) -> str:
+    return _SIM_V_ARCH.get(arch, arch)
+
+
+def _run_main_on_hexagon_dir(sdk_root: str, arch: str = tc.DSP_ARCH) -> str:
+    return os.path.join(
+        sdk_root, "libs", "run_main_on_hexagon", "ship",
+        f"hexagon_toolv19_{arch}",
+    )
+
+
+def run_main_on_hexagon_sim_path(sdk_root: str, arch: str = tc.DSP_ARCH) -> str:
+    """The SDK's OWN prebuilt QuRT-hosted launcher. Referenced by path from
+    the SDK, never copied into this repo (the SDK is license-restricted)."""
+    return os.path.join(_run_main_on_hexagon_dir(sdk_root, arch),
+                        "run_main_on_hexagon_sim")
+
+
+def runelf_pbn_path(sdk_root: str, arch: str = tc.DSP_ARCH) -> str:
+    return os.path.join(sdk_root, "rtos", "qurt", f"compute{arch}",
+                        "sdksim_bin", "runelf.pbn")
+
+
+def build_sim_so(out_dir: str, sdk_root: str | None = None) -> str:
+    """Link the simulator host + skel into a QuRT-hosted shared object.
+
+    Recovered from the SDK's own `libs/run_main_on_hexagon` example's
+    `test_main_so_link.txt` (see the module-level comment above this
+    function for the full recipe provenance).
     """
     root = sdk_root or tc.default_sdk_root()
     bin_dir = tc.find_toolchain_bin(root)
     env = tc.toolchain_env(bin_dir)
     compiler = os.path.join(bin_dir, tc.exe(tc.COMPILER))
-    tools_root = os.path.dirname(os.path.dirname(bin_dir))
-    repo = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
     gen = os.path.join(out_dir, "gen")
 
     lib = os.path.join(out_dir, "libhexlib_skel.a")
     if not os.path.isfile(lib):
         raise RuntimeBuildError(f"build_skel_lib must run first: {lib} missing")
 
-    elf = os.path.join(out_dir, "hexlib_q")
-    cmd = [compiler] + tc.cflags_for_caps(["hvx"]) + SIM_LINK_FLAGS
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    simhost_c = os.path.join(repo, "hexlib", "runtime", "simhost", "simhost.c")
+
+    so = os.path.join(out_dir, "hexlib_sim.so")
+    cmd = [compiler] + tc.cflags_for_caps(["hvx"]) + SIM_SO_LINK_FLAGS
     for d in runtime_include_dirs(root, gen):
         cmd.append(f"-I{d}")
-    cmd += ["-o", elf, "-Wl,--start-group",
-            os.path.join(repo, "hexlib", "runtime", "simhost", "simhost.c"),
-            lib]
-    cmd += SIM_LINK_EXTRAS(root, tools_root)
-    cmd += ["-Wl,--end-group"]
+    cmd += [
+        "-Wl,-Map=" + so + ".map",
+        "-Wl,-soname=" + os.path.basename(so),
+        "-o", so,
+        "-Wl,--start-group", simhost_c, lib, "-Wl,--end-group",
+    ]
 
     rc, out, err, to = tc.run(cmd, env, timeout=tc.SIM_TIMEOUT_S)
-    if to or rc != 0 or not os.path.isfile(elf):
-        raise RuntimeBuildError("linking hexlib_q failed", (out + err).strip())
-    return elf
+    if to or rc != 0 or not os.path.isfile(so):
+        raise RuntimeBuildError("linking hexlib_sim.so failed", (out + err).strip())
+    return so
+
+
+def write_qurt_sim_configs(out_dir: str, sdk_root: str | None = None,
+                           tools_root: str | None = None,
+                           arch: str = tc.DSP_ARCH) -> tuple[str, str]:
+    """Write osam.cfg and q6ss.cfg into `out_dir` (never the source tree --
+    `_work/` and `*.cfg` alongside build output are already git-ignored via
+    the same rules that already ignore *.o/*.a/*.so there).
+
+    NOT VENDORING: each file is one or two lines naming an existing SDK
+    artifact BY PATH (the QuRT debugger model, and two cosim timer/interrupt
+    controller shims); no SDK file's bytes are copied. Recovered verbatim
+    from rtos/qurt/qurt_libs_priv.min's own $(OBJ_DIR)/osam.cfg and
+    $(OBJ_DIR)/q6ss.cfg rules (Windows branch: this project only targets
+    Windows per toolchain.py/CLAUDE.md conventions already established
+    elsewhere in this codebase).
+    """
+    root = sdk_root or tc.default_sdk_root()
+    bin_dir = tc.find_toolchain_bin(root)
+    tools = tools_root or os.path.dirname(os.path.dirname(bin_dir))
+    os.makedirs(out_dir, exist_ok=True)
+
+    is_arm64 = os.environ.get("PROCESSOR_ARCHITEW6432") == "ARM64"
+    debugger_dir = "Win_arm64" if is_arm64 else "Win"
+    qurt_model = os.path.join(root, "rtos", "qurt", f"compute{arch}",
+                              "debugger", debugger_dir, "qurt_model.dll")
+    if not os.path.isfile(qurt_model):
+        raise RuntimeBuildError(f"QuRT debugger model not found: {qurt_model}")
+    osam_cfg = os.path.join(out_dir, "osam.cfg")
+    with open(osam_cfg, "w") as f:
+        f.write(qurt_model + "\n")
+
+    iss_dir = os.path.join(tools, "Tools", "lib", "iss")
+    qtimer = os.path.join(iss_dir, "qtimer.dll")
+    l2vic = os.path.join(iss_dir, "l2vic.dll")
+    for f in (qtimer, l2vic):
+        if not os.path.isfile(f):
+            raise RuntimeBuildError(f"simulator cosim module not found: {f}")
+    q6ss_cfg = os.path.join(out_dir, "q6ss.cfg")
+    with open(q6ss_cfg, "w") as f:
+        f.write(f"{qtimer} --csr_base=0xFC900000 --irq_p=3 --freq=19200000 --cnttid=1\n")
+        f.write(f"{l2vic} 32 0xFC910000\n")
+
+    return osam_cfg, q6ss_cfg
+
+
+def sim_qurt_command(out_dir: str, so_path: str, sdk_root: str | None = None,
+                     extra_args: tuple[str, ...] = (),
+                     arch: str = tc.DSP_ARCH) -> list[str]:
+    """Assemble the full hexagon-sim invocation that boots a real QuRT
+    kernel, then dlopen's `so_path` (which must already sit inside
+    `out_dir`) and calls its main(argc, argv) with `extra_args`.
+
+    Recovered from the SDK's own `libs/run_main_on_hexagon` example's
+    `sim_cmd_line.txt` at v75/toolv19 -- the exact shape its own
+    QURT_QEXE_EXEC/QEXE_EXEC make rules produce (rtos/qurt/
+    qurt_libs_priv.min), not reconstructed.
+
+    Pure with respect to the filesystem except for locating hexagon-sim and
+    the two prebuilt SDK artifacts by path -- assertable without running it,
+    like sim.py's own sim_command().
+    """
+    root = sdk_root or tc.default_sdk_root()
+    bin_dir = tc.find_toolchain_bin(root)
+    sim_exe = os.path.join(bin_dir, tc.exe("hexagon-sim"))
+
+    osam_cfg = os.path.join(out_dir, "osam.cfg")
+    q6ss_cfg = os.path.join(out_dir, "q6ss.cfg")
+    run_main = run_main_on_hexagon_sim_path(root, arch)
+    runelf = runelf_pbn_path(root, arch)
+
+    cmd = [
+        sim_exe, f"-m{sim_v_arch(arch)}", "--simulated_returnval",
+        "--usefs", out_dir,
+        "--pmu_statsfile", os.path.join(out_dir, "pmu_stats.txt"),
+        "--cosim_file", q6ss_cfg,
+        "--l2tcm_base", "0xd800",
+        "--rtos", osam_cfg,
+        runelf, "--",
+        run_main, "--",
+        os.path.basename(so_path),
+    ]
+    cmd += list(extra_args)
+    return cmd
