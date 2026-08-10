@@ -99,12 +99,24 @@ def test_libcdsprpc_is_dlopened_not_linked(driver):
     """A missing driver becomes a readable message instead of a loader
     failure with no output -- this is why a well-built capability probe works
     the first time it runs on real hardware. Scoped to hexlib_drv_init():
-    dlopen() and the candidate path must
-    both live in the function that actually loads the driver, not merely
-    somewhere in the file (e.g. a comment mentioning both)."""
+    dlopen() and the candidate path must both live in the function that
+    actually loads the driver, not merely somewhere in the file (e.g. a
+    comment mentioning both). AND a NULL handle -- every candidate path
+    failed -- must actually fail hexlib_drv_init from inside its own check,
+    not merely be logged: a build that calls dlopen() and ignores a NULL
+    result would otherwise satisfy the presence checks above and still crash
+    the first time a dlsym() runs against it."""
     body = _function_body(driver, "hexlib_drv_init")
     assert "dlopen(" in body
     assert "libcdsprpc.so" in body
+
+    null_check = re.search(r"handle\s*==\s*NULL", body)
+    assert null_check, "a failed dlopen() must be checked, not assumed to succeed"
+    null_block = _block_from(body, null_check.end())
+    assert re.search(r"return\s+-1\s*;", null_block), (
+        "a NULL driver handle must actually fail hexlib_drv_init, not just "
+        "be logged"
+    )
 
 
 def test_every_symbol_is_resolved_by_name_and_checked(driver):
@@ -171,9 +183,34 @@ def test_the_uri_is_built_not_hardcoded_with_a_domain(session):
     """The URI must be assembled from hexlib_iface_URI (qaic-generated) and
     CDSP_DOMAIN (<remote.h>'s own "&_dom=cdsp" macro) as adjacent string
     literals -- never spelled out as a literal "&_dom=cdsp" string, which
-    would silently stop tracking either constant if it ever changed."""
-    assert re.search(r"hexlib_iface_URI\s+CDSP_DOMAIN\b", session)
+    would silently stop tracking either constant if it ever changed.
+
+    THIS CHECKS CONSTRUCTION *FLOWING INTO USE*, not mere co-occurrence in
+    the file: it is not enough for `hexlib_iface_URI CDSP_DOMAIN` to appear
+    somewhere in session.c if the variable it builds is dead code and
+    hexlib_iface_open() is actually called with something else entirely.
+    So this captures the constructed variable's name and asserts THAT name
+    is what is passed as hexlib_iface_open's first argument, in hexlib_open
+    itself, after the construction."""
+    body = _function_body(session, "hexlib_open")
+    construct = re.search(
+        r"(\w+)\s*\[\]\s*=\s*hexlib_iface_URI\s+CDSP_DOMAIN\b", body
+    )
+    assert construct, (
+        "hexlib_open must build the URI from hexlib_iface_URI and CDSP_DOMAIN"
+    )
     assert '"&_dom=cdsp"' not in session
+
+    var = construct.group(1)
+    open_call = re.search(rf"\bhexlib_iface_open\s*\(\s*{re.escape(var)}\s*,", body)
+    assert open_call, (
+        f"the constructed URI variable ({var!r}) must be passed as the "
+        "first argument to hexlib_iface_open -- not merely constructed and "
+        "left unused while something else is opened"
+    )
+    assert construct.start() < open_call.start(), (
+        "the URI must be constructed before it is passed to hexlib_iface_open"
+    )
 
 
 def test_arch_is_queried_from_the_driver_not_assumed(session):
@@ -200,13 +237,33 @@ def test_no_literal_request_ids(session):
     counting an enum in a doc comment; the real value is 2. A wrong request id
     does not fail loudly -- it queries something else. So every request id
     must come from <remote.h>'s own enums, never a bare number passed
-    straight to the control APIs."""
+    straight to the control APIs.
+
+    NEGATIVE HALF (absence of the bad pattern) paired with a POSITIVE HALF
+    (presence of the right one): a purely negative check would pass
+    vacuously if the real `remote_handle_control`/`remote_session_control`
+    calls were deleted outright, which is exactly the kind of gutted
+    implementation these tests exist to catch."""
     assert "#include <remote.h>" in session
     assert not re.search(r"=\s*11\b", session)
     # Nothing may pass a literal digit as the request id argument itself --
     # that would dodge the "= 11" check above while still hardcoding a
     # different id the same way.
     assert not re.search(r"remote_(handle|session)_control\s*\(\s*\d", session)
+
+    caps_body = _function_body(session, "hexlib_query_caps")
+    assert re.search(
+        r"hexlib_remote_handle_control\s*\(\s*DSPRPC_GET_DSP_INFO\s*,", caps_body
+    ), "hexlib_query_caps must actually call remote_handle_control with DSPRPC_GET_DSP_INFO"
+
+    enable_body = _function_body(session, "enable_unsigned_pd")
+    assert re.search(
+        r"hexlib_remote_session_control\s*\(\s*DSPRPC_CONTROL_UNSIGNED_MODULE\s*,",
+        enable_body,
+    ), (
+        "enable_unsigned_pd must actually call remote_session_control with "
+        "DSPRPC_CONTROL_UNSIGNED_MODULE"
+    )
 
 
 def test_buffers_use_rpcmem_and_fastrpc_mmap(buffers):
