@@ -1,0 +1,15 @@
+{
+  "task_id": "cast_f32_f16",
+  "dtype": "fp32->fp16",
+  "caps": [],
+  "mechanisms": ["hvx"],
+  "params": {
+    "n": 4160,
+    "n_odd": 4133,
+    "encoder_shape": "[256, 1536]",
+    "encoder_op_count": 1
+  },
+  "expert_kernel_cycles": null,
+  "tolerance": "hexlib_close_f16",
+  "tags": ["elementwise", "encoder", "dtype-boundary"]
+}

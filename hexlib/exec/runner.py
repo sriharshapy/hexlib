@@ -181,6 +181,19 @@ SPECS: dict[str, RunnerSpec] = {
             "than given a second kernel."
         ),
     ),
+    "cast": RunnerSpec(
+        kind="cast",
+        kernel_dir="kernels/cast_f32_f16",
+        inputs=("fp32",),
+        out_dtype="fp16",
+        scalars=(Scalar("numel:0", "int"),),
+        requires=(("dtype", "fp16"),),
+        notes=(
+            "1 op, [256,1536] fp32 -> fp16, the host/activation dtype boundary. "
+            "`requires` pins the target dtype: `cast` is a general op kind and a "
+            "cast to anything else would be a different kernel."
+        ),
+    ),
     "transpose": RunnerSpec(
         kind="transpose",
         kernel_dir="kernels/transpose_th_fp16",
