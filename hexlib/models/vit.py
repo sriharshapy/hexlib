@@ -229,7 +229,7 @@ def _layernorm(
     return b.emit("layernorm", (x, w, bias), out_name, shape, {"eps": eps})
 
 
-def _get_positive_int_field_names() -> set[str]:
+def _get_positive_int_field_names() -> tuple[str, ...]:
     """Get the names of all int-typed fields in VitConfig that must be positive.
 
     Every int field is a count, a dimension, or a divisor somewhere in
@@ -239,13 +239,17 @@ def _get_positive_int_field_names() -> set[str]:
     an `Err`. This derives the set of field names from VitConfig's type
     annotations rather than maintaining a hand-written tuple: a field added
     to `VitConfig` later is immediately guarded without changing this function.
+
+    Returned sorted, not as a set: config problems get printed and pasted into
+    PRs, and hash-order iteration would make that output non-deterministic
+    across processes for no reason.
     """
     hints = get_type_hints(VitConfig)
     int_field_names = set()
     for field in fields(VitConfig):
         if hints.get(field.name) is int:
             int_field_names.add(field.name)
-    return int_field_names
+    return tuple(sorted(int_field_names))
 
 
 def _config_problems(cfg: VitConfig) -> list[str]:

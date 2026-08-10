@@ -76,7 +76,15 @@ def order(graph: Graph, policy: str = "min_peak") -> Graph | Err:
                 f"no op is ready but {len(remaining)} remain; first stuck: {stuck}",
             )
         chosen = choose(ready, live_bytes, graph)
-        assert chosen in ready, f"policy {policy!r} returned op not in ready set"
+        if chosen not in ready:
+            return Err(
+                "ordering policy returned an op outside the ready set",
+                f"policy {policy!r} returned op "
+                f"{getattr(chosen, 'id', chosen)!r}, which is not in the "
+                "current ready set; a scheduler that invents ops is not a "
+                "scheduler, and this must fail as an Err, not an assert that "
+                "vanishes under -O",
+            )
         remaining.remove(chosen)
         scheduled.append(chosen)
         for name in chosen.outputs:

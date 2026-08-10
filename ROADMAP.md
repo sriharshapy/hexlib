@@ -62,14 +62,17 @@ covers every op of that kind across all 12 blocks), not individual promoted kern
 a kind needs at least one kernel clearing the six gates in `CONTRIBUTING.md` before it
 can leave this list. Ordered by `predicted_bytes_moved` from the bake-off
 (`python -m pytest hexlib/tests/test_policy_bakeoff.py -q -s`, `qwen35@256`,
-`min_peak`/`linear_scan`) — the highest-value kernel to write is at the top, because it
-is the one moving the most DDR traffic and therefore the one most likely to be
-memory-bound in practice. Kinds tied at zero bytes moved (their inputs are already
-VTCM-resident; they cost compute cycles, not DMA) are broken by step count, descending.
+`min_peak`/`largest_first`, the shipped default as of the whole-branch review that
+also made the plan move the image in and the encoder's output back out -- see the
+fix report below) — the highest-value kernel to write is at the top, because it is the
+one moving the most DDR traffic and therefore the one most likely to be memory-bound
+in practice. Kinds tied at zero bytes moved (their inputs are already VTCM-resident;
+they cost compute cycles, not DMA) are broken by step count, descending.
 
 | op kind | steps | predicted bytes moved | status | related backlog kernel |
 |---|---|---|---|---|
-| `matmul_epilogue` | 75 | 55,868,416 | `kernel: None` | fused matmul+bias, closest to `matmul_i8_hmx` |
+| `matmul_epilogue` | 75 | 55,999,488 | `kernel: None` | fused matmul+bias, closest to `matmul_i8_hmx` |
+| `patchify` | 1 | 1,572,864 | `kernel: None` | runs once, at the input -- now includes the image's own DMA-in |
 | `add` | 25 | 786,432 | `kernel: None` | residual add, elementwise |
 | `layernorm` | 25 | 153,600 | `kernel: None` | reduction, adjacent to `rmsnorm_fp16`/`rmsnorm_f32` |
 | `rope_2d` | 24 | 131,072 | `kernel: None` | 2D variant of `rope_fp16` |
@@ -78,10 +81,14 @@ VTCM-resident; they cost compute cycles, not DMA) are broken by step count, desc
 | `matmul` | 24 | 0 | `kernel: None` | unfused QK^T / attn·V, compute-bound not DMA-bound |
 | `scale` | 12 | 0 | `kernel: None` | elementwise |
 | `softmax` | 12 | 0 | `kernel: None` | same subsystem checkpoint as `softmax_fp16` |
-| `patchify` | 1 | 0 | `kernel: None` | runs once, at the input |
 | `cast` | 1 | 0 | `kernel: None` | runs once, at the input |
 
-Total across all eleven kinds: `predicted_bytes_moved = 56,939,520` at 256x256, against
-the measured `vtcm_high_water = 5,111,808` of an 8,388,608-byte budget — see
-`.superpowers/sdd/2026-08-09-vlm-encoder-m1-pass-pipeline/task-9-report.md` for the full
-plan.
+Total across all eleven kinds: `predicted_bytes_moved = 58,643,456` at 256x256, against
+the measured `vtcm_high_water = 5,355,648` of an 8,388,608-byte budget (63.8%). Both
+figures now include the image's DMA-in and the encoder output's DMA-out (previously
+missing entirely -- see the whole-branch fix report), and `vtcm_high_water` now
+includes the const/weight-streaming region (previously computed and budget-checked,
+but never folded into `plan.vtcm` or the reported high-water number). See
+`.superpowers/sdd/2026-08-09-vlm-encoder-m1-pass-pipeline/task-9-report.md` for the
+original plan and `final-fix-report.md` for the cross-cutting fixes that produced the
+numbers above.

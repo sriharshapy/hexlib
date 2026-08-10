@@ -151,7 +151,7 @@ def main(argv: list[str] | None = None) -> int:
              "when planning for real hardware.",
     )
     pl.add_argument("--order-policy", default="min_peak")
-    pl.add_argument("--alloc-policy", default="linear_scan")
+    pl.add_argument("--alloc-policy", default="largest_first")
     pl.add_argument("--print", dest="print_plan", action="store_true")
     pl.add_argument("--out", default="")
     pl.set_defaults(func=_cmd_plan)
