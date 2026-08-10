@@ -58,6 +58,12 @@ class KernelSpec:
     expert_kernel_cycles: int | None = None
     tolerance: str = "exact"
     tags: list[str] = field(default_factory=list)
+    movement_only: bool = False
+    """Declares that this op performs no arithmetic (a transpose, a gather).
+
+    Changes what the gate demands as proof of acceleration: vector USE rather
+    than vector ARITHMETIC. See VerifyReport.movement_only for why, and why it is
+    not a way to opt out of the check."""
 
 
 def load_spec(kernel_dir: str) -> KernelSpec:

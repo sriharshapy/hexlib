@@ -1,0 +1,18 @@
+{
+  "task_id": "transpose_th_fp16",
+  "dtype": "fp16",
+  "caps": [],
+  "mechanisms": ["hvx"],
+  "params": {
+    "T": 8,
+    "H": 3,
+    "D": 64,
+    "D_odd": 40,
+    "encoder_shape": "[256, 12, 64] -> [12, 256, 64]",
+    "encoder_op_count": 36
+  },
+  "expert_kernel_cycles": null,
+  "tolerance": "exact",
+  "movement_only": true,
+  "tags": ["layout", "encoder", "attention"]
+}

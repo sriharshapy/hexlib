@@ -134,6 +134,24 @@ def _run_elf(elf: str, cwd: str, caps: list[str]) -> str:
     return combined
 
 
+def _out_shape(spec, arrays: tuple[np.ndarray, ...], attrs: Mapping[str, Any]):
+    """The output's shape.
+
+    Elementwise ops keep the first input's shape. A permutation does not -- its
+    output is the input's shape reordered by `perm` -- and reusing the input shape
+    there would reshape the returned bytes wrongly and hand back garbage that
+    still has the right element count.
+    """
+    shape = tuple(arrays[0].shape)
+    perm = attrs.get("perm")
+    if perm is not None:
+        return tuple(shape[i] for i in perm)
+    declared = attrs.get("shape")
+    if declared is not None:
+        return tuple(declared)
+    return shape
+
+
 def backend_for(
     kind: str,
     work_dir: str | None = None,
@@ -166,7 +184,10 @@ def backend_for(
     def backend(
         arrays: tuple[np.ndarray, ...], attrs: Mapping[str, Any]
     ) -> tuple[np.ndarray, ...]:
-        out_shape = tuple(arrays[0].shape)
+        # An op kind is not always one kernel. Refused before the kernel runs,
+        # because the failure mode otherwise is a correctly-shaped wrong answer.
+        spec.check_requires(attrs)
+        out_shape = _out_shape(spec, arrays, attrs)
         with open(os.path.join(work, IN_NAME), "wb") as f:
             f.write(spec.encode(arrays, attrs))
 

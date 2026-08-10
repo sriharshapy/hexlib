@@ -48,13 +48,39 @@ class VerifyReport:
     expert_kernel_cycles: int | None = None
     n_wrong: int = 0
     max_err: float = 0.0
+    movement_only: bool = False
+    """This op performs NO arithmetic, so its acceleration is bytes per
+    instruction rather than vector arithmetic.
+
+    Set from `spec.json`. It exists because the encoder contains 49 pure layout
+    ops -- two transposes and a patchify -- and the default accel rule below was
+    written when every kernel in the project was a compute kernel. A transpose
+    that moves 128 bytes per instruction instead of 2 IS accelerated, and it has
+    no arithmetic to put in a vector register.
+
+    NARROW ON PURPOSE, and it does not turn the check off. A movement-only
+    kernel must still prove it used the vector unit (`used_hvx`), so a purely
+    scalar implementation still fails the gate. What it drops is only the
+    requirement of vector ARITHMETIC, which for this class of op would be
+    satisfiable only by adding arithmetic that does not belong there -- gaming
+    the check rather than passing it.
+
+    It is declared in the committed spec and printed in the result table, so a
+    reviewer sees the claim. A kernel that does have arithmetic and sets this
+    flag is a reviewable lie, not a silent one.
+    """
 
     def gate_passed(self) -> bool:
         if not self.correct:
             return False
+        if self.movement_only:
+            # No arithmetic exists to vectorise; using the vector unit at all is
+            # the whole claim, and a scalar implementation still fails here.
+            if not self.accel.used_hvx:
+                return False
         # Load-only HVX is not acceleration: bytes moved through the vector unit
         # while the arithmetic stayed in scalar registers.
-        if not (self.accel.used_hvx_compute or self.accel.used_hmx):
+        elif not (self.accel.used_hvx_compute or self.accel.used_hmx):
             return False
         # No near-misses means the harness was never shown to discriminate.
         # validate_dir already requires one, but gate_passed must not depend on
@@ -74,6 +100,9 @@ class VerifyReport:
         if self.expert_kernel_cycles and self.kernel_cycles:
             ratio = self.expert_kernel_cycles / self.kernel_cycles
             speedup = f" ({ratio:.2f}x vs recorded {self.expert_kernel_cycles})"
+        # Printed, so the weaker accel requirement is visible to a reviewer
+        # rather than buried in spec.json.
+        movement = " · movement-only (no arithmetic)" if self.movement_only else ""
         mechs = [
             n
             for n, v in (
@@ -91,7 +120,8 @@ class VerifyReport:
             f"| correct | {'PASS' if self.correct else 'FAIL'} |",
             f"| max abs error | {self.max_err:.6g} (n_wrong {self.n_wrong}) |",
             f"| kernel_cycles | {self.kernel_cycles}{speedup} |",
-            f"| accel (ELF-proven) | {', '.join(mechs) if mechs else 'NONE'} |",
+            f"| accel (ELF-proven) | "
+            f"{', '.join(mechs) if mechs else 'NONE'}{movement} |",
         ]
         for name, state in sorted(self.nearmiss.items()):
             if state == NEARMISS_REJECTED:
@@ -237,6 +267,7 @@ def verify(kernel_dir: str, out_dir: str, sdk_root: str | None = None) -> Result
         expert_kernel_cycles=spec.expert_kernel_cycles,
         n_wrong=outcome.n_wrong,
         max_err=outcome.max_err,
+        movement_only=bool(getattr(spec, "movement_only", False)),
     )
 
     os.makedirs(out_dir, exist_ok=True)

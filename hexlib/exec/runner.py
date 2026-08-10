@@ -83,11 +83,28 @@ class RunnerSpec:
     inputs: tuple[str, ...]
     out_dtype: str
     scalars: tuple[Scalar, ...] = ()
+    # Attr values this kernel is only valid for. An op kind is not always one
+    # kernel: `transpose` covers three distinct permutations in this graph, and
+    # handing a perm(0,2,1) op to the perm(1,0,2) kernel would produce a
+    # perfectly-shaped, silently WRONG layout. Every shape check downstream
+    # passes, so nothing but the values would catch it. Checked before the
+    # kernel is invoked, and a mismatch is an error rather than a fallback.
+    requires: tuple[tuple[str, Any], ...] = ()
     # Output shape comes from the graph, not from the kernel: the op's `infer`
     # already declared it and the executor checks it. A kernel that returned a
     # different length fails the byte-count check in the backend.
     out_shape_from: str = "declared"
     notes: str = ""
+
+    def check_requires(self, attrs: Mapping[str, Any]) -> None:
+        for key, want in self.requires:
+            got = attrs.get(key)
+            if got != want:
+                raise ValueError(
+                    f"{self.kernel_dir} implements {self.kind} only for "
+                    f"{key}={want!r}, but this op has {key}={got!r}. Dispatching "
+                    "it here would produce a correctly-shaped wrong answer."
+                )
 
     def __post_init__(self) -> None:
         for dtype in self.inputs + (self.out_dtype,):
@@ -162,6 +179,28 @@ SPECS: dict[str, RunnerSpec] = {
             "25 ops. 24 are fp16+fp16; the 25th takes an fp32 right operand "
             "(the learned pos_embed) and is rounded to fp16 on the wire rather "
             "than given a second kernel."
+        ),
+    ),
+    "transpose": RunnerSpec(
+        kind="transpose",
+        kernel_dir="kernels/transpose_th_fp16",
+        inputs=("fp16",),
+        out_dtype="fp16",
+        scalars=(
+            Scalar("dim:0:0", "int"),
+            Scalar("dim:0:1", "int"),
+            Scalar("dim:0:2", "int"),
+        ),
+        requires=(("perm", (1, 0, 2)),),
+        notes=(
+            "48 of the graph's 60 transposes: perm (1,0,2) in both directions, "
+            "[256,12,64]->[12,256,64] (36 ops) and [12,256,64]->[256,12,64] "
+            "(12 ops). One kernel covers both, because swapping axes 0 and 1 is "
+            "the same operation with the dims passed the other way round.\n"
+            "The remaining 12 are perm (0,2,1), which transposes the INNERMOST "
+            "two axes -- no contiguous run survives, so it is a genuinely "
+            "different kernel. `requires` refuses them rather than returning a "
+            "correctly-shaped wrong answer."
         ),
     ),
 }
