@@ -34,18 +34,40 @@ def test_attr_scalar_comes_from_params_blob():
     assert "a->params" in src
 
 
-def test_requires_is_enforced_on_the_dsp_not_only_on_the_host():
+def test_perm_requirement_is_documented_as_unenforceable_not_faked():
     """transpose covers three signatures. Handing a perm (0,2,1) op to the perm
     (1,0,2) kernel returns a correctly-shaped, silently WRONG layout that every
-    downstream shape check accepts. It must be refused before the kernel runs,
-    on whichever side the request arrives."""
+    downstream shape check accepts -- but `hexlib_args` has no field that
+    carries a permutation (only per-buffer buf/ne/dtype/layout, plus n_buf,
+    vtcm, params, n_threads), so no `if` written here could ever fail on a
+    perm mismatch. Enforcement lives only on the host, in
+    `RunnerSpec.check_requires`, before the op is ever put on the wire. This
+    gap must be documented plainly, not papered over with a check that cannot
+    fail -- a check that cannot fail is indistinguishable from no check at all
+    except that it looks like protection."""
     src = ge.emit_entry("transpose", rn.SPECS["transpose"])
-    assert "HEXLIB_DSP_ERR_REQUIRES" in src
+    assert "NOT VERIFIED ON THE DSP" in src
+    assert "perm" in src, "the gap should name the key it cannot verify"
+    checks = [line for line in src.splitlines() if line.strip().startswith("if (")]
+    assert not any("perm" in line for line in checks), (
+        "a reachable `if` mentioning perm would be a check that cannot fail, "
+        "i.e. exactly the decorative check this generator must not emit"
+    )
 
 
 def test_cast_requires_fp16_dtype():
+    """Unlike `perm`, `dtype` maps onto a real per-buffer field
+    (`hexlib_args.dtype[]`), so this one must be a reachable check, not just a
+    documented gap -- asserting only the status-code string would still pass
+    if the real check were downgraded to a comment, which is the one thing
+    this test exists to catch."""
     src = ge.emit_entry("cast", rn.SPECS["cast"])
     assert "HEXLIB_DSP_ERR_REQUIRES" in src
+    checks = [line for line in src.splitlines() if line.strip().startswith("if (")]
+    assert any("a->dtype[" in line for line in checks), (
+        "the dtype requirement must be a reachable `if (a->dtype[...] ...)` "
+        "check, not only documented"
+    )
 
 
 def test_table_is_sorted_and_terminated():

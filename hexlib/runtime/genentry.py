@@ -66,22 +66,19 @@ class GenError(Exception):
     pass
 
 
-def _scalar_expr(sc: Scalar, spec: RunnerSpec, param_index: int) -> tuple[str, str]:
-    """(C expression, C type) for one scalar. Returns the DSP-side derivation."""
+def _scalar_expr(sc: Scalar, spec: RunnerSpec, param_index: int) -> str:
+    """The C expression for one scalar -- the DSP-side derivation."""
     src = sc.source
     if src.startswith("attr:"):
         ctype = _PARAM_CTYPE[sc.ctype]
-        return f"((const {ctype} *) a->params)[{param_index}]", ctype
+        return f"((const {ctype} *) a->params)[{param_index}]"
     if src.startswith("numel:"):
         i = int(src.split(":", 1)[1])
         # From the tensor's OWN extent, not from a number the host asserted.
-        return (
-            f"(int) (a->ne[{i}][0] * a->ne[{i}][1] * a->ne[{i}][2] * a->ne[{i}][3])",
-            "int",
-        )
+        return f"(int) (a->ne[{i}][0] * a->ne[{i}][1] * a->ne[{i}][2] * a->ne[{i}][3])"
     if src.startswith("dim:"):
         _, i, axis = src.split(":")
-        return f"(int) a->ne[{i}][{axis}]", "int"
+        return f"(int) a->ne[{i}][{axis}]"
     raise GenError(f"unknown scalar source {src!r} in spec for {spec.kind}")
 
 
@@ -140,7 +137,7 @@ def emit_entry(name: str, spec: RunnerSpec) -> str:
 
     param_index = 0
     for sc in spec.scalars:
-        expr, _ = _scalar_expr(sc, spec, param_index)
+        expr = _scalar_expr(sc, spec, param_index)
         if sc.source.startswith("attr:"):
             param_index += 1
         args.append(expr)
