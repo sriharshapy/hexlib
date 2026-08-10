@@ -20,17 +20,22 @@
  */
 #include "skel_internal.h"
 
-#include <string.h>
-
 #include "HAP_farf.h"
 #include "HAP_mem.h"
 
-/* Defined at the bottom of this file, after every caller. The lookup-by-fd
- * comparison it contains is what `test_base_is_cleared_before_any_lookup`
- * checks the position of relative to `hexlib_bufs_map`'s clearing of `base` --
- * keeping the definition below the callers keeps that ordering honest instead
- * of coincidental. */
-static struct hexlib_mmap *find_by_fd(struct hexlib_ctx *ctx, uint32_t fd);
+/* THE LOOKUP THE WHOLE FILE EXISTS TO GATE. Matches by fd, never by whatever
+ * `base` the host sent. Occupied slots have a nonzero size; fd alone is not
+ * enough, since an unregistered slot's fd field is reset to -1, not left
+ * stale. */
+static struct hexlib_mmap *find_by_fd(struct hexlib_ctx *ctx, uint32_t fd) {
+    for (uint32_t i = 0; i < HEXLIB_MAX_MMAPS; i++) {
+        struct hexlib_mmap *m = &ctx->mmap[i];
+        if (m->size && m->fd == (int32_t) fd) {
+            return m;
+        }
+    }
+    return 0;
+}
 
 int hexlib_bufs_register(struct hexlib_ctx *ctx, uint32_t fd, uint32_t size) {
     if (find_by_fd(ctx, fd)) {
@@ -70,14 +75,31 @@ int hexlib_bufs_unregister(struct hexlib_ctx *ctx, uint32_t fd) {
     if (!m) {
         return HEXLIB_DSP_ERR_UNMAPPED;
     }
-#if __HVX_ARCH__ > 73
-    HAP_munmap2((void *) m->base, (size_t) m->size);
-#else
-    HAP_munmap((void *) m->base, (int) m->size);
-#endif
+    uint64_t base = m->base;
+    uint64_t size = m->size;
+    /* Free the slot regardless of the unmap outcome below: whatever happens at
+     * the OS level, this fd must stop being something hexlib_bufs_map() can
+     * hand back on a future lookup. */
     m->base = 0;
     m->size = 0;
     m->fd   = -1;
+#if __HVX_ARCH__ > 73
+    int rc = HAP_munmap2((void *) base, (size_t) size);
+#else
+    int rc = HAP_munmap((void *) base, (int) size);
+#endif
+    if (rc != 0) {
+        /* No dedicated "unmap failed" status exists on the wire (see
+         * hexlib_dsp.h, not modified by this file); MMAP_FAILED is the closest
+         * available fit for "a HAP_mem mapping call did not do what we asked".
+         * Checked rather than ignored: a failed unmap does not threaten the
+         * pointer invariant (the slot above is already cleared either way),
+         * but silently discarding an OS-level failure here is exactly the
+         * kind of thing this file exists to stop doing. */
+        FARF(ERROR, "hexlib: munmap failed for fd %u base %p size %u rc %d",
+             fd, (void *) base, (uint32_t) size, rc);
+        return HEXLIB_DSP_ERR_MMAP_FAILED;
+    }
     return HEXLIB_DSP_OK;
 }
 
@@ -132,18 +154,4 @@ int hexlib_tensors_resolve(struct hexlib_ctx *ctx, struct hexlib_buf_desc *bufs,
         t->data = (uint32_t) (b->base + t->offset);
     }
     return HEXLIB_DSP_OK;
-}
-
-/* THE LOOKUP THE WHOLE FILE EXISTS TO GATE. Matches by fd, never by whatever
- * `base` the host sent -- callers above have already cleared it before
- * reaching here. Occupied slots have a nonzero size; fd alone is not enough,
- * since an unregistered slot's fd field is reset to -1, not left stale. */
-static struct hexlib_mmap *find_by_fd(struct hexlib_ctx *ctx, uint32_t fd) {
-    for (uint32_t i = 0; i < HEXLIB_MAX_MMAPS; i++) {
-        struct hexlib_mmap *m = &ctx->mmap[i];
-        if (m->size && m->fd == (int32_t) fd) {
-            return m;
-        }
-    }
-    return 0;
 }
