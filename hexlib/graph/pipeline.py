@@ -8,7 +8,7 @@ from __future__ import annotations
 from hexlib.graph.dma import insert_transfers, plan_problems
 from hexlib.graph.fuse import fuse
 from hexlib.graph.ir import Graph
-from hexlib.graph.liveness import live_intervals
+from hexlib.graph.liveness import Interval, live_intervals
 from hexlib.graph.order import order
 from hexlib.graph.ops import REGISTRY
 from hexlib.graph.plan import Plan
@@ -23,7 +23,7 @@ def compile_graph(
     graph: Graph,
     budget: int,
     order_policy: str = "min_peak",
-    alloc_policy: str = "linear_scan",
+    alloc_policy: str = "largest_first",
     target: str = "hexagon-v75",
 ) -> Plan | Err:
     """Graph in, Plan out. The budget is a parameter and has no default."""
@@ -55,16 +55,34 @@ def compile_graph(
     allocation = allocate(intervals, budget=budget, policy=alloc_policy)
     if isinstance(allocation, Err):
         return _at("vtcm", allocation)
-    slots, high_water = allocation
-
-    problems = allocation_problems(slots, intervals, budget)
-    if problems:
-        return Err("vtcm: allocation violates its invariants", "\n".join(problems))
+    slots, _activation_high_water = allocation
+    # allocate() already ran allocation_problems on `slots` internally and
+    # returned Err if it failed -- checking `slots` alone again here would be
+    # dead code. The const region insert_transfers is about to place is NOT
+    # covered by that check, so the meaningful call happens below, once the
+    # const slots exist and can be checked for overlap against everything.
 
     transfers = insert_transfers(ordered, slots, budget)
     if isinstance(transfers, Err):
         return _at("dma", transfers)
-    steps, moved = transfers
+    steps, moved, const_slots = transfers
+
+    all_slots = tuple(slots) + const_slots
+    # Const slots span the whole plan's lifetime (see dma._const_slots), so
+    # their Interval is exactly their Slot -- there is nothing to widen or
+    # infer. This is what brings the const region under the SAME overlap
+    # invariant activations already get, instead of the ad-hoc per-step
+    # budget arithmetic `insert_transfers` used to be the only thing
+    # checking.
+    const_intervals = tuple(
+        Interval(tensor=s.tensor, first_use=s.first_use, last_use=s.last_use, nbytes=s.size)
+        for s in const_slots
+    )
+    all_intervals = tuple(intervals) + const_intervals
+    problems = allocation_problems(all_slots, all_intervals, budget)
+    if problems:
+        return Err("vtcm: allocation violates its invariants", "\n".join(problems))
+    high_water = max(s.end for s in all_slots)
 
     problems = plan_problems(steps, ordered, slots, budget=budget)
     if problems:
@@ -84,7 +102,7 @@ def compile_graph(
 
     return Plan(
         steps=steps,
-        vtcm=slots,
+        vtcm=all_slots,
         vtcm_high_water=high_water,
         predicted_bytes_moved=moved,
         vtcm_budget=budget,
