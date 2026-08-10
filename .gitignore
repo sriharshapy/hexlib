@@ -24,6 +24,7 @@ _work/
 pmu_stats*.txt
 packet_analyze*.json
 
+
 # FastRPC / qaic generated sources (silicon path). These are generated from
 # the IDL at build time; the IDL is the source of truth.
 *_stub.c

@@ -17,15 +17,19 @@ import inspect
 import os
 import re
 import struct
+import subprocess
 
 import pytest
 
+import hexlib
 from hexlib import toolchain as tc
 from hexlib.runtime import build as rb
 from hexlib.runtime import wire
 
 HAS_SDK = os.path.isdir(tc.default_sdk_root())
 sdk = pytest.mark.skipif(not HAS_SDK, reason="Hexagon SDK not present")
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(hexlib.__file__)))
 
 
 # ============================================================================
@@ -95,6 +99,45 @@ def test_runelf_pbn_path_is_sdk_relative_never_vendored():
     p = rb.runelf_pbn_path("/sdk", "v75")
     joined = p.replace("\\", "/")
     assert joined == "/sdk/rtos/qurt/computev75/sdksim_bin/runelf.pbn"
+
+
+def test_generated_sim_configs_are_actually_gitignored_by_name():
+    """FIX 1 (coordinator review, task 7b): write_qurt_sim_configs's own
+    docstring used to claim osam.cfg/q6ss.cfg were "already git-ignored via
+    the same rules that already ignore *.o/*.a/*.so" -- no rule actually
+    matched *.cfg, so that was a stated guarantee with nothing behind it: a
+    caller pointing out_dir INSIDE the repo would have committed SDK-derived
+    config files, only avoided today by pytest's tmp_path happening to sit
+    outside the repo.
+
+    Asks git DIRECTLY (`git check-ignore`) rather than re-parsing
+    `.gitignore` in Python, so this cannot drift from what git itself will
+    actually do -- reimplementing gitignore's own matching logic would risk
+    the test and the real behavior silently disagreeing.
+
+    Uses a path nested under a directory ("_no_such_dir") that appears
+    nowhere else in `.gitignore`, and a same-directory sibling with a
+    different extension as a negative control, so a pass here can only be
+    explained by a rule that names these two files specifically -- not a
+    blanket `*.cfg`, and not some unrelated existing rule (e.g. `_work/`)
+    catching it by accident.
+    """
+    for name in ("osam.cfg", "q6ss.cfg"):
+        rel = os.path.join("hexlib", "runtime", "_no_such_dir", name)
+        rc = subprocess.run(
+            ["git", "check-ignore", "-q", rel], cwd=REPO_ROOT
+        ).returncode
+        assert rc == 0, f"{rel!r} is not matched by .gitignore (rc={rc})"
+
+    # Negative control: a same-shaped path that must NOT be ignored, proving
+    # the match above is specific to these two filenames.
+    control = os.path.join("hexlib", "runtime", "_no_such_dir", "not_a_generated_sim_config.cfg")
+    rc = subprocess.run(["git", "check-ignore", "-q", control], cwd=REPO_ROOT).returncode
+    assert rc != 0, (
+        f"{control!r} is unexpectedly git-ignored -- the rule added for "
+        "osam.cfg/q6ss.cfg may have been written as a blanket *.cfg instead "
+        "of the tighter by-name pattern that was asked for"
+    )
 
 
 # ============================================================================

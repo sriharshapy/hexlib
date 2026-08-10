@@ -391,9 +391,15 @@ def build_sim_so(out_dir: str, sdk_root: str | None = None) -> str:
 def write_qurt_sim_configs(out_dir: str, sdk_root: str | None = None,
                            tools_root: str | None = None,
                            arch: str = tc.DSP_ARCH) -> tuple[str, str]:
-    """Write osam.cfg and q6ss.cfg into `out_dir` (never the source tree --
-    `_work/` and `*.cfg` alongside build output are already git-ignored via
-    the same rules that already ignore *.o/*.a/*.so there).
+    """Write osam.cfg and q6ss.cfg into `out_dir` (never the source tree).
+
+    Both filenames are matched BY NAME in `.gitignore` (`osam.cfg`, `q6ss.cfg`
+    -- not a blanket `*.cfg`, so a config someone actually means to commit
+    elsewhere is not silently swallowed). That rule is what keeps these out
+    of the repo; `out_dir` living inside a pytest `tmp_path` today is
+    incidental, not the actual protection -- a caller is free to pass a work
+    dir INSIDE the repo, and `.gitignore` is what stops the resulting files
+    from being committed, not where the caller happened to point `out_dir`.
 
     NOT VENDORING: each file is one or two lines naming an existing SDK
     artifact BY PATH (the QuRT debugger model, and two cosim timer/interrupt
@@ -447,6 +453,22 @@ def sim_qurt_command(out_dir: str, so_path: str, sdk_root: str | None = None,
     Pure with respect to the filesystem except for locating hexagon-sim and
     the two prebuilt SDK artifacts by path -- assertable without running it,
     like sim.py's own sim_command().
+
+    CALLER MUST SET THE SUBPROCESS cwd TO `out_dir` -- CONFIRMED EMPIRICALLY,
+    NOT A GUESS. Under this QuRT-hosted launch, relative fopen() READS inside
+    the dlopen'd .so (hexlib_batch.bin, hexlib_in.bin) resolve through
+    `--usefs out_dir` correctly, but relative fopen(..., "wb") WRITES
+    (hexlib_rsp.bin, hexlib_out.bin) land in the LAUNCHING PROCESS'S OWN
+    working directory instead -- QuRT's own POSIX filesystem layer does not
+    consult --usefs the same way for file creation. This function cannot fix
+    that from here (it only assembles argv; it does not spawn the process),
+    so whatever runs this command (e.g. `subprocess.run(cmd, cwd=out_dir,
+    ...)`, or `tc.run` -- which does not itself take a cwd -- called from a
+    caller that has already os.chdir'd or otherwise pinned its own cwd to
+    `out_dir`) MUST set the subprocess's cwd to this same `out_dir`, or the
+    response/output files will not be where the batch/input files were
+    written. See hexlib/runtime/simhost/simhost.c's own header comment for
+    the full empirical writeup.
     """
     root = sdk_root or tc.default_sdk_root()
     bin_dir = tc.find_toolchain_bin(root)

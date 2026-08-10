@@ -237,7 +237,7 @@ int hexlib_invoke(hexlib_ctx *ctx, const void *batch, size_t batch_len,
     /* THE FIRST CODE IN THIS PROJECT TO EXERCISE QAIC'S REAL ARGUMENT
      * MARSHALLING. Every simulator run through Task 8 called skel.c's
      * hexlib_iface_invoke as a plain C function in the same address space
-     * (see runtime/build.py's build_sim_qexe); the qaic stub was never
+     * (see runtime/build.py's build_sim_so); the qaic stub was never
      * linked there. Here it is: this call goes through the generated
      * hexlib_iface_stub.c, which marshals `batch`/`result` into a
      * remote_arg[] and calls remote_handle64_invoke() for real. */
