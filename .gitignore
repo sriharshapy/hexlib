@@ -130,3 +130,13 @@ $RECYCLE.BIN/
 
 # ---- Windows / MSYS ----
 *.stackdump
+
+# ---- Simulator run artifacts, never committed ----
+# A sim run writes these RELATIVE TO THE LAUNCHING PROCESS'S CWD, not to --usefs
+# (see hexlib/runtime/build.py sim_qurt_command). So a suite run from the repo
+# root drops them here. Two were committed by accident in f796edd via a blanket
+# `git add -A` and removed in the following commit.
+hexlib_out.bin
+hexlib_rsp.bin
+hexlib_in.bin
+hexlib_batch.bin
