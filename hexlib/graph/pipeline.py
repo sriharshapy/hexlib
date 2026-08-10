@@ -5,6 +5,7 @@ bug localises to one pass rather than to "the scheduler".
 """
 from __future__ import annotations
 
+from hexlib.graph.compiled import Compiled
 from hexlib.graph.dma import insert_transfers, plan_problems
 from hexlib.graph.fuse import fuse
 from hexlib.graph.ir import Graph
@@ -26,7 +27,42 @@ def compile_graph(
     alloc_policy: str = "largest_first",
     target: str = "hexagon-v75",
 ) -> Plan | Err:
-    """Graph in, Plan out. The budget is a parameter and has no default."""
+    """Graph in, Plan out. The budget is a parameter and has no default.
+
+    Returns the plan alone. Anything that intends to EXECUTE the plan wants
+    `compile_model` instead: a plan's steps name tensors without describing
+    them, and fusion creates ops that appear in no graph the caller holds, so
+    the plan on its own is not executable. See `compiled.Compiled`.
+    """
+    result = _compile(graph, budget, order_policy, alloc_policy, target)
+    return result if isinstance(result, Err) else result[1]
+
+
+def compile_model(
+    graph: Graph,
+    budget: int,
+    order_policy: str = "min_peak",
+    alloc_policy: str = "largest_first",
+    target: str = "hexagon-v75",
+) -> "Compiled | Err":
+    """Graph in, executable (post-fusion graph, Plan) pair out."""
+    result = _compile(graph, budget, order_policy, alloc_policy, target)
+    if isinstance(result, Err):
+        return result
+    ordered, plan = result
+    try:
+        return Compiled(graph=ordered, plan=plan)
+    except (TypeError, ValueError) as e:
+        return Err("compiled pair failed validation", f"{type(e).__name__}: {e}")
+
+
+def _compile(
+    graph: Graph,
+    budget: int,
+    order_policy: str,
+    alloc_policy: str,
+    target: str,
+) -> "tuple[Graph, Plan] | Err":
     if not isinstance(budget, int) or budget <= 0:
         return Err(
             "invalid VTCM budget",
@@ -100,7 +136,7 @@ def compile_graph(
         )
     )
 
-    return Plan(
+    plan = Plan(
         steps=steps,
         vtcm=all_slots,
         vtcm_high_water=high_water,
@@ -109,6 +145,9 @@ def compile_graph(
         unimplemented=unimplemented,
         target=target,
     )
+    # `ordered` is returned alongside, not discarded: it is the only graph that
+    # describes the ops the plan actually schedules. Fusion created 75 of them.
+    return ordered, plan
 
 
 def _at(pass_name: str, err: Err) -> Err:
