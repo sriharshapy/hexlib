@@ -83,6 +83,19 @@ _CASES = {
         (Tensor("a", "fp16", (2, 3)), Tensor("b", "fp32", (3, 4))),
         (np.arange(6, dtype=np.float16).reshape(2, 3), np.arange(12, dtype=np.float32).reshape(3, 4)),
     ),
+    "matmul_epilogue": _case(
+        (
+            Tensor("a", "fp16", (2, 3)),
+            Tensor("b", "q4_0", (3, 4)),
+            Tensor("bias", "fp32", (4,)),
+        ),
+        (
+            np.arange(6, dtype=np.float16).reshape(2, 3),
+            np.arange(12, dtype=np.float32).reshape(3, 4),
+            np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
+        ),
+        {"act": "none"},
+    ),
     "patchify": _case(
         (Tensor("img", "fp32", (1, 1, 4, 4)),),
         (np.arange(16, dtype=np.float32).reshape(1, 1, 4, 4),),
@@ -153,3 +166,22 @@ def test_reference_dtype_matches_what_infer_declared(kind):
         assert tuple(value.shape) == shape, (
             f"{kind}: infer declared shape {shape} but reference returned {value.shape}"
         )
+
+
+def test_matmul_epilogue_gelu_tanh_delegation_preserves_declared_dtype():
+    # The table case above uses act="none", so it never reaches the one path
+    # that is unique to this op: delegating to the unfused activation's own
+    # `reference` (`get(act).reference((out,), {})`). Pin that path under the
+    # same fp16-activation / q4_0-weight / fp32-bias mix.
+    tensors, arrays, _ = _CASES["matmul_epilogue"]
+    attrs = {"act": "gelu_tanh"}
+    opdef = get("matmul_epilogue")
+
+    declared = opdef.infer(tensors, attrs)
+    results = opdef.reference(arrays, attrs)
+
+    assert len(results) == len(declared) == 1
+    shape, dtype = declared[0]
+    value = np.asarray(results[0])
+    assert value.dtype == _expected_numpy_dtype("matmul_epilogue", dtype)
+    assert tuple(value.shape) == shape

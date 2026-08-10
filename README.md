@@ -22,6 +22,15 @@ are not implemented in this plan** — they arrive with the silicon-path plan. N
 here should be read as a working device pipeline; `hexlib test --device local` and
 `--device qdc` currently just print that the backend isn't implemented yet.
 
+## The model path
+
+`hexlib plan qwen35 --print` compiles the Qwen3.5-0.8B vision encoder to a VTCM
+and DMA plan and prints it: the high-water mark, the predicted DDR traffic, and
+the op kinds that still have no kernel. It needs no SDK, no simulator and no
+device — the whole graph and scheduling layer is pure host Python, which is
+where most of the contribution surface is. See
+[`docs/superpowers/specs/2026-08-09-vlm-encoder-design.md`](docs/superpowers/specs/2026-08-09-vlm-encoder-design.md).
+
 ## Quickstart
 
 ```bash
