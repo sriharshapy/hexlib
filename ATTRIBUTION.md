@@ -53,6 +53,8 @@ and from where:
 | `runtime/skel/skel_vtcm.c` | `htp/main.c` `vtcm_acquire`/`vtcm_alloc` | `HAP_compute_res_*` acquisition with a release callback |
 | `runtime/skel/hexlib_dsp.h` | `htp/htp-ops.h` | the batch descriptor SHAPE, and `htp_status`'s "OK is 1, not 0" |
 | `runtime/skel/skel.c` | `htp/main.c` session entry points | the `open`/`close`/`start`/`stop`/`mmap`/`munmap`/`hwinfo` lifecycle qaic's skel dispatches to; `invoke` is hexlib's own (a single opaque batch, not a dspqueue packet per op) |
+| `runtime/host/session.c` (`hexlib_query_caps`'s `ARCH_VER` query) | `htp-drv.cpp` `htpdrv_get_arch` | the `remote_dsp_capability` / `DSPRPC_GET_DSP_INFO` query shape. Not adapted from it: hexlib queries every capability it needs (`DOMAIN_SUPPORT`, `UNSIGNED_PD_SUPPORT`, `HVX_SUPPORT_128B`, `VTCM_PAGE`, `VTCM_COUNT`, `ARCH_VER`, `HMX_SUPPORT_DEPTH`) through one loop rather than one bespoke function per attribute, and cross-checks the result against the skel's own `hwinfo` reply rather than trusting it alone |
+| `runtime/host/buffers.c` | describes the same `rpcmem_alloc` / `rpcmem_to_fd` / `fastrpc_mmap` sequence `htp-drv.cpp` wraps, using the SDK's own documented call order rather than copying code — `htp-drv.cpp`'s own allocation call sites live in `htp-drv.cpp`'s caller, not in the file this repository's row above already attributes | the sequence, not the code |
 
 **Deliberately not adapted:** `dspqueue` dispatch (`htp_main_thread`,
 `htp_packet_callback`, `process_opbatch`), because it has no simulator path;
