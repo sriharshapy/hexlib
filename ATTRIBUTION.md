@@ -34,11 +34,39 @@ llama.cpp or ggml, and none of the copied headers reference ggml (verified by
 `hexlib/tests/test_vendored_headers.py`, which fails the build if a `ggml` reference
 appears in any of them, or if the vendored directory is empty).
 
-**Deferred to plan 2 (the tile DSL / v2 spec):** ggml-hexagon's IDL, host driver
-(`htp-drv.cpp`), and CMake toolchain file are also planned to be copied under this
-same MIT attribution, once the DSL and device runtime work that needs them begins.
-Nothing under those categories has been copied yet in this plan; when it is, this
-document must be updated alongside it.
+## Adapted: ggml-hexagon's FastRPC runtime (MIT)
+
+**Source:** `ggml/src/ggml-hexagon/` in
+[`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp).
+**License:** MIT. **Copyright:** (c) 2023-2026 The ggml authors.
+**Upstream commit:** `6a32c29a746a2e44de463de647f9f6661eb5086b` (2026-08-06).
+
+hexlib's silicon-path runtime (`hexlib/runtime/`) is **adapted** from this
+backend — rewritten in hexlib's own tree, not copied verbatim. What was adapted,
+and from where:
+
+| hexlib | upstream | what was taken |
+|---|---|---|
+| `runtime/idl/hexlib_iface.idl` | `htp/htp_iface.idl` | the session lifecycle: `start`, `stop`, `mmap`, `munmap`, `hwinfo` |
+| `runtime/host/driver.c` | `htp-drv.cpp` | dlopen/dlsym of `libcdsprpc`, so a missing driver is a message rather than a loader failure |
+| `runtime/skel/skel_bufs.c` | `htp/main.c` `reuse_buf`/`mmap_buf`/`prep_tensor` | fd→base mmap caching, and the **(buffer index, offset)** tensor addressing that keeps host addresses off the wire |
+| `runtime/skel/skel_vtcm.c` | `htp/main.c` `vtcm_acquire`/`vtcm_alloc` | `HAP_compute_res_*` acquisition with a release callback |
+| `runtime/skel/hexlib_dsp.h` | `htp/htp-ops.h` | the batch descriptor SHAPE, and `htp_status`'s "OK is 1, not 0" |
+
+**Deliberately not adapted:** `dspqueue` dispatch (`htp_main_thread`,
+`htp_packet_callback`, `process_opbatch`), because it has no simulator path;
+`htp_tensor`'s `ne`/`nb` strides, because hexlib uses an enumerated layout; and
+the ggml opcode enum.
+
+**One upstream defect is fixed rather than carried over:** `mmap_buf` returns
+silently with `base == 0` when all mmap slots are occupied, after which
+`prep_tensor` computes `0 + offset` and the kernel reads or writes a small bogus
+address; it also `abort()`s on a failed mapping. hexlib returns
+`HEXLIB_DSP_ERR_NO_MMAP_SLOT` / `HEXLIB_DSP_ERR_MMAP_FAILED` and runs no op.
+
+This is **adapted, not vendored** — unlike `include/hexlib/hvx/`, which is
+byte-identical upstream and must never be edited in place. hexlib still has no
+build or runtime dependency on llama.cpp or ggml.
 
 ## Adapted, not vendored: hexbench (same author)
 

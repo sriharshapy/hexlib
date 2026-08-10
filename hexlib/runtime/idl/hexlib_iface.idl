@@ -1,0 +1,52 @@
+//============================================================================
+/// hexlib_iface.idl -- the FastRPC interface for running hexlib kernels on a
+/// Hexagon DSP.
+///
+/// SYNCHRONOUS, NOT DSPQUEUE, AND THAT IS THE WHOLE DESIGN. llama.cpp's
+/// htp_iface carries no ops at all: `start` takes a queue identifier and every
+/// op travels as a dspqueue packet. dspqueue has no simulator path -- of all SDK
+/// examples, the six that build a simulator-runnable target are every one of
+/// them plain synchronous FastRPC -- so adopting it would mean the first time
+/// this interface ever ran would be on non-renewable device minutes.
+///
+/// dspqueue amortizes per-call latency over thousands of small dispatches.
+/// hexlib has a compiler that knows all 308 steps before the first one runs, so
+/// one call carries a whole batch and there is nothing to amortize. `invoke`
+/// takes opaque bytes precisely so the same descriptor can move to a queue
+/// packet later without touching this file.
+///
+/// Session lifecycle adapted from llama.cpp ggml-hexagon's htp_iface.idl (MIT);
+/// see ATTRIBUTION.md.
+//============================================================================
+
+#ifndef HEXLIB_IDL
+#define HEXLIB_IDL
+
+#include "AEEStdDef.idl"
+#include "remote.idl"
+
+interface hexlib_iface : remote_handle64 {
+
+   /// Acquire VTCM and open a session. n_hvx/n_hmx are unit counts; max_vmem
+   /// caps how much host memory may stay mapped at once.
+   AEEResult start(in uint32 sess_id, in uint32 n_hvx, in uint32 n_hmx,
+                   in uint64 max_vmem);
+
+   AEEResult stop();
+
+   /// Register a host buffer by fd. The DSP maps it ITSELF -- the host never
+   /// sends an address.
+   AEEResult mmap(in uint32 fd, in uint32 size);
+   AEEResult munmap(in uint32 fd);
+
+   /// What the DSP says about itself, never what a marketing name implies.
+   /// vtcm_size is the ACQUIRED size, not the part's total.
+   AEEResult hwinfo(rout uint32 arch, rout uint32 n_threads, rout uint32 n_hvx,
+                    rout uint32 n_hmx, rout uint64 vtcm_size);
+
+   /// Run a batch. `batch` is hexlib_batch_hdr and friends; `result` is
+   /// hexlib_batch_rsp_hdr and friends.
+   AEEResult invoke(in sequence<octet> batch, rout sequence<octet> result);
+};
+
+#endif /* HEXLIB_IDL */

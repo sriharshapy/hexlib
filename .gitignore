@@ -29,6 +29,11 @@ packet_analyze*.json
 *_stub.c
 *_skel.c
 
+# Generated runtime artifacts (qaic output, skel objects, entry points)
+hexlib/runtime/gen/
+kernels/*/_build/
+_work/runtime/
+
 # The Hexagon SDK is license-restricted and is NEVER vendored, bundled, or
 # fetched. It is discovered through HEXAGON_SDK_ROOT. These guard against an
 # accidental copy landing in the repository.
