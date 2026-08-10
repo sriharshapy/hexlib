@@ -52,6 +52,7 @@ and from where:
 | `runtime/skel/skel_bufs.c` | `htp/main.c` `reuse_buf`/`mmap_buf`/`prep_tensor` | fd→base mmap caching, and the **(buffer index, offset)** tensor addressing that keeps host addresses off the wire |
 | `runtime/skel/skel_vtcm.c` | `htp/main.c` `vtcm_acquire`/`vtcm_alloc` | `HAP_compute_res_*` acquisition with a release callback |
 | `runtime/skel/hexlib_dsp.h` | `htp/htp-ops.h` | the batch descriptor SHAPE, and `htp_status`'s "OK is 1, not 0" |
+| `runtime/skel/skel.c` | `htp/main.c` session entry points | the `open`/`close`/`start`/`stop`/`mmap`/`munmap`/`hwinfo` lifecycle qaic's skel dispatches to; `invoke` is hexlib's own (a single opaque batch, not a dspqueue packet per op) |
 
 **Deliberately not adapted:** `dspqueue` dispatch (`htp_main_thread`,
 `htp_packet_callback`, `process_opbatch`), because it has no simulator path;

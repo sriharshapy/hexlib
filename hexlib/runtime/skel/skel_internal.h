@@ -42,4 +42,10 @@ void hexlib_vtcm_release(struct hexlib_ctx *ctx);
 int hexlib_dispatch_batch(struct hexlib_ctx *ctx, const uint8_t *batch, uint32_t len,
                           uint8_t *rsp, uint32_t rsp_cap, uint32_t *rsp_len);
 
+/* Defined in skel_dispatch.c, shared with skel.c: both hexlib_dispatch_batch's
+ * own failure returns AND hexlib_iface_invoke's invoke-before-start refusal
+ * must write the exact same response header shape, with the arch this binary
+ * was built for -- never a value either caller passes in. */
+void hexlib_write_rsp_hdr(uint8_t *rsp, uint32_t status, uint32_t n_ops, uint64_t cycles);
+
 #endif /* HEXLIB_SKEL_INTERNAL_H */
