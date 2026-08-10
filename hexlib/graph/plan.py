@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 from hexlib.graph.ir import Op
+from hexlib.graph.layout import Layout
 from hexlib.result import Err
 
 V75_VTCM_TOTAL_BYTES = 8388608
@@ -59,6 +60,15 @@ class Transfer:
     direction: str
     vtcm_offset: int
     nbytes: int
+    layout: Layout
+    """The layout this transfer's destination bytes are claimed to be in.
+
+    This is the structural half of the repack check: a pass that hands a
+    quantized weight to `check_layouts` as `Q4_0_REPACKED` must record that
+    same claim here, on the value the rest of the plan (and M2/M3) actually
+    see. Without it the claim evaporates the moment `check_layouts` returns,
+    and nothing downstream can tell a repack happened at all.
+    """
 
     def __post_init__(self) -> None:
         if self.direction not in ("in", "out"):
@@ -70,18 +80,25 @@ class Transfer:
             raise ValueError(f"transfer {self.id}: nbytes must be positive")
         if self.vtcm_offset < 0:
             raise ValueError(f"transfer {self.id}: vtcm_offset must be non-negative")
+        if not isinstance(self.layout, Layout):
+            raise TypeError(
+                f"transfer {self.id}: layout must be a Layout, got "
+                f"{type(self.layout).__name__}"
+            )
 
 
 @dataclass(frozen=True)
 class Tiling:
-    """The step's dma_in, op and dma_out repeat `count` times.
+    """`transfer` is what repeats `count` times; `Step.dma_in`/`dma_out` do not.
 
-    `vtcm_offset` rotates through `buffers` slots, so buffers=2 is the
-    double-buffering that lets a DMA overlap the compute it feeds.
+    `transfer.vtcm_offset` rotates through `buffers` slots, so buffers=2 is
+    the double-buffering that lets a DMA overlap the compute it feeds. A
+    `Step` can carry ONE-SHOT transfers in `dma_in`/`dma_out` (e.g. a fused
+    bias, moved exactly once) alongside a `Tiling` that repeats; which one
+    repeats is this field, never a position in a list.
     """
 
-    axis: str
-    tile_elements: int
+    transfer: Transfer
     count: int
     buffers: int
 
@@ -90,8 +107,6 @@ class Tiling:
             raise ValueError("tiling count must be at least 1")
         if self.buffers < 1:
             raise ValueError("tiling buffers must be at least 1")
-        if self.tile_elements < 1:
-            raise ValueError("tiling tile_elements must be at least 1")
 
 
 @dataclass(frozen=True)
@@ -161,6 +176,20 @@ def _plan_to_dict(plan: Plan) -> dict[str, Any]:
     }
 
 
+def _transfer_to_dict(t: Transfer) -> dict[str, Any]:
+    d = asdict(t)
+    d["layout"] = t.layout.value
+    return d
+
+
+def _tiling_to_dict(tiling: Tiling) -> dict[str, Any]:
+    return {
+        "transfer": _transfer_to_dict(tiling.transfer),
+        "count": tiling.count,
+        "buffers": tiling.buffers,
+    }
+
+
 def _step_to_dict(step: Step) -> dict[str, Any]:
     op = None
     if step.op is not None:
@@ -173,10 +202,10 @@ def _step_to_dict(step: Step) -> dict[str, Any]:
         }
     return {
         "op": op,
-        "dma_in": [asdict(t) for t in step.dma_in],
+        "dma_in": [_transfer_to_dict(t) for t in step.dma_in],
         "dma_wait": list(step.dma_wait),
-        "dma_out": [asdict(t) for t in step.dma_out],
-        "tiling": asdict(step.tiling) if step.tiling else None,
+        "dma_out": [_transfer_to_dict(t) for t in step.dma_out],
+        "tiling": _tiling_to_dict(step.tiling) if step.tiling else None,
     }
 
 
@@ -229,6 +258,20 @@ def _lists_to_tuples(obj: Any) -> Any:
         return obj
 
 
+def _transfer_from_dict(raw: dict[str, Any]) -> Transfer:
+    d = dict(raw)
+    d["layout"] = Layout(d["layout"])
+    return Transfer(**d)
+
+
+def _tiling_from_dict(raw: Any) -> Tiling:
+    return Tiling(
+        transfer=_transfer_from_dict(raw["transfer"]),
+        count=raw["count"],
+        buffers=raw["buffers"],
+    )
+
+
 def _step_from_dict(raw: dict[str, Any]) -> Step:
     op = None
     if raw.get("op") is not None:
@@ -242,10 +285,10 @@ def _step_from_dict(raw: dict[str, Any]) -> Step:
         )
     return Step(
         op=op,
-        dma_in=tuple(Transfer(**t) for t in raw["dma_in"]),
+        dma_in=tuple(_transfer_from_dict(t) for t in raw["dma_in"]),
         dma_wait=tuple(raw["dma_wait"]),
-        dma_out=tuple(Transfer(**t) for t in raw["dma_out"]),
-        tiling=Tiling(**raw["tiling"]) if raw.get("tiling") else None,
+        dma_out=tuple(_transfer_from_dict(t) for t in raw["dma_out"]),
+        tiling=_tiling_from_dict(raw["tiling"]) if raw.get("tiling") else None,
     )
 
 
@@ -267,7 +310,7 @@ def render(plan: Plan) -> str:
     lines.append("")
 
     if plan.unimplemented:
-        lines.append("Op kinds with no kernel — NOT IMPLEMENTED")
+        lines.append("Op kinds with no kernel -- NOT IMPLEMENTED")
         for kind in plan.unimplemented:
             lines.append(f"  {kind}")
         lines.append("  This plan schedules them but nothing can execute it yet.")
@@ -280,12 +323,13 @@ def render(plan: Plan) -> str:
         kind = step.op.kind if step.op else "(dma only)"
         name = step.op.outputs[0] if step.op and step.op.outputs else ""
         tile = ""
-        if step.tiling:
-            tile = (
-                f"  x{step.tiling.count} tiles of {step.tiling.tile_elements} "
-                f"on {step.tiling.axis}, {step.tiling.buffers} buffers"
-            )
         moved = sum(t.nbytes for t in step.dma_in) + sum(t.nbytes for t in step.dma_out)
+        if step.tiling:
+            moved += step.tiling.transfer.nbytes
+            tile = (
+                f"  x{step.tiling.count} chunks of {step.tiling.transfer.nbytes} B, "
+                f"{step.tiling.buffers} buffers"
+            )
         per_iter = f"  {moved:,} B/iter" if moved else ""
         lines.append(f"  {i:4d}  {kind:<18} {name:<24}{per_iter}{tile}")
     return "\n".join(lines)
