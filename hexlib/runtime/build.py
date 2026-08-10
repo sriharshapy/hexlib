@@ -68,7 +68,10 @@ def run_qaic(idl: str, out_dir: str, sdk_root: str | None = None) -> QaicOutput:
         skel=os.path.join(out_dir, f"{stem}_skel.c"),
     )
     # FAIL CLOSED: qaic exiting 0 without writing the files is a failure, not a
-    # build we then link and get confusing errors from.
+    # build we then link and get confusing errors from. Covered by
+    # test_qaic_exit_zero_without_files_still_raises, which monkeypatches
+    # tc.run to succeed while writing nothing -- do not delete this as
+    # "redundant" with the happy-path test; that one can't fail this check.
     for f in (res.header, res.stub, res.skel):
         if not os.path.isfile(f):
             raise RuntimeBuildError(

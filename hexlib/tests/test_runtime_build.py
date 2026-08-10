@@ -59,3 +59,15 @@ def test_generated_skel_dispatches_invoke(tmp_path):
 def test_missing_idl_is_an_error_not_an_empty_success(tmp_path):
     with pytest.raises(rb.RuntimeBuildError, match="not found"):
         rb.run_qaic(str(tmp_path / "nope.idl"), str(tmp_path))
+
+
+def test_qaic_exit_zero_without_files_still_raises(tmp_path, monkeypatch):
+    """Offline. qaic exiting 0 but writing nothing must still raise -- this is
+    the fail-closed check itself, not the happy path. Without this test,
+    deleting that check would leave every other test passing (they all rely
+    on the real qaic actually writing files), which is exactly the "absence
+    read as success" failure mode the check exists to prevent."""
+    monkeypatch.setattr(rb, "qaic_path", lambda root: IDL)
+    monkeypatch.setattr(rb.tc, "run", lambda cmd, env, timeout=None: (0, "", "", False))
+    with pytest.raises(rb.RuntimeBuildError, match="did not produce"):
+        rb.run_qaic(IDL, str(tmp_path))
