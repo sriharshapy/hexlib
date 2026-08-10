@@ -91,6 +91,11 @@ docs/hardware/     measured hardware notes (HMX int8, simulator accuracy)
   (no SDK needed) is always visible.
 - [`ATTRIBUTION.md`](ATTRIBUTION.md) — every vendored source, its license, and the
   commit it came from.
+- [`docs/hvx/`](docs/hvx/README.md) — **learning HVX.** A guided, function-by-function
+  tour of the vendored headers: the vector types and predicates, alignment handling,
+  horizontal reductions, transcendentals built from polynomial approximation, division by
+  Newton–Raphson, and the reduce-then-broadcast pattern that every transformer kernel is a
+  variation on. Start here if you have never written HVX.
 - [`docs/hardware/hmx-int8.md`](docs/hardware/hmx-int8.md) — the measured HMX int8
   MAC sequence.
 - [`docs/hardware/simulator-accuracy.md`](docs/hardware/simulator-accuracy.md) — what
