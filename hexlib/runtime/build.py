@@ -267,9 +267,29 @@ def build_skel_lib(kernels: list[str], out_dir: str,
 def build_sim_qexe(out_dir: str, sdk_root: str | None = None) -> str:
     """Link the simulator host + skel + rtld into one runnable ELF.
 
-    The qaic-generated stub is deliberately NOT one of the sources here -- see
-    the module-level comment above SIM_LINK_FLAGS for why linking it alongside
-    skel.c would be a duplicate-symbol error, not merely redundant.
+    ==========================================================================
+    WHAT A SIMULATOR RUN OF THIS ELF DOES NOT PROVE -- READ THIS FIRST.
+
+    simhost.c calls hexlib_iface_open/_start/_mmap/_invoke/_stop/_close as
+    PLAIN C FUNCTIONS, bound by the linker DIRECTLY to skel.c's definitions.
+    The qaic-generated stub (hexlib_iface_stub.c) is DELIBERATELY NOT ONE OF
+    THE SOURCES LINKED HERE. It defines the exact same function names as
+    skel.c's DSP-side implementation, so linking both into one address space
+    is a duplicate-symbol error, not merely redundant (confirmed by running
+    qaic and reading both generated files back). The SDK's own calculator
+    example makes the identical choice: `calculator_q_C_SRCS` in
+    examples/calculator/hexagon.min never includes calculator_stub.c either.
+
+    CONSEQUENCE: a simulator run through this ELF exercises hexlib's OWN
+    code -- batch parsing, the buffer table, the kernel dispatch table,
+    kernel correctness, and PCYCLE accounting -- but it does NOT exercise
+    qaic's argument marshaling/demarshaling at all. That is a real gap
+    against this project's own design spec, which describes the simulator
+    path as exercising "a qaic stub/skel invoke": what actually happens is a
+    plain function call, and the marshaling layer is completely bypassed.
+    Marshaling is only exercised on a real device, where the stub and skel
+    genuinely live in separate processes and the call cannot avoid the wire.
+    ==========================================================================
     """
     root = sdk_root or tc.default_sdk_root()
     bin_dir = tc.find_toolchain_bin(root)

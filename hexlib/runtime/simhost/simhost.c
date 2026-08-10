@@ -1,5 +1,33 @@
 /* hexlib/runtime/simhost/simhost.c -- the host side, for the simulator.
  *
+ * ============================================================================
+ * WHAT A SIMULATOR RUN OF THIS FILE DOES NOT PROVE -- READ THIS FIRST.
+ *
+ * This file calls hexlib_iface_open/_start/_mmap/_invoke/_stop/_close as
+ * PLAIN C FUNCTIONS, bound by the linker DIRECTLY to skel.c's definitions.
+ * The qaic-generated stub (hexlib_iface_stub.c) -- the code that would
+ * actually marshal these calls into a `remote_arg` scalar/buffer list and
+ * drive them through `remote_handle64_open`/`_invoke` -- is DELIBERATELY NOT
+ * LINKED INTO THIS QEXE AT ALL. It defines the exact same function names as
+ * skel.c's DSP-side implementation (confirmed by running qaic and reading
+ * both generated files back), so linking both into one address space is a
+ * duplicate-symbol error, not merely redundant. The SDK's own calculator
+ * example makes the identical choice: `calculator_q_C_SRCS` in
+ * examples/calculator/hexagon.min never includes calculator_stub.c either.
+ *
+ * CONSEQUENCE: a simulator run through this file exercises hexlib's OWN
+ * code -- batch parsing (hexlib_dispatch_batch), the buffer table
+ * (hexlib_bufs_register/_map), the kernel dispatch table
+ * (hexlib_kernel_table), kernel correctness, and PCYCLE accounting -- but it
+ * does NOT exercise qaic's argument marshaling/demarshaling at all. That is
+ * a real gap against this project's own design spec, which describes the
+ * simulator path as exercising "a qaic stub/skel invoke": what actually
+ * happens here is a plain function call, and the marshaling layer is
+ * completely bypassed. Marshaling is only exercised on a real device, where
+ * the stub and skel genuinely live in separate processes and the call
+ * cannot avoid the wire.
+ * ============================================================================
+ *
  * WHY THIS EXISTS. On a device the host is an aarch64 Android binary. On the
  * simulator there is no aarch64, so the "host" is Hexagon code in the same ELF
  * as the skel. That is the SDK's own BUILD_QEXES pattern (examples/calculator's
