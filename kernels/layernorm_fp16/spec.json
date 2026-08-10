@@ -1,0 +1,17 @@
+{
+  "task_id": "layernorm_fp16",
+  "dtype": "fp16",
+  "caps": [],
+  "mechanisms": ["hvx"],
+  "params": {
+    "R": 4,
+    "C": 768,
+    "eps": 1e-06,
+    "encoder_shape": "[256, 768], fp32 weight and bias",
+    "encoder_op_count": 25,
+    "reductions_vectorised": false
+  },
+  "expert_kernel_cycles": null,
+  "tolerance": "hexlib_close_f16",
+  "tags": ["normalisation", "encoder", "reduce-then-broadcast", "first-rung"]
+}
