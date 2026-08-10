@@ -5,6 +5,7 @@ import json
 import pytest
 
 from hexlib.graph.ir import Op
+from hexlib.graph.layout import Layout
 from hexlib.graph.plan import (
     Plan,
     Slot,
@@ -19,14 +20,18 @@ from hexlib.result import Err
 
 
 def _plan(**overrides):
+    weight_transfer = Transfer(
+        id=0, tensor="w", direction="in", vtcm_offset=0, nbytes=576,
+        layout=Layout.Q4_0_REPACKED,
+    )
     base = dict(
         steps=(
             Step(
                 op=Op(id=0, kind="matmul", inputs=("x", "w"), outputs=("y",), attrs={}),
-                dma_in=(Transfer(id=0, tensor="w", direction="in", vtcm_offset=0, nbytes=576),),
+                dma_in=(),
                 dma_wait=(0,),
                 dma_out=(),
-                tiling=Tiling(axis="n", tile_elements=32, count=96, buffers=2),
+                tiling=Tiling(transfer=weight_transfer, count=96, buffers=2),
             ),
         ),
         vtcm=(Slot(tensor="y", offset=1152, size=4096, first_use=0, last_use=1),),
@@ -68,19 +73,37 @@ def test_high_water_over_budget_cannot_be_constructed():
 
 def test_transfer_direction_must_be_in_or_out():
     with pytest.raises(ValueError):
-        Transfer(id=0, tensor="w", direction="sideways", vtcm_offset=0, nbytes=4)
+        Transfer(
+            id=0, tensor="w", direction="sideways", vtcm_offset=0, nbytes=4,
+            layout=Layout.DENSE,
+        )
 
 
 def test_transfer_nbytes_must_be_positive():
     with pytest.raises(ValueError):
-        Transfer(id=0, tensor="w", direction="in", vtcm_offset=0, nbytes=0)
+        Transfer(
+            id=0, tensor="w", direction="in", vtcm_offset=0, nbytes=0,
+            layout=Layout.DENSE,
+        )
+
+
+def test_transfer_layout_must_be_a_layout():
+    with pytest.raises(TypeError):
+        Transfer(
+            id=0, tensor="w", direction="in", vtcm_offset=0, nbytes=4,
+            layout="dense",
+        )
 
 
 def test_tiling_requires_at_least_one_iteration_and_one_buffer():
+    transfer = Transfer(
+        id=0, tensor="w", direction="in", vtcm_offset=0, nbytes=576,
+        layout=Layout.Q4_0_REPACKED,
+    )
     with pytest.raises(ValueError):
-        Tiling(axis="n", tile_elements=32, count=0, buffers=2)
+        Tiling(transfer=transfer, count=0, buffers=2)
     with pytest.raises(ValueError):
-        Tiling(axis="n", tile_elements=32, count=4, buffers=0)
+        Tiling(transfer=transfer, count=4, buffers=0)
 
 
 def test_slot_last_use_may_not_precede_first_use():
@@ -155,7 +178,13 @@ def test_render_says_so_when_nothing_is_unimplemented():
 def test_render_shows_the_tiling_loop_rather_than_unrolling_it():
     text = render(_plan())
     assert "96" in text  # the iteration count
-    assert text.count("Transfer") < 10, "the render unrolled the loop"
+    # One step -> one line, regardless of how many times its tiling repeats.
+    # `text.count("Transfer") < 10` used to "check" this, but render() never
+    # emits the word "Transfer" at all, so that count was always 0 -- it
+    # could not have failed. Bound the total line count instead: if the loop
+    # were unrolled, a count of 96 would blow this past 100 lines for a plan
+    # with exactly one step and a handful of header lines.
+    assert text.count("\n") < 30
 
 
 def test_from_json_on_non_dict_steps_entry_is_an_err():

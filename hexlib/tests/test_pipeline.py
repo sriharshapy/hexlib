@@ -58,9 +58,33 @@ def test_an_invalid_graph_is_an_err_naming_the_first_failing_pass():
     assert "shape" in out.reason.lower() or "shape" in out.detail.lower()
 
 
-def test_every_named_pass_actually_runs():
-    # A pipeline that skipped a pass would produce a plan that looked fine.
+def test_passes_tuple_names_the_six_stages():
+    # Just the tuple's contents. This alone proves nothing about whether
+    # compile_graph actually CALLS each one -- see the spy-based test below,
+    # which is what used to be claimed (wrongly) under this test's old name,
+    # test_every_named_pass_actually_runs.
     assert PASSES == ("shapes", "fuse", "order", "liveness", "vtcm", "dma")
+
+
+def test_compile_graph_actually_invokes_every_named_pass():
+    # A pipeline that skipped a pass would produce a plan that looked fine;
+    # nothing else guards against a pass being silently dropped. Spy on each
+    # pass's entry point as bound in pipeline.py's own namespace (that is
+    # what compile_graph actually calls) and confirm a real compile touches
+    # all six exactly once.
+    from unittest.mock import Mock, patch
+
+    import hexlib.graph.pipeline as pipeline_mod
+
+    names = ("infer_shapes", "fuse", "order", "live_intervals", "allocate", "insert_transfers")
+    with patch.multiple(
+        pipeline_mod,
+        **{name: Mock(wraps=getattr(pipeline_mod, name)) for name in names},
+    ):
+        plan = compile_graph(build_vision_encoder(qwen35_at(256)), budget=BUDGET)
+        assert isinstance(plan, Plan), getattr(plan, "detail", "")
+        for name in names:
+            getattr(pipeline_mod, name).assert_called_once()
 
 
 def test_both_order_policies_and_both_alloc_policies_compile():
@@ -75,15 +99,25 @@ def test_both_order_policies_and_both_alloc_policies_compile():
 
 
 def test_the_plan_fits_in_vtcm_at_256():
+    # `Plan.__post_init__` already makes vtcm_high_water > vtcm_budget
+    # unconstructible, so asserting that inequality again here (as this test
+    # used to) is checking something that can never fail once `plan` exists
+    # at all. What actually needs proving is that compile_graph SUCCEEDS
+    # (returns a Plan, not an Err) at this resolution and budget.
     plan = compile_graph(build_vision_encoder(qwen35_at(256)), budget=BUDGET)
-    assert plan.vtcm_high_water <= BUDGET
+    assert isinstance(plan, Plan), getattr(plan, "detail", "")
 
 
 def test_a_larger_resolution_moves_more_bytes():
     small = compile_graph(build_vision_encoder(qwen35_at(256)), budget=BUDGET)
+    assert isinstance(small, Plan), getattr(small, "detail", "")
     large = compile_graph(build_vision_encoder(qwen35_at(512)), budget=BUDGET)
     if isinstance(large, Err):
-        # Legitimate: 512^2 may not fit. It must SAY so, not produce a plan.
-        assert "does not fit" in large.detail or "budget" in large.detail
+        # Legitimate: 512^2 may not fit. It must fail because the
+        # ALLOCATION does not fit -- not some unrelated malformed-input Err,
+        # which `"budget" in large.detail` was too weak to rule out (nearly
+        # every allocator error mentions "budget" somewhere in its detail).
+        assert large.reason.startswith(("vtcm:", "dma:")), large.reason
+        assert "does not fit" in large.reason or "no VTCM left" in large.reason
     else:
         assert large.predicted_bytes_moved > small.predicted_bytes_moved

@@ -254,11 +254,16 @@ def test_guard_tracks_vit_config_int_fields_not_a_constant():
         if hints.get(field.name) is int
     }
 
-    # Get the set of fields the guard actually checks.
+    # Get the fields the guard actually checks. Returned sorted (not a set --
+    # config-problem output is pasted into PRs and must not depend on hash
+    # order), so compare as sets here.
     guarded_fields = _get_positive_int_field_names()
+    assert guarded_fields == tuple(sorted(guarded_fields)), (
+        "_get_positive_int_field_names must return its fields sorted"
+    )
 
     # They must be identical.
-    assert guarded_fields == declared_int_fields, (
+    assert set(guarded_fields) == declared_int_fields, (
         f"guard checks {sorted(guarded_fields)} but VitConfig has int fields "
         f"{sorted(declared_int_fields)}; the guard is out of sync"
     )

@@ -46,9 +46,15 @@ def test_overflow_is_an_err_naming_the_tensor_the_high_water_and_the_budget():
 
 
 def test_overflow_returns_no_partial_plan():
+    # `allocate`'s return type is `tuple[...] | Err`; proving `out` IS an
+    # `Err` already proves no partial (slots, high_water) tuple was
+    # returned alongside it -- the two are mutually exclusive by
+    # construction. `not hasattr(out, "slots")` used to "check" this, but
+    # `Err.__slots__` is `("reason", "detail")`, so that attribute is
+    # absent unconditionally, on any `Err`, regardless of whether this
+    # function ever had a partial-plan bug. It could not have failed.
     out = allocate(_ivs(("big", 0, 1, 99999)), budget=1024)
     assert isinstance(out, Err)
-    assert not hasattr(out, "slots")
 
 
 def test_every_interval_gets_exactly_one_slot():

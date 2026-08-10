@@ -118,7 +118,19 @@ def test_an_unknown_policy_is_an_err_naming_the_known_ones():
     assert "asap" in out.detail
 
 
-def test_a_cycle_is_an_err_naming_the_stuck_ops():
+def test_two_ops_with_a_circular_data_dependency_are_caught_by_structural_validation():
+    # Renamed from test_a_cycle_is_an_err_naming_the_stuck_ops: that name
+    # claimed to exercise order()'s own ready-set "cycle or unreachable ops"
+    # branch, but it never does. Graph.problems() checks read-before-write
+    # against a running "written" set built by walking graph.ops in
+    # DECLARATION order; a genuine cycle (op 0 needs op 1's output, op 1
+    # needs op 0's) can never pass that check, because whichever op is
+    # declared first is missing its dependency right there. So
+    # graph.problems() -- which order() runs BEFORE ever reaching its own
+    # ready-set loop -- always catches a true cycle first, and the
+    # ready-set's own "stuck" branch is unreachable from here. This test
+    # documents what actually gets exercised: the pre-check, not the
+    # scheduler's cycle detection.
     tensors = {
         "x": Tensor("x", "fp32", (4,)),
         "a": Tensor("a", "fp32", (4,)),
@@ -135,11 +147,8 @@ def test_a_cycle_is_an_err_naming_the_stuck_ops():
     )
     out = order(g, policy="asap")
     assert isinstance(out, Err)
-    # The graph has a circular dependency (a->b->a) that is caught by either
-    # cycle detection (cycle in reason) or structural validation (op 0 in detail).
-    assert (
-        "cycle" in out.reason or "cycle" in out.detail or "op 0" in out.detail
-    )
+    assert "structurally invalid" in out.reason
+    assert "op 0" in out.detail
 
 
 def test_peak_live_bytes_is_positive_and_at_least_the_largest_tensor():
@@ -170,6 +179,18 @@ def test_undeclared_output_tensor_returns_err():
     out = order(g)
     assert isinstance(out, Err)
     assert "structurally invalid" in out.reason or "structurally invalid" in out.detail
+
+
+def test_a_policy_that_invents_an_op_outside_the_ready_set_is_an_err(monkeypatch):
+    # Was `assert chosen in ready` -- a bare assert inside a pass contracted
+    # never to raise, and one that silently vanishes under `-O`. A
+    # misbehaving policy (a bug in a future custom one, not either shipped
+    # policy) must come back as an Err, not an AssertionError.
+    rogue_op = Op(id=999, kind="scale", inputs=(), outputs=(), attrs={"factor": 1.0})
+    monkeypatch.setitem(ORDER_POLICIES, "rogue", lambda ready, live_bytes, graph: rogue_op)
+    out = order(_diamond(), policy="rogue")
+    assert isinstance(out, Err)
+    assert "ready set" in out.reason
 
 
 def test_min_peak_beats_asap_on_two_independent_chains():
