@@ -33,8 +33,22 @@ class SimOutcome:
     kernel_cycles: int
 
 
+# maxerr is matched as a non-space run and parsed with float(), NOT as a
+# character class of digits and exponent punctuation.
+#
+# WHY. printf("%.9g") emits `inf` and `nan` for a non-finite error, and a
+# digits-only class does not match either. The whole verdict line then fails to
+# parse, and a kernel that produced inf was reported as "no verdict recovered:
+# the harness never printed HEXLIB_VERDICT, so nothing was actually checked" --
+# when the harness had printed a perfectly good verdict saying the kernel was
+# WRONG. Found by a near-miss that adds fp16 bit patterns as integers, which
+# overflows to inf: it was scored INCONCLUSIVE instead of correctly rejected.
+#
+# It failed safe rather than dangerously -- inconclusive, never a pass -- but it
+# misattributed the cause, and a real kernel that overflowed would have been
+# reported as not having run rather than as incorrect.
 _VERDICT = re.compile(
-    r"HEXLIB_VERDICT correct=(\d+) wrong=(\d+) maxerr=([0-9eE.+-]+)"
+    r"HEXLIB_VERDICT correct=(\d+) wrong=(\d+) maxerr=(\S+)"
 )
 _KCYCLES = re.compile(r"HEXLIB_KCYCLES kernel=(\d+)")
 
@@ -43,7 +57,14 @@ def parse_verdict(text: str) -> tuple[bool, int, float] | None:
     m = _VERDICT.search(text)
     if not m:
         return None
-    return bool(int(m.group(1))), int(m.group(2)), float(m.group(3))
+    try:
+        max_err = float(m.group(3))
+    except ValueError:
+        # A verdict whose error field is unparseable has still told us
+        # correct=/wrong=, and those are what decide the gate. Losing the whole
+        # line over an unreadable magnitude is how an inf became "never ran".
+        max_err = float("inf")
+    return bool(int(m.group(1))), int(m.group(2)), max_err
 
 
 def parse_kernel_cycles(text: str) -> int | None:

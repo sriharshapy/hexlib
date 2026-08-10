@@ -134,6 +134,69 @@ def _run_elf(elf: str, cwd: str, caps: list[str]) -> str:
     return combined
 
 
+def backend_for(
+    kind: str,
+    work_dir: str | None = None,
+    stats: RunnerStats | None = None,
+    sdk_root: str | None = None,
+    kernel_dir: str | None = None,
+):
+    """A backend for `kind`, computed by its real kernel, driven by its RunnerSpec.
+
+    This is the general path: the wire format comes from the declarative spec in
+    `exec.runner`, so adding a kernel is a spec entry plus a `runner.c`, not
+    another bespoke marshaller. Returns None when `kind` has no spec, which is
+    what lets the executor fall back to the reference for op kinds whose kernel
+    does not exist yet -- so the encoder runs at every stage rather than only at
+    the end.
+    """
+    from hexlib.exec.runner import spec_for
+
+    spec = spec_for(kind)
+    if spec is None:
+        return None
+
+    directory = kernel_dir or spec.kernel_dir
+    work = work_dir or tempfile.mkdtemp(prefix=f"hexlib-{kind}-")
+    os.makedirs(work, exist_ok=True)
+    elf = build_runner(directory, work, sdk_root=sdk_root)
+    caps = kd.load_spec(directory).caps
+    tracker = stats if stats is not None else RunnerStats()
+
+    def backend(
+        arrays: tuple[np.ndarray, ...], attrs: Mapping[str, Any]
+    ) -> tuple[np.ndarray, ...]:
+        out_shape = tuple(arrays[0].shape)
+        with open(os.path.join(work, IN_NAME), "wb") as f:
+            f.write(spec.encode(arrays, attrs))
+
+        out_path = os.path.join(work, OUT_NAME)
+        if os.path.exists(out_path):
+            # A stale output would be read as this call's result if the runner
+            # failed to write one.
+            os.remove(out_path)
+
+        text = _run_elf(elf, work, caps)
+
+        if not os.path.exists(out_path):
+            raise HexagonBackendError(
+                f"{kind}: the runner produced no {OUT_NAME}; nothing was "
+                f"computed.\n{text}"
+            )
+        with open(out_path, "rb") as f:
+            raw = f.read()
+        result = spec.decode(raw, out_shape)
+
+        tracker.calls += 1
+        tracker.max_n = max(tracker.max_n, int(arrays[0].size))
+        for token in text.split():
+            if token.startswith("cycles="):
+                tracker.kernel_cycles += int(token.split("=", 1)[1])
+        return (result,)
+
+    return backend
+
+
 def scale_backend(
     kernel_dir: str,
     work_dir: str | None = None,

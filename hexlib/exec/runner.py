@@ -1,0 +1,171 @@
+"""One declarative description per kernel, instead of one Python function per kernel.
+
+`hexagon.scale_backend` was written for a single input and a single float attr.
+Generalising it is not optional work: `matmul_epilogue` takes three inputs, one
+of them block-quantized, plus an activation selector, and discovering the gaps in
+a bespoke marshaller inside the hardest kernel in the set is the expensive way to
+find them.
+
+THE WIRE FORMAT, little-endian:
+
+    hexlib_in.bin    scalars, in the order `RunnerSpec.scalars` lists them
+                     then each input's payload, in the order `inputs` lists them,
+                     each in its own storage dtype, C-contiguous
+    hexlib_out.bin   the output payload, in `out_dtype`
+
+WHAT IS PINNED, AND BY WHAT. The agreement between this table and a kernel's
+`runner.c` is the whole contract, and two comments that can drift apart is not a
+contract. So each kernel's test asserts the pair agrees, and every scalar a
+runner reads has to appear in the spec that feeds it -- a mismatch shows up as a
+byte offset error on the first call, which is loud, rather than as plausible
+wrong numbers.
+
+WHY SCALARS COME FIRST. The payloads are variable length and the scalars say how
+long they are. A runner has to know `n` before it can read `x[n]`.
+"""
+from __future__ import annotations
+
+import struct
+from dataclasses import dataclass, field
+from typing import Any, Mapping
+
+import numpy as np
+
+# Storage dtypes on the wire. Deliberately a separate table from
+# exec.vtcm.STORAGE_DTYPE even though they agree today: this one describes bytes
+# in a file that a C program parses, and changing it is an ABI change.
+WIRE_DTYPE: dict[str, np.dtype] = {
+    "fp32": np.dtype("<f4"),
+    "fp16": np.dtype("<f2"),
+    "int32": np.dtype("<i4"),
+}
+
+_STRUCT_CODE = {"int": "i", "float": "f"}
+
+
+@dataclass(frozen=True)
+class Scalar:
+    """One value in the header.
+
+    `source` is either 'attr:<name>' (read from the op's attrs), 'numel:<i>'
+    (the element count of input i), or 'dim:<i>:<axis>' (one dimension of input
+    i). Those three cover every kernel in the encoder without letting a spec
+    smuggle in arbitrary host-side computation, which would put logic somewhere
+    no kernel test looks.
+    """
+
+    source: str
+    ctype: str = "int"
+
+    def value(self, arrays: tuple[np.ndarray, ...], attrs: Mapping[str, Any]) -> Any:
+        kind, _, rest = self.source.partition(":")
+        if kind == "attr":
+            if rest not in attrs:
+                raise KeyError(
+                    f"runner scalar wants attr {rest!r}; op attrs are {sorted(attrs)}"
+                )
+            return attrs[rest]
+        if kind == "numel":
+            return int(arrays[int(rest)].size)
+        if kind == "dim":
+            idx, _, axis = rest.partition(":")
+            return int(arrays[int(idx)].shape[int(axis)])
+        raise ValueError(
+            f"unknown runner scalar source {self.source!r}; expected attr:, "
+            "numel: or dim:"
+        )
+
+
+@dataclass(frozen=True)
+class RunnerSpec:
+    kind: str
+    kernel_dir: str
+    inputs: tuple[str, ...]
+    out_dtype: str
+    scalars: tuple[Scalar, ...] = ()
+    # Output shape comes from the graph, not from the kernel: the op's `infer`
+    # already declared it and the executor checks it. A kernel that returned a
+    # different length fails the byte-count check in the backend.
+    out_shape_from: str = "declared"
+    notes: str = ""
+
+    def __post_init__(self) -> None:
+        for dtype in self.inputs + (self.out_dtype,):
+            if dtype not in WIRE_DTYPE:
+                raise ValueError(
+                    f"{self.kind}: {dtype!r} has no wire form; block-quantized "
+                    "inputs are staged as raw bytes and need their own path"
+                )
+        for s in self.scalars:
+            if s.ctype not in _STRUCT_CODE:
+                raise ValueError(f"{self.kind}: unknown scalar ctype {s.ctype!r}")
+
+    def header(
+        self, arrays: tuple[np.ndarray, ...], attrs: Mapping[str, Any]
+    ) -> bytes:
+        fmt = "<" + "".join(_STRUCT_CODE[s.ctype] for s in self.scalars)
+        values = []
+        for s in self.scalars:
+            v = s.value(arrays, attrs)
+            values.append(int(v) if s.ctype == "int" else float(v))
+        return struct.pack(fmt, *values)
+
+    def payload(self, arrays: tuple[np.ndarray, ...]) -> bytes:
+        if len(arrays) != len(self.inputs):
+            raise ValueError(
+                f"{self.kind} takes {len(self.inputs)} inputs, got {len(arrays)}"
+            )
+        out = bytearray()
+        for array, dtype in zip(arrays, self.inputs):
+            out += np.ascontiguousarray(array, dtype=WIRE_DTYPE[dtype]).tobytes()
+        return bytes(out)
+
+    def encode(
+        self, arrays: tuple[np.ndarray, ...], attrs: Mapping[str, Any]
+    ) -> bytes:
+        return self.header(arrays, attrs) + self.payload(arrays)
+
+    def decode(self, raw: bytes, shape: tuple[int, ...]) -> np.ndarray:
+        dtype = WIRE_DTYPE[self.out_dtype]
+        expect = int(np.prod(shape)) * dtype.itemsize if shape else dtype.itemsize
+        if len(raw) != expect:
+            raise ValueError(
+                f"{self.kind}: output is {len(raw)} bytes, expected {expect} for "
+                f"shape {shape} of {self.out_dtype}"
+            )
+        return np.frombuffer(raw, dtype=dtype).reshape(shape).astype(np.float32)
+
+
+# --- the encoder's kernels ------------------------------------------------
+#
+# One entry per op kind that has a kernel directory with a runner.c. An op kind
+# absent from here falls back to the registry's reference implementation, which
+# is why the encoder runs at every stage of this work rather than only at the
+# end.
+
+SPECS: dict[str, RunnerSpec] = {
+    "scale": RunnerSpec(
+        kind="scale",
+        kernel_dir="kernels/scale_fp16",
+        inputs=("fp16",),
+        out_dtype="fp16",
+        scalars=(Scalar("numel:0", "int"), Scalar("attr:factor", "float")),
+        notes="12 ops. factor is 1/sqrt(head_dim) = 0.125, exact in fp16.",
+    ),
+    "add": RunnerSpec(
+        kind="add",
+        kernel_dir="kernels/add_fp16",
+        inputs=("fp16", "fp16"),
+        out_dtype="fp16",
+        scalars=(Scalar("numel:0", "int"),),
+        notes=(
+            "25 ops. 24 are fp16+fp16; the 25th takes an fp32 right operand "
+            "(the learned pos_embed) and is rounded to fp16 on the wire rather "
+            "than given a second kernel."
+        ),
+    ),
+}
+
+
+def spec_for(kind: str) -> RunnerSpec | None:
+    return SPECS.get(kind)

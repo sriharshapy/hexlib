@@ -1,0 +1,15 @@
+{
+  "task_id": "add_fp16",
+  "dtype": "fp16",
+  "caps": [],
+  "mechanisms": ["hvx"],
+  "params": {
+    "n": 4100,
+    "encoder_n": 196608,
+    "encoder_shape": "[256, 768]",
+    "encoder_op_count": 25
+  },
+  "expert_kernel_cycles": null,
+  "tolerance": "hexlib_close_f16",
+  "tags": ["elementwise", "encoder", "residual"]
+}
