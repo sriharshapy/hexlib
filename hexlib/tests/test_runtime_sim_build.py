@@ -13,6 +13,7 @@ under a real booted QuRT kernel instead -- the load-bearing test here,
 test_sim_run_reaches_start_and_reports_real_vtcm, is the one that proves the
 fix actually works, not merely that a function returned a path string.
 """
+import contextlib
 import inspect
 import os
 import re
@@ -30,6 +31,26 @@ HAS_SDK = os.path.isdir(tc.default_sdk_root())
 sdk = pytest.mark.skipif(not HAS_SDK, reason="Hexagon SDK not present")
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(hexlib.__file__)))
+
+
+@contextlib.contextmanager
+def _cwd(path):
+    """tc.run() (hexlib/toolchain.py, off limits here) takes no `cwd` kwarg
+    and always inherits the calling process's own working directory. As
+    `sim_qurt_command`'s own docstring now says: under the QuRT-hosted
+    launch, `fopen(..., "wb")` writes land in the LAUNCHING PROCESS'S cwd,
+    not in `--usefs`'s directory. Without this, running these tests from the
+    repo root (exactly what `python -m pytest hexlib/tests` does) would write
+    hexlib_rsp.bin/hexlib_out.bin into the repo's own working directory on
+    every run -- confirmed the hard way: an earlier run of this file did
+    exactly that and silently modified a tracked fixture file at the repo
+    root. This is the fix the docstring tells every future caller to make."""
+    prev = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(prev)
 
 
 # ============================================================================
@@ -257,7 +278,11 @@ def test_sim_run_reaches_start_and_reports_real_vtcm(tmp_path):
     cmd = rb.sim_qurt_command(out_dir, so)
     bin_dir = tc.find_toolchain_bin(tc.default_sdk_root())
     env = tc.toolchain_env(bin_dir)
-    rc, out, err, timed_out = tc.run(cmd, env, timeout=tc.SIM_TIMEOUT_MAX_S)
+    # See sim_qurt_command's own docstring and _cwd's: writes land in the
+    # LAUNCHING process's cwd, not --usefs's directory, so this MUST run with
+    # cwd == out_dir or hexlib_rsp.bin/hexlib_out.bin land in the repo root.
+    with _cwd(out_dir):
+        rc, out, err, timed_out = tc.run(cmd, env, timeout=tc.SIM_TIMEOUT_MAX_S)
     combined = out + err
 
     assert not timed_out, combined
@@ -309,7 +334,8 @@ def test_an_unmapped_fd_batch_is_still_refused_under_the_new_build(tmp_path):
     cmd = rb.sim_qurt_command(out_dir, so, extra_args=("--unmapped",))
     bin_dir = tc.find_toolchain_bin(tc.default_sdk_root())
     env = tc.toolchain_env(bin_dir)
-    rc, out, err, timed_out = tc.run(cmd, env, timeout=tc.SIM_TIMEOUT_MAX_S)
+    with _cwd(out_dir):
+        rc, out, err, timed_out = tc.run(cmd, env, timeout=tc.SIM_TIMEOUT_MAX_S)
     combined = out + err
 
     assert not timed_out, combined
