@@ -299,7 +299,22 @@ def test_a_PARTIAL_kernel_tree_is_an_error_not_a_partial_dispatch_table(tmp_path
         ge.generate(str(tmp_path), str(tmp_path / "out"))
     # The MISSING list, not merely the names somewhere in the message: the one
     # kernel that IS present must not be reported as absent.
-    assert "for ['add', 'cast', 'transpose']" in str(exc.value)
+    #
+    # DERIVED FROM `SPECS`, NOT HARDCODED. This read `for ['add', 'cast',
+    # 'transpose']`, which is every spec except the one staged above -- so
+    # adding a legitimate new RunnerSpec (layernorm) failed it, on a change the
+    # test has no reason to care about. A test that has to be edited whenever
+    # the roster it is not testing grows is over-specified: it makes the test
+    # dictate the spec table. The property being checked is unchanged.
+    missing = sorted(k for k in rn.SPECS if k != "scale")
+    assert f"for {missing}" in str(exc.value)
+    # And the present one is reported as PRESENT. Asserting `"scale" not in
+    # message` would be wrong -- the message says `found ['scale']`, which is
+    # exactly the diagnostic a reader needs.
+    assert "found ['scale']" in str(exc.value), (
+        "the kernel that IS present must be reported as found, so the operator "
+        "can tell an incomplete checkout from a wrong kernels root"
+    )
     assert not (tmp_path / "out" / "hexlib_kernel_table.c").exists(), (
         "a partial dispatch table must not be left behind for a build to link"
     )

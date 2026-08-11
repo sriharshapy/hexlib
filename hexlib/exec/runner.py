@@ -216,6 +216,35 @@ SPECS: dict[str, RunnerSpec] = {
             "correctly-shaped wrong answer."
         ),
     ),
+    "layernorm": RunnerSpec(
+        kind="layernorm",
+        kernel_dir="kernels/layernorm_fp16",
+        inputs=("fp16", "fp32", "fp32"),
+        out_dtype="fp16",
+        scalars=(
+            Scalar("dim:0:0", "int"),    # R
+            Scalar("dim:0:1", "int"),    # C
+            Scalar("attr:eps", "float"),
+        ),
+        notes=(
+            "All 25 layernorm ops in the encoder share ONE signature -- checked "
+            "against the built graph, not assumed: x=(256,768) fp16, weight and "
+            "bias both (768,) fp32, eps=1e-06. Because the input is rank 2, R and "
+            "C are each a single dimension, so no new Scalar source was needed.\n"
+            "THE KERNEL EXISTED AND GATED GREEN FOR A DAY WITHOUT THIS SPEC, and "
+            "the spec -- not a runner.c -- is what makes an op dispatchable on the "
+            "DSP batch path. Until this landed, KIND_ID['layernorm'] = 3 was "
+            "reachable on the wire and answered ERR_NO_KERNEL, while STATE.md "
+            "counted its 25 ops as covered.\n"
+            "First kernel here with THREE inputs, and the first with MIXED input "
+            "dtypes: fp16 data against fp32 affine parameters. That makes it the "
+            "first real exercise of the generated entry's per-input dtype check, "
+            "which previously only ever saw buffers of one type.\n"
+            "Its 111088 cycles are a first rung, not a result -- both reductions "
+            "are still scalar. Note the gate measured R=4; the encoder needs "
+            "R=256, which the kernel takes as a parameter and no harness has run."
+        ),
+    ),
 }
 
 

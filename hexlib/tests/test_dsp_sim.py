@@ -145,3 +145,121 @@ def test_a_response_that_was_never_written_cannot_read_as_success(backend):
     """Belt and braces on the structural guarantee: status 0 is not a status."""
     with pytest.raises(dspmod.wire.WireError):
         dspmod.wire.unpack_response(b"\x00" * 32)
+
+
+# ---------------------------------------------------------------------------
+# layernorm: three inputs, mixed input dtypes, and the dim: scalar sources
+# ---------------------------------------------------------------------------
+#
+# Everything above drives `scale`: one input, one float attr. That left the
+# general run() path -- multiple buffers, per-input dtypes, dimension-derived
+# scalars -- carried on the simulator by nothing, which STATE.md recorded as an
+# open gap. layernorm is the first op here with THREE inputs and the first with
+# MIXED input dtypes (fp16 data, fp32 affine parameters), so it exercises the
+# generated entry's per-buffer dtype check against buffers that genuinely differ.
+
+LN_EPS = 1e-6
+
+
+def _ln_reference(x, w, b, eps, ddof=0):
+    """The op registry's own formula, accumulated in fp64.
+
+    `ddof=1` produces the UNBIASED-variance near-miss that
+    kernels/layernorm_fp16/ keeps as a rejected variant. It is a parameter here
+    so the test below can prove its own threshold discriminates.
+    """
+    xf = x.astype(np.float64)
+    mean = xf.mean(axis=-1, keepdims=True)
+    centred = xf - mean
+    n = xf.shape[-1]
+    var = (centred * centred).sum(axis=-1, keepdims=True) / (n - ddof)
+    return ((centred / np.sqrt(var + eps)) * w + b).astype(np.float16)
+
+
+def _ln_inputs(R, C, seed=7):
+    rng = np.random.default_rng(seed)
+    return (rng.standard_normal((R, C)).astype(np.float16),
+            rng.standard_normal(C).astype(np.float32),
+            rng.standard_normal(C).astype(np.float32))
+
+
+@sdk
+@pytest.mark.parametrize("R,C", [(4, 768), (8, 64), (256, 768)])
+def test_layernorm_agrees_with_the_reference_and_rejects_the_near_miss(backend, R, C):
+    """A MAX-ERROR TOLERANCE CANNOT CHECK THIS KERNEL, so this does not use one.
+
+    One fp16 ULP is 9.8e-4 relative. The unbiased-variance near-miss -- divide
+    by C-1 instead of C -- is only 6.5e-4 at C=768. So ANY per-element tolerance
+    loose enough to admit the kernel's genuine 1-ULP noise is already looser
+    than the bug it must catch. This repo has paid for that once: that near-miss
+    was WRONGLY ACCEPTED on its first run for exactly this reason.
+
+    What separates them is the SHAPE of the disagreement, not its size. The
+    kernel's error is 1-ULP noise on a handful of elements; the near-miss is a
+    systematic shift on every element. So the statistic is the fraction of
+    BIT-EXACT elements, and the test asserts both directions -- that the kernel
+    clears the threshold, and that the near-miss does not. The second assertion
+    is what stops the threshold from being quietly argued downwards later:
+    lower it far enough to admit the bug and this test fails.
+
+    Measured through this path, for the record: 99.805% bit-exact at (4,768),
+    99.917% at (256,768), 100% at (8,64); the near-miss scores 49.7%, 47.8% and
+    11.1%. Max error is 1 ULP at (4,768) and 6 ULPs at (256,768) -- the relative
+    error is the same, there are simply 64x more rows for the tail to appear in.
+    """
+    x, w, b = _ln_inputs(R, C)
+    y, _ = backend.run("layernorm", [x, w, b], {"eps": LN_EPS})
+
+    assert y.dtype == np.float16
+    assert y.shape == (R, C)
+
+    good = _ln_reference(x, w, b, LN_EPS, ddof=0)
+    near_miss = _ln_reference(x, w, b, LN_EPS, ddof=1)
+
+    frac_good = float((y == good).sum()) / y.size
+    frac_bad = float((y == near_miss).sum()) / y.size
+
+    assert frac_good >= 0.99, (
+        f"layernorm at R={R} C={C} matched the reference bit-for-bit on only "
+        f"{frac_good:.4%} of elements; 1-ULP noise on a few is expected, a "
+        f"systematic disagreement is not"
+    )
+    assert frac_bad < 0.90, (
+        f"THE THRESHOLD NO LONGER DISCRIMINATES: the unbiased-variance "
+        f"near-miss scores {frac_bad:.4%}, which the 0.99 bound above would "
+        f"not obviously reject. Tighten the check or find a better statistic "
+        f"-- do not relax it."
+    )
+    assert frac_good - frac_bad > 0.4, (
+        f"correct {frac_good:.4%} vs near-miss {frac_bad:.4%}: the separation "
+        f"this test relies on has collapsed"
+    )
+
+
+@sdk
+def test_layernorm_reaches_the_kernel_with_its_dimensions_and_eps_intact(backend):
+    """The scalars, checked by consequence rather than by reading the blob.
+
+    R and C arrive as `dim:0:0` and `dim:0:1` and eps as `attr:eps` -- the first
+    use of the dimension-derived sources on this transport. A swap of R and C
+    would be invisible to a square input and to any shape-only assertion, so
+    this uses a NON-SQUARE shape whose transpose is not even the same length,
+    and a deliberately large eps whose effect on the output is unmistakable.
+    """
+    R, C = 8, 64
+    x, w, b = _ln_inputs(R, C)
+
+    y_small = backend.run("layernorm", [x, w, b], {"eps": 1e-6})[0]
+    y_huge = backend.run("layernorm", [x, w, b], {"eps": 4.0})[0]
+
+    assert y_small.shape == (R, C)
+    # eps sits inside the sqrt, so a large one shrinks every normalised value
+    # towards zero before the affine term. If eps were dropped or read as an
+    # int, these two would be identical.
+    assert not np.array_equal(y_small, y_huge), (
+        "eps=1e-6 and eps=4.0 produced identical output, so the attr scalar is "
+        "not reaching the kernel"
+    )
+    assert np.allclose(y_huge.astype(np.float32),
+                       _ln_reference(x, w, b, 4.0).astype(np.float32),
+                       atol=2e-3), "eps=4.0 did not match the reference"
