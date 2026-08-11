@@ -25,8 +25,8 @@ its evidence.
 |---|---|---|
 | **Kernel pipeline** | ✅ shipped | write a `.c`, run `hexlib test`, get a gate verdict + cycles + ELF proof |
 | **Graph → plan compiler** | ✅ shipped | `hexlib plan qwen35 --print`, no SDK needed |
-| **Plan executor** | ✅ shipped | whole encoder runs end to end, validated against PyTorch |
-| **6 kernels** | ✅ gated | 4 dispatchable from the executor |
+| **Plan executor** | ✅ shipped | whole encoder runs end to end; validated against PyTorch **on a tiny config only** — no full-size reference exists yet |
+| **6 kernels** | ✅ gated | 4 dispatchable from the executor; 86 of 259 real-work ops |
 | **Silicon-path runtime** | 🚧 on a branch | FastRPC + DSP skel; simulator green, **never run on hardware** |
 | **On-device execution** | ❌ not yet | cross-compiles and stages; no job has been run |
 
@@ -140,11 +140,27 @@ DDR ↔ VTCM        58,643,456 bytes
 Plan steps        308   (396 ops before fusion)
 ```
 
-The encoder reproduces upstream `transformers` to **4.47e-08** on committed golden
-vectors, with no torch at test time. Through the plan executor: 4.470e-08 in fp32,
-6.747e-05 in fp16 — which is what fp16 storage costs, measured rather than assumed.
-
 `matmul_epilogue` alone accounts for 55.9 of those 58.6 MB, which is why it is next.
+
+**Numerical validation is at a different scale, and the distinction matters.** The plan
+figures above are at 256×256. The accuracy figures below are **not**: they are measured
+on a *tiny* config — 2 layers, hidden 64, image 32 — against committed golden vectors,
+with no torch at test time.
+
+| | |
+|---|---|
+| tiny config vs upstream `transformers` | **4.47e-08** |
+| tiny config through the plan executor, fp32 | 4.470e-08 |
+| tiny config through the plan executor, fp16 | 6.747e-05 |
+
+**There is no full-size PyTorch reference yet**, so nothing here says the 0.8B encoder is
+validated at 256×256. What the tiny config does establish is that the graph, the pass
+pipeline, the plan and the executor agree with upstream to fp32 round-off, and what the
+fp16 row costs — which is the part a larger config would not change. Obtaining a
+full-size reference is tracked in [`docs/STATE.md`](docs/STATE.md).
+
+*(Corrected 2026-08-11: these three figures previously sat directly under the "at
+256×256" heading with no scale caveat, which read as a claim about the full model.)*
 
 ---
 
