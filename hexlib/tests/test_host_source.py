@@ -951,3 +951,34 @@ def test_coherency_check_documents_its_own_scope_limits(main_comments):
     assert "DSP-write" in main and "host-read" in main
     assert "host-write" in main and "DSP-read" in main
     assert "kernel-independent" in main.lower()
+
+
+def test_the_self_test_batch_names_its_layout_instead_of_writing_a_bare_zero(main):
+    """`tens[i].layout` must be spelled with the macro, not a literal.
+
+    This was `tens[i].layout = 0;` with a trailing comment naming
+    `LAYOUT_ID["row_major"]` -- and unlike the `dtype = 1` literal beside it,
+    which genentry's emitted `a->dtype[0] != 1u` guard rejects loudly at run
+    time, NOTHING checked layout at all. `grep -c layout` over this file was 0.
+
+    A bare 0 is not wrong today; it is unbound. Insert a layout ahead of
+    row_major in `wire.LAYOUT_ID` and `pack_batch` emits 1 while this file
+    keeps emitting 0, and `--self-test` still prints `PASS (4100 values,
+    bit-exact)` over a buffer the batch declared as something else. The enum
+    exists (per hexlib_dsp.h's own header) so that un-repacked weights are a
+    plan-time error rather than silent corruption, and `LAYOUT_ID` already
+    carries `q4_0_repacked` for the matmul that comes next.
+
+    The macro's VALUE is bound to `wire.LAYOUT_ID` by a compiled probe in
+    test_wire_struct_layout.py; this test only pins that main.c goes through
+    the macro. Read off comment-blanked source, so the explanatory comment
+    cannot satisfy it.
+    """
+    body = _function_body(main, "build_scale_batch")
+    assert "HEXLIB_LAYOUT_ROW_MAJOR" in body, (
+        "build_scale_batch must set tens[].layout from HEXLIB_LAYOUT_ROW_MAJOR, "
+        "not from a bare integer whose only tie to wire.LAYOUT_ID is a comment"
+    )
+    assert not re.search(r"\.layout\s*=\s*\d", body), (
+        "a numeric literal is being assigned to .layout again; use the macro"
+    )

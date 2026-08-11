@@ -62,7 +62,7 @@ import os
 from typing import Sequence
 
 from hexlib.exec.runner import RunnerSpec, Scalar
-from hexlib.runtime.wire import DTYPE_ID
+from hexlib.runtime.wire import DTYPE_ID, LAYOUT_ID
 
 KIND_ID: dict[str, int] = {
     "add": 1,
@@ -143,6 +143,37 @@ def _dtype_check(idx: int, dtype: str, role: str) -> str:
             f"would silently halve or double every stride."
         )
         + f"\n    if (a->dtype[{idx}] != {DTYPE_ID[dtype]}u) "
+        f"return HEXLIB_DSP_ERR_REQUIRES;"
+    )
+
+
+def _layout_check(idx: int, layout: str, role: str) -> str:
+    """The layout guard for ONE buffer, emitted beside its dtype guard.
+
+    `a->layout[idx]` is filled by `skel_dispatch.c` from the tensor's own
+    layout field, serialized through the same `LAYOUT_ID` table imported here.
+    Nothing checked it before: `main.c` wrote a bare literal `0` with a comment
+    for the binding, `grep -c layout hexlib/tests/test_host_source.py` was 0,
+    and `--self-test` printed `PASS (4100 values, bit-exact)` regardless of
+    what the batch declared.
+
+    THIS IS THE CHECK THAT MAKES THE ENUM WORTH HAVING. `hexlib_dsp.h`'s own
+    header says the layout is enumerated rather than ne/nb strides so that
+    "un-repacked weights are a plan-time error rather than silent corruption" --
+    and `LAYOUT_ID` already carries `q4_0_repacked`, the matmul weight layout.
+    Without a guard here that sentence describes an intention, not a mechanism:
+    a q4_0-repacked weight buffer handed to a row-major kernel is read as
+    row-major fp16 and returns HEXLIB_DSP_OK with a plausible wrong answer, the
+    same failure mode the per-buffer dtype check exists to stop.
+    """
+    return (
+        _comment(
+            f"{role} buf[{idx}] is addressed as {layout}, so the batch must "
+            f"have declared it {layout} ({LAYOUT_ID[layout]} in "
+            f"hexlib.runtime.wire.LAYOUT_ID). A differently-laid-out buffer of "
+            f"the same dtype and byte count passes every other check here."
+        )
+        + f"\n    if (a->layout[{idx}] != {LAYOUT_ID[layout]}u) "
         f"return HEXLIB_DSP_ERR_REQUIRES;"
     )
 
@@ -243,6 +274,14 @@ def emit_entry(name: str, spec: RunnerSpec) -> str:
     for i, in_dtype in enumerate(spec.inputs):
         checks.append(_dtype_check(i, in_dtype, "input"))
     checks.append(_dtype_check(out_idx, spec.out_dtype, "output"))
+
+    # AND EVERY BUFFER'S DECLARED LAYOUT, for the same reason and on the same
+    # terms -- see `_layout_check`. `spec.buf_layouts()` defaults every buffer to
+    # row_major, so this is a no-op for every kernel shipped today and becomes
+    # load-bearing the moment a q4_0_repacked weight appears.
+    for i, layout in enumerate(spec.buf_layouts()):
+        checks.append(_layout_check(i, layout, "input" if i < len(spec.inputs)
+                                    else "output"))
 
     # `requires` is enforced HERE as well as on the host where it is genuinely
     # checkable -- see `_requires_check` for exactly which keys that is, and the

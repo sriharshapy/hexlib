@@ -604,3 +604,63 @@ def test_the_dsp_side_scratch_fields_are_where_the_host_writes_its_zeros(
         "test_runtime_wire.py::test_host_writes_zero_into_tensor_data reads "
         f"it at a hardcoded offset 36 and would now read {tensor['data']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# The layout enum, on both sides at once
+# ---------------------------------------------------------------------------
+
+
+@needs_cc
+def test_the_layout_enum_has_the_same_values_in_c_as_on_the_wire(tmp_path):
+    """`HEXLIB_LAYOUT_*` in the header vs `wire.LAYOUT_ID`, COMPILED.
+
+    `main.c` used to write `tens[i].layout = 0` as a bare literal whose only
+    tie to `LAYOUT_ID["row_major"]` was a trailing comment, and unlike the
+    `dtype` literal beside it nothing checked layout anywhere: `grep -c layout
+    hexlib/tests/test_host_source.py` was 0. Inserting a value ahead of
+    row_major would have left `pack_batch` emitting 1 while `main.c` kept
+    emitting 0, and `--self-test` would still have printed `PASS (4100 values,
+    bit-exact)` over a buffer the batch declared as a different layout.
+
+    Compiled rather than grepped for the reason this whole file exists: a
+    source assertion over `#define` lines is satisfied by a comment, and was
+    twice satisfied by a string literal. The preprocessor's own numbers are the
+    only thing that cannot be faked. Every entry in `LAYOUT_ID` must have a
+    macro, so ADDING a Python-side layout without adding the C one fails here
+    too -- which is the direction the next kernel takes (`q4_0_repacked`).
+    """
+    names = {k: "HEXLIB_LAYOUT_" + k.upper() for k in wire.LAYOUT_ID}
+    lines = ['#include <stdio.h>', '#include "hexlib_dsp.h"', "int main(void) {"]
+    for key, macro in names.items():
+        lines.append(f'    printf("{key} %lu' + r'\n' + f'", (unsigned long) {macro});')
+    lines += ["    return 0;", "}", ""]
+
+    c_path = tmp_path / "layout_probe.c"
+    c_path.write_text("\n".join(lines))
+    exe = tmp_path / ("lp.exe" if sys.platform == "win32" else "lp")
+    cc = subprocess.run(
+        [HOST_CC, "-o", str(exe), str(c_path), "-I", str(DSP_H.parent.resolve())],
+        capture_output=True, text=True,
+    )
+    assert cc.returncode == 0, (
+        "the layout-enum probe did not compile. Every name in wire.LAYOUT_ID "
+        "must have a HEXLIB_LAYOUT_<NAME> macro in hexlib_dsp.h -- a layout "
+        "that exists only on the Python side is one main.c cannot spell:\n"
+        f"{cc.stdout}\n{cc.stderr}"
+    )
+    run = subprocess.run([str(exe)], capture_output=True, text=True)
+    assert run.returncode == 0, f"layout probe exited {run.returncode}"
+
+    got = {}
+    for line in run.stdout.split("\n"):
+        parts = line.split()
+        if len(parts) == 2:
+            got[parts[0]] = int(parts[1])
+
+    assert got == dict(wire.LAYOUT_ID), (
+        f"the C layout macros are {got} but wire.LAYOUT_ID is "
+        f"{dict(wire.LAYOUT_ID)}. These cross the wire in "
+        "hexlib_tensor.layout; a mismatch is a correctly-shaped wrong answer, "
+        "not a compile error."
+    )

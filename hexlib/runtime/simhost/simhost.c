@@ -196,16 +196,56 @@ int main(int argc, char **argv) {
     }
 
     /* The batch was built by the host with fd 0 as a placeholder; patch in the
-     * real fd. Offsets are unchanged -- they are all this side ever sends. */
+     * real fd. Offsets are unchanged -- they are all this side ever sends.
+     *
+     * BOUNDED HERE, AND NOT BY BORROWING skel_dispatch.c's CHECK. That check
+     * is correct and is widened to 64-bit arithmetic, but it runs on the far
+     * side of hexlib_iface_invoke -- and this loop writes 24 bytes per
+     * iteration into a fixed 64 KiB static array before then, straight from
+     * fields the batch file supplied. `DspSimBackend.run_raw` exists precisely
+     * to feed the DSP arbitrary blobs "so a bad magic, a truncated blob or an
+     * unknown op kind exercises the DSP's OWN validation", so those fields are
+     * untrusted BY DESIGN on this path: n_bufs=1 with off_bufs=0xFFFFFF00 was
+     * a ~4 GiB out-of-range write that faults hexagon-sim, and
+     * n_bufs=0x01000000 with off_bufs=40 walked 384 MiB forward in 24-byte
+     * steps over g_rsp and the skel's own static bufs[]/tens[]. Either way the
+     * caller saw an opaque simulator crash instead of the DSP's rejection
+     * status, which is the one thing that call was written to observe.
+     *
+     * A blob that does not fit is therefore NOT PATCHED AND STILL SENT: the
+     * skel answers with its own status, unchanged. Refusing to send it here
+     * would substitute the host's verdict for the DSP's and defeat the same
+     * purpose from the other direction. main.c:911-916 already validates these
+     * fields on the device path; the asymmetry was the defect.
+     *
+     * Widened to uint64_t so a large n_bufs cannot wrap the comparison back
+     * into passing, and blen is checked against the header size first so a
+     * short read cannot leave `hdr` holding whatever was in g_batch before. */
     struct hexlib_batch_hdr hdr;
-    memcpy(&hdr, g_batch, sizeof(hdr));
-    for (uint32_t i = 0; i < hdr.n_bufs; i++) {
-        struct hexlib_buf_desc b;
-        size_t off = hdr.off_bufs + i * sizeof(b);
-        memcpy(&b, g_batch + off, sizeof(b));
-        b.fd = (uint32_t) fd;
-        b.base = 0;   /* never an address, on any path */
-        memcpy(g_batch + off, &b, sizeof(b));
+    memset(&hdr, 0, sizeof(hdr));
+    int patch_bufs = 0;
+    if (blen >= (long) sizeof(hdr)) {
+        memcpy(&hdr, g_batch, sizeof(hdr));
+        uint64_t need = (uint64_t) hdr.off_bufs +
+                        (uint64_t) hdr.n_bufs * sizeof(struct hexlib_buf_desc);
+        patch_bufs = (need <= (uint64_t) blen);
+    }
+    if (patch_bufs) {
+        for (uint32_t i = 0; i < hdr.n_bufs; i++) {
+            struct hexlib_buf_desc b;
+            size_t off = (size_t) hdr.off_bufs + (size_t) i * sizeof(b);
+            memcpy(&b, g_batch + off, sizeof(b));
+            b.fd = (uint32_t) fd;
+            b.base = 0;   /* never an address, on any path */
+            memcpy(g_batch + off, &b, sizeof(b));
+        }
+    } else {
+        /* Printed, not silent: an unpatched batch is a legitimate thing to
+         * send here, but it is never what a normal run wants, so a normal run
+         * showing this line is a bug in the caller and must be visible. */
+        printf("SIMHOST note=bufs_out_of_range_not_patched "
+               "n_bufs=%u off_bufs=%u blen=%ld\n",
+               (unsigned int) hdr.n_bufs, (unsigned int) hdr.off_bufs, blen);
     }
 
     rc = hexlib_iface_invoke(h, g_batch, (int) blen, g_rsp, (int) sizeof(g_rsp));

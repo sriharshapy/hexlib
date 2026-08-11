@@ -42,6 +42,14 @@ WIRE_DTYPE: dict[str, np.dtype] = {
 
 _STRUCT_CODE = {"int": "i", "float": "f"}
 
+# THE LAYOUT NAMES ARE IMPORTED, NOT RESPELLED, unlike WIRE_DTYPE above. That
+# table is deliberately independent because it maps names to numpy dtypes and
+# only agrees with wire.py's by coincidence of naming; this one is the same set
+# of names for the same field, and a second copy of it is precisely the drift
+# that left main.c emitting layout 0 while pack_batch could emit something else.
+# wire.py imports nothing but the stdlib, so this cannot cycle.
+from hexlib.runtime.wire import LAYOUT_ID as WIRE_LAYOUT  # noqa: E402
+
 
 @dataclass(frozen=True)
 class Scalar:
@@ -90,11 +98,31 @@ class RunnerSpec:
     # passes, so nothing but the values would catch it. Checked before the
     # kernel is invoked, and a mismatch is an error rather than a fallback.
     requires: tuple[tuple[str, Any], ...] = ()
+    # The wire layout each buffer must be declared as, inputs then output, or ()
+    # for "row_major throughout" -- which every kernel shipped so far is. Named
+    # per buffer rather than per kernel because the matmul this leads to takes a
+    # `q4_0_repacked` weight beside a row-major activation, and `LAYOUT_ID`
+    # already carries that value. See `genentry._layout_check` for what enforces
+    # it on the DSP and why an unchecked enum is a comment, not a mechanism.
+    layouts: tuple[str, ...] = ()
     # Output shape comes from the graph, not from the kernel: the op's `infer`
     # already declared it and the executor checks it. A kernel that returned a
     # different length fails the byte-count check in the backend.
     out_shape_from: str = "declared"
     notes: str = ""
+
+    def buf_layouts(self) -> tuple[str, ...]:
+        """The layout of every buffer, inputs then output, always fully spelled.
+
+        `layouts=()` means row_major throughout, which is what every kernel
+        shipped so far is -- so the default keeps the declaration short without
+        making "unspecified" a third possibility anything downstream has to
+        handle. Callers get one buffer per buffer, in the order
+        `skel_dispatch.c` walks src then dst.
+        """
+        if not self.layouts:
+            return ("row_major",) * (len(self.inputs) + 1)
+        return self.layouts
 
     def check_requires(self, attrs: Mapping[str, Any]) -> None:
         for key, want in self.requires:
@@ -116,6 +144,26 @@ class RunnerSpec:
         for s in self.scalars:
             if s.ctype not in _STRUCT_CODE:
                 raise ValueError(f"{self.kind}: unknown scalar ctype {s.ctype!r}")
+        # Refused at construction, not at generate time: an unknown layout name
+        # would reach `genentry._layout_check` as a KeyError from a dict lookup
+        # inside an f-string, which says nothing about which spec is wrong. A
+        # short `layouts` is the worse error of the two -- it silently leaves the
+        # output buffer, or an input, with no guard at all.
+        if self.layouts:
+            want = len(self.inputs) + 1
+            if len(self.layouts) != want:
+                raise ValueError(
+                    f"{self.kind}: layouts has {len(self.layouts)} entries but "
+                    f"this kernel has {len(self.inputs)} input(s) plus one "
+                    f"output = {want}. Every buffer must be named, in src-then-"
+                    f"dst order, or leave layouts=() for row_major throughout."
+                )
+            for layout in self.layouts:
+                if layout not in WIRE_LAYOUT:
+                    raise ValueError(
+                        f"{self.kind}: {layout!r} is not a layout on the wire; "
+                        f"known layouts are {sorted(WIRE_LAYOUT)}"
+                    )
 
     def header(
         self, arrays: tuple[np.ndarray, ...], attrs: Mapping[str, Any]

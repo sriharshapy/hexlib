@@ -235,7 +235,7 @@ static uint8_t *build_scale_batch(int fd_x, int fd_y, size_t nbytes, float facto
         tens[i].offset = 0;
         tens[i].nbytes = (uint32_t) nbytes;
         tens[i].dtype  = 1;   /* hexlib.runtime.wire.DTYPE_ID["fp16"] */
-        tens[i].layout = 0;   /* hexlib.runtime.wire.LAYOUT_ID["row_major"] */
+        tens[i].layout = HEXLIB_LAYOUT_ROW_MAJOR;
         tens[i].ne[0]  = SELF_TEST_N;
         tens[i].ne[1]  = 1;
         tens[i].ne[2]  = 1;

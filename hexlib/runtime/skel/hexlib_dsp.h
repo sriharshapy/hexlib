@@ -85,6 +85,26 @@ struct hexlib_buf_desc {
     uint32_t flags;
 };
 
+/* THE ENUMERATED LAYOUT, spelled once. These MUST equal
+ * hexlib.runtime.wire.LAYOUT_ID, which is what the host serializes through, and
+ * hexlib/tests/test_wire_struct_layout.py compares the two tables so a value
+ * added on one side cannot drift from the other.
+ *
+ * Named rather than left as bare integers because `tens[i].layout = 0` in
+ * main.c's hand-built batch was a literal 0 with only a comment tying it to
+ * `LAYOUT_ID["row_major"]` -- and unlike the `dtype` literal beside it, which
+ * genentry's emitted `a->dtype[..] != 1u` guard catches loudly at run time,
+ * nothing checked layout at all. Inserting a layout ahead of row_major would
+ * have left `pack_batch` emitting 1 while main.c kept emitting 0, and
+ * `--self-test` would still print `PASS (4100 values, bit-exact)` while
+ * declaring the buffer as something else entirely. Latent only because no
+ * kernel reads `a->layout` YET: `q4_0_repacked` is the matmul weight layout,
+ * and the whole reason this field is an enum rather than ne/nb strides is so
+ * that un-repacked weights are a plan-time error and not silent corruption. */
+#define HEXLIB_LAYOUT_ROW_MAJOR    0u
+#define HEXLIB_LAYOUT_TILED_32X32  1u
+#define HEXLIB_LAYOUT_Q4_0_REPACKED 2u
+
 struct hexlib_tensor {
     uint32_t bi;
     uint32_t offset;

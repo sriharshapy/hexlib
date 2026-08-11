@@ -380,14 +380,22 @@ class DspSimBackend:
         out_dtype = WIRE_DTYPE[spec.out_dtype]
         out_nbytes = int(np.prod(out_shape)) * out_dtype.itemsize if out_shape else out_dtype.itemsize
 
+        # FROM THE SPEC, NOT THE CONSTANT "row_major". Both tensor loops below
+        # used to hard-code it, which meant the DSP's layout guard (added with
+        # `genentry._layout_check`) could never see anything but row_major from
+        # this serializer -- the same self-comparison the output dtype has, and
+        # for the same structural reason. A spec declaring a `q4_0_repacked`
+        # weight now actually says so on the wire.
+        buf_layouts = spec.buf_layouts()
+
         payload = bytearray()
         tensors = []
         offset = 0
-        for a, dt in zip(arrays, spec.inputs):
+        for i, (a, dt) in enumerate(zip(arrays, spec.inputs)):
             nbytes = a.nbytes
             tensors.append(wire.TensorDesc(
                 bi=0, offset=offset, nbytes=nbytes, dtype=dt,
-                layout="row_major", ne=_ne(a.shape),
+                layout=buf_layouts[i], ne=_ne(a.shape),
             ))
             payload += a.tobytes()
             offset += nbytes
@@ -405,7 +413,7 @@ class DspSimBackend:
         # `check_requires` above is the check that actually decides it.
         tensors.append(wire.TensorDesc(
             bi=0, offset=out_offset, nbytes=out_nbytes, dtype=spec.out_dtype,
-            layout="row_major", ne=_ne(out_shape),
+            layout=buf_layouts[-1], ne=_ne(out_shape),
         ))
         payload += b"\x00" * out_nbytes
 

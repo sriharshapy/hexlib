@@ -179,6 +179,65 @@ def _qdc_remaining_budget_min() -> int | None:
     return int(text, 10)
 
 
+def _qdc_budget_refusal(timeout_min: object) -> str | None:
+    """The budget COMPARISON ALONE -- the reason to refuse, or None. Prints
+    nothing.
+
+    Split out of `_qdc_budget_guard` so that `_qdc_submit`, which is the
+    function that actually spends the minutes, can re-run the comparison
+    without printing the budget line a second time. The printing is a
+    courtesy to whoever typed the command; the comparison is the guard, and
+    only the guard has to be duplicated at the point of spending. Same shape
+    and same reason as `_qdc_kernel_refusal`.
+
+    A non-int `timeout_min` is refused rather than compared. `_cmd_test_qdc`
+    rejects `None` before it gets here, but a second caller invoking
+    `_qdc_submit` directly has no such guarantee, and `None > budget` raises
+    on some paths and passes on others -- neither of which may decide whether
+    money is spent.
+    """
+    if not isinstance(timeout_min, int) or isinstance(timeout_min, bool):
+        return (
+            f"--timeout-min must be a whole number of minutes, got "
+            f"{timeout_min!r} -- a value that cannot be compared to a budget "
+            "is refused rather than submitted with no comparison at all"
+        )
+    try:
+        budget = _qdc_remaining_budget_min()
+    except _QdcBudgetError as e:
+        return str(e)
+    if budget is None:
+        return None
+    if timeout_min > budget:
+        return (
+            f"--timeout-min {timeout_min} exceeds the {budget} "
+            f"minute(s) recorded in {_QDC_BUDGET_ENV} -- refusing to submit a "
+            "job whose own timeout is larger than the budget it has to spend "
+            "from. Device minutes are non-renewable. Lower --timeout-min, or "
+            f"correct {_QDC_BUDGET_ENV} if it is stale."
+        )
+    return None
+
+
+def _qdc_confirm_refusal(timeout_min: object, yes: object) -> str | None:
+    """The `--yes` threshold ALONE -- the reason to refuse, or None. Prints
+    nothing, for the same reason as `_qdc_budget_refusal`.
+
+    This is the guard that does not depend on the operator having recorded a
+    budget anywhere, so it is the one that must hold on every path.
+    """
+    if not isinstance(timeout_min, int) or isinstance(timeout_min, bool):
+        return None                 # _qdc_budget_refusal owns that message
+    if timeout_min > _QDC_YES_THRESHOLD_MIN and not yes:
+        return (
+            f"--timeout-min {timeout_min} is above the "
+            f"{_QDC_YES_THRESHOLD_MIN}-minute confirmation threshold -- pass "
+            "--yes to submit anyway. This does not limit the job itself, "
+            "only submitting one this size without a human confirming it."
+        )
+    return None
+
+
 def _qdc_budget_guard(timeout_min: int) -> int:
     """Print the (locally recorded, never queried) remaining budget and
     COMPARE it to `timeout_min`. Returns 0 to proceed, 2 to refuse.
@@ -193,35 +252,29 @@ def _qdc_budget_guard(timeout_min: int) -> int:
     the ceiling QDC itself will enforce on the job, so a job whose ceiling
     exceeds the stated remaining budget can, on its own, exhaust the account.
     Equality is allowed (spending the last minutes deliberately is a real
-    thing to want); exceeding is not.
+    thing to want); exceeding is not. The comparison itself lives in
+    `_qdc_budget_refusal` so `_qdc_submit` can repeat it silently.
     """
     try:
         budget = _qdc_remaining_budget_min()
-    except _QdcBudgetError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 2
+    except _QdcBudgetError:
+        pass                        # the refusal below carries the message
+    else:
+        if budget is None:
+            print(
+                f"remaining budget: unknown ({_QDC_BUDGET_ENV} is not set) -- "
+                "NO BUDGET CHECK WAS PERFORMED. Nothing here queries QDC for a "
+                "remaining-minutes figure (there is no reliable API for it on "
+                f"this account), and unset means unknown, NOT unlimited: set "
+                f"{_QDC_BUDGET_ENV} to have --timeout-min actually checked "
+                "against it."
+            )
+        else:
+            print(f"remaining budget: {budget} minutes (from {_QDC_BUDGET_ENV})")
 
-    if budget is None:
-        print(
-            f"remaining budget: unknown ({_QDC_BUDGET_ENV} is not set) -- "
-            "NO BUDGET CHECK WAS PERFORMED. Nothing here queries QDC for a "
-            "remaining-minutes figure (there is no reliable API for it on "
-            f"this account), and unset means unknown, NOT unlimited: set "
-            f"{_QDC_BUDGET_ENV} to have --timeout-min actually checked "
-            "against it."
-        )
-        return 0
-
-    print(f"remaining budget: {budget} minutes (from {_QDC_BUDGET_ENV})")
-    if timeout_min > budget:
-        print(
-            f"error: --timeout-min {timeout_min} exceeds the {budget} "
-            f"minute(s) recorded in {_QDC_BUDGET_ENV} -- refusing to submit a "
-            "job whose own timeout is larger than the budget it has to spend "
-            "from. Device minutes are non-renewable. Lower --timeout-min, or "
-            f"correct {_QDC_BUDGET_ENV} if it is stale.",
-            file=sys.stderr,
-        )
+    refusal = _qdc_budget_refusal(timeout_min)
+    if refusal is not None:
+        print(f"error: {refusal}", file=sys.stderr)
         return 2
     return 0
 
@@ -330,6 +383,25 @@ def _qdc_submit(args) -> int:
     if refusal is not None:
         print(f"error: {refusal}", file=sys.stderr)
         return 2
+
+    # AND SO ARE THE TWO GUARDS THAT COST MONEY, for the reason stated above --
+    # which previously applied only to the CHEAPEST of the guards. The kernel
+    # check was re-run here while `_qdc_budget_guard` and the `--yes` threshold
+    # were left one frame up in `_cmd_test_qdc`, so `cli._qdc_submit(args)` with
+    # `timeout_min=240` under `QDC_BUDGET_MIN=3` built, staged and submitted a
+    # 240-minute job with no comparison, no confirmation, and nothing printed:
+    # exactly the 80x overspend `_qdc_budget_guard`'s docstring says it exists
+    # to prevent, past a guard that was present but not on this path.
+    #
+    # The `_refusal` (silent) forms are used, not `_qdc_budget_guard`, so the
+    # normal route through `_cmd_test_qdc` prints the budget line ONCE. Money
+    # guards duplicated; the courtesy print not.
+    for check in (_qdc_budget_refusal(getattr(args, "timeout_min", None)),
+                  _qdc_confirm_refusal(getattr(args, "timeout_min", None),
+                                       getattr(args, "yes", False))):
+        if check is not None:
+            print(f"error: {check}", file=sys.stderr)
+            return 2
 
     build_dir = os.path.join(args.out, "qdc_build")
     try:
@@ -581,13 +653,40 @@ def _qdc_check_results(job_id: int, paths: list[str]) -> int:
         `_qdc_cycles_total_verdict` for why zero is the expected shape of
         the failure rather than a pedantic edge case.
     """
-    results_path = next(
-        (p for p in paths if os.path.basename(p) == "results.xml"), None
-    )
+    # SELECTED BY THE SAME SUFFIX TEST `job.wait()` USES, not by basename, and
+    # AMBIGUITY IS A FAILURE. `job.fetch` mirrors QDC's directory layout beneath
+    # `log_dir` precisely because `TestLogs/results.xml` and `logs/results.xml`
+    # used to collide on disk -- so from that fix onwards TWO files named
+    # results.xml can exist, and `os.path.basename(p) == "results.xml"` took
+    # whichever QDC happened to list first. A framework placeholder
+    # (`<testsuite tests="1" failures="0" .../>`) listed ahead of the real
+    # report is then parsed as the verdict, and since `write_qdc_log` runs
+    # before the asserts the combined log still carries the PASS and
+    # `cycles_total=` lines: a failed device job reported as a pass, which is
+    # this project's own named Critical, on the money path.
+    #
+    # `job._results_filename` requires the full `TestLogs/results.xml` suffix,
+    # which is what actually distinguishes the report from the placeholder. Two
+    # matches means the layout is not what this reader was written against, and
+    # a verdict read from a guess is worse than no verdict.
+    from hexlib.device.qdc import job as _qdc_job
+
+    matches = [p for p in paths if _qdc_job._results_filename(p)]
+    if len(matches) > 1:
+        print(
+            f"error: job {job_id}: {len(matches)} files match "
+            f"{_qdc_job.RESULTS_MARKER} ({', '.join(sorted(matches))}) -- "
+            "refusing to guess which one is the verdict. A job whose report "
+            "cannot be identified unambiguously is a failure, never a pass.",
+            file=sys.stderr,
+        )
+        return 1
+    results_path = matches[0] if matches else None
     if results_path is None:
         print(
-            f"error: job {job_id}: results.xml was not among the fetched log "
-            "files -- a job with no results is a failure, never a pass",
+            f"error: job {job_id}: no {_qdc_job.RESULTS_MARKER} was among the "
+            "fetched log files -- a job with no results is a failure, never a "
+            "pass",
             file=sys.stderr,
         )
         return 1
@@ -737,14 +836,9 @@ def _cmd_test_qdc(args) -> int:
     if budget_rc != 0:
         return budget_rc
 
-    if args.timeout_min > _QDC_YES_THRESHOLD_MIN and not args.yes:
-        print(
-            f"error: --timeout-min {args.timeout_min} is above the "
-            f"{_QDC_YES_THRESHOLD_MIN}-minute confirmation threshold -- pass "
-            "--yes to submit anyway. This does not limit the job itself, "
-            "only submitting one this size without a human confirming it.",
-            file=sys.stderr,
-        )
+    confirm = _qdc_confirm_refusal(args.timeout_min, args.yes)
+    if confirm is not None:
+        print(f"error: {confirm}", file=sys.stderr)
         return 2
 
     return _qdc_submit(args)

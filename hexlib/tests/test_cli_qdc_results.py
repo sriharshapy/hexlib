@@ -36,15 +36,27 @@ CYCLES_LINE = "hexlib: --self-test: cycles_total=886"
 GOOD_LOG = f"{PASS_LINE}\n{CYCLES_LINE}\n"
 
 
-def _args(tmp_path, kernel="scale_fp16", timeout_min=5):
+def _args(tmp_path, kernel="scale_fp16", timeout_min=5, yes=None):
     """A REALISTIC Namespace, `kernel` included. It used to be built with no
     `kernel` attribute at all and `_qdc_submit` ran fine -- which was itself
     the evidence that `--device qdc` ignored the argument and would spend real
     minutes measuring scale_fp16 no matter which kernel was asked for.
     `_qdc_submit` now refuses an args object with no kernel on it, so leaving
-    it out here would fail loudly instead of passing silently."""
+    it out here would fail loudly instead of passing silently.
+
+    `yes` defaults to WHAT THIS TIMEOUT ACTUALLY REQUIRES, because
+    `_qdc_submit` now re-checks the confirmation threshold and the budget as
+    well as the kernel -- it is the function that spends the minutes, and it is
+    reachable without going through `_cmd_test_qdc`. Every test here means to
+    submit a legitimate job, so a `timeout_min` above the threshold implies
+    `--yes`; hard-coding `yes=False` for all of them made three tests assert on
+    a job the CLI would have refused at the front door. Pass `yes` explicitly
+    to test the guard itself.
+    """
+    if yes is None:
+        yes = timeout_min > cli._QDC_YES_THRESHOLD_MIN
     return argparse.Namespace(
-        out=str(tmp_path / "out"), timeout_min=timeout_min, yes=False, kernel=kernel
+        out=str(tmp_path / "out"), timeout_min=timeout_min, yes=yes, kernel=kernel
     )
 
 
@@ -72,25 +84,135 @@ def _stub_build_submit_and_wait(monkeypatch):
     monkeypatch.setattr(job, "wait", lambda job_id, **kw: True)
 
 
-def _fake_fetch(tmp_path, *, results_xml, extra_logs=None):
+def _write_log(log_dir, rel, text):
+    """One fetched file at `rel`, a QDC-style relative path with forward
+    slashes, mirrored beneath `log_dir` the way `job.fetch` mirrors it."""
+    p = os.path.join(log_dir, *rel.split("/"))
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(text)
+    return p
+
+
+def _fake_fetch(tmp_path, *, results_xml, extra_logs=None, decoy_results_xml=None):
     """Write fabricated fetched log files under out/qdc_logs and return the
     list of local paths -- the same shape `job.fetch`'s real return value
     has (job.py's own `fetch()` returns exactly this: local paths it wrote
-    from QDC's log files)."""
+    from QDC's log files).
+
+    THE REPORT GOES AT `TestLogs/results.xml`, NOT AT THE TOP LEVEL. It used
+    to be written flat, which quietly made every test here unable to see the
+    defect that `job.fetch` mirrors QDC's directory layout -- so two files
+    named results.xml can now exist, and the reader used to pick by basename.
+    `job.RESULTS_MARKER` is the real remote name and is used here rather than
+    respelled, so the fixture cannot drift away from what `wait()` looks for.
+
+    `decoy_results_xml` writes a SECOND results.xml at `logs/results.xml`,
+    which is the shape of the framework placeholder, and puts it FIRST in the
+    returned list -- QDC's listing order is not ours to choose.
+    """
     log_dir = os.path.join(str(tmp_path / "out"), "qdc_logs")
     os.makedirs(log_dir, exist_ok=True)
     paths = []
+    if decoy_results_xml is not None:
+        paths.append(_write_log(log_dir, "logs/results.xml", decoy_results_xml))
     if results_xml is not None:
-        p = os.path.join(log_dir, "results.xml")
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(results_xml)
-        paths.append(p)
+        paths.append(_write_log(log_dir, job.RESULTS_MARKER, results_xml))
     for name, text in (extra_logs or {}).items():
-        p = os.path.join(log_dir, name)
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(text)
-        paths.append(p)
+        paths.append(_write_log(log_dir, name, text))
     return paths
+
+
+def _boom_build(monkeypatch):
+    """Make the FIRST thing after the guards explode. `_qdc_submit`'s guards all
+    run before `build_device_binary`, so if a guard refuses we get its exit code
+    and if it does not we get this -- no test here can pass by accident because
+    something further down happened to fail."""
+
+    def boom(build_dir, sdk_root=None):
+        raise AssertionError(
+            "reached the device build: _qdc_submit accepted a job its own "
+            "guards should have refused"
+        )
+
+    monkeypatch.setattr(runtime_build, "build_device_binary", boom)
+
+
+def test_qdc_submit_refuses_an_over_budget_job_on_its_own(monkeypatch, tmp_path, capsys):
+    """THE MONEY GUARD, CHECKED WHERE THE MONEY IS SPENT.
+
+    `_qdc_submit` re-checked `_qdc_kernel_refusal` -- the cheapest of the
+    guards -- with an explicit rationale: it is the function that spends the
+    minutes and it is called directly, by tests today and any second caller
+    tomorrow. The budget comparison and the `--yes` threshold were left one
+    frame up in `_cmd_test_qdc`, so the rationale was written and then applied
+    to the one guard whose absence costs nothing.
+
+    This is the 80x overspend `_qdc_budget_guard`'s docstring says it exists to
+    prevent, reached past a guard that is present: a 240-minute job under a
+    3-minute recorded budget, submitted with `--yes` so the confirmation
+    threshold cannot be what stops it.
+    """
+    monkeypatch.setenv(cli._QDC_BUDGET_ENV, "3")
+    _boom_build(monkeypatch)
+    rc = cli._qdc_submit(_args(tmp_path, timeout_min=240, yes=True))
+    assert rc == 2
+    err = capsys.readouterr().err.lower()
+    assert "240" in err and "budget" in err
+
+
+def test_qdc_submit_refuses_above_the_confirmation_threshold_on_its_own(
+    monkeypatch, tmp_path, capsys
+):
+    """The other half, and the half that does not depend on the operator
+    having recorded a budget anywhere -- so it is the guard that must hold on
+    every path. Budget deliberately unset: nothing but the threshold can
+    refuse this."""
+    monkeypatch.delenv(cli._QDC_BUDGET_ENV, raising=False)
+    _boom_build(monkeypatch)
+    rc = cli._qdc_submit(_args(tmp_path, timeout_min=240, yes=False))
+    assert rc == 2
+    err = capsys.readouterr().err.lower()
+    assert "--yes" in err
+
+
+def test_qdc_submit_refuses_a_timeout_it_cannot_compare_to_a_budget(
+    monkeypatch, tmp_path, capsys
+):
+    """`_cmd_test_qdc` rejects `timeout_min=None` before `_qdc_submit` sees it.
+    A direct caller carries no such guarantee, and `None > budget` raises on
+    one path and passes on another -- neither may decide whether money is
+    spent, so it is refused."""
+    monkeypatch.setenv(cli._QDC_BUDGET_ENV, "60")
+    _boom_build(monkeypatch)
+    rc = cli._qdc_submit(_args(tmp_path, timeout_min=None, yes=True))
+    assert rc == 2
+    err = capsys.readouterr().err.lower()
+    assert "timeout-min" in err
+
+
+def test_qdc_submit_prints_the_budget_line_exactly_once_via_the_command(
+    monkeypatch, tmp_path, capsys
+):
+    """The reason the duplicated guards use the SILENT `_refusal` forms.
+
+    `_cmd_test_qdc` prints the recorded budget as a courtesy, then calls
+    `_qdc_submit`, which now repeats the comparison. Repeating
+    `_qdc_budget_guard` instead would print the figure twice on the normal
+    route and read as two different checks disagreeing about nothing. Money
+    guards are duplicated; the courtesy print is not.
+    """
+    monkeypatch.setenv(cli._QDC_BUDGET_ENV, "60")
+    _boom_build(monkeypatch)
+    # Reaching the build is the SUCCESS condition here: it means both frames'
+    # guards passed, which is the only situation in which the line could be
+    # printed twice.
+    with pytest.raises(AssertionError, match="reached the device build"):
+        cli._cmd_test_qdc(_args(tmp_path, timeout_min=5))
+    out = capsys.readouterr().out
+    assert out.count("remaining budget:") == 1, (
+        f"the budget line was printed {out.count('remaining budget:')} times"
+    )
 
 
 def test_a_good_run_with_measurements_present_exits_zero(monkeypatch, tmp_path):
@@ -175,6 +297,83 @@ def test_missing_results_xml_entirely_is_a_failure(monkeypatch, tmp_path, capsys
     assert rc != 0
     err = capsys.readouterr().err.lower()
     assert "results.xml" in err
+
+
+def test_a_clean_decoy_results_xml_cannot_mask_the_real_failing_report(
+    monkeypatch, tmp_path, capsys
+):
+    """THE BASENAME SELECTION, WITH BOTH FILES PRESENT AND THE DECOY FIRST.
+
+    `898089c` made `job.fetch` mirror QDC's directory layout precisely because
+    `TestLogs/results.xml` and `logs/results.xml` used to overwrite each other
+    on disk. From that commit onwards both exist -- and the verdict reader
+    still did `os.path.basename(p) == "results.xml"`, taking whichever QDC
+    listed first.
+
+    So: `logs/results.xml` is a framework placeholder reporting one passing
+    test, listed FIRST; `TestLogs/results.xml` is the real report with three
+    failures. The self-test log carries a genuine PASS line and a positive
+    `cycles_total=`, because `write_qdc_log` runs before the asserts do -- so
+    every other check in `_qdc_check_results` is satisfied and the ONLY thing
+    standing between this job and `exit 0` is which file gets parsed.
+
+    A failed device job reported as a pass is this project's own named
+    Critical, and this is it on the money path. Both a nonzero exit and the
+    reason are asserted: passing for the wrong reason would be worth nothing
+    here.
+    """
+    _stub_build_submit_and_wait(monkeypatch)
+    paths = _fake_fetch(
+        tmp_path,
+        results_xml='<testsuite tests="5" failures="3" errors="0" skipped="0"></testsuite>',
+        decoy_results_xml='<testsuite tests="1" failures="0" errors="0" skipped="0"/>',
+        extra_logs={"hexlib_selftest.log": GOOD_LOG},
+    )
+    # The decoy is first in QDC's listing order -- that ordering is the defect's
+    # trigger and is not ours to choose, so it is pinned rather than assumed.
+    assert paths[0].endswith(os.path.join("logs", "results.xml"))
+    monkeypatch.setattr(job, "fetch", lambda job_id, dest: paths)
+
+    rc = cli._qdc_submit(_args(tmp_path))
+    assert rc != 0, (
+        "a job whose real report has 3 failures exited 0 because a clean "
+        "placeholder results.xml was parsed instead"
+    )
+    err = capsys.readouterr().err.lower()
+    assert "results.xml" in err
+
+
+def test_two_matching_results_files_are_refused_rather_than_guessed_between(
+    monkeypatch, tmp_path, capsys
+):
+    """Ambiguity is a failure, even when BOTH candidates look clean.
+
+    The check above passes as soon as the reader stops preferring the decoy --
+    including if it simply preferred the other one. That is still a guess, and
+    the next layout change flips it back. So when two files match the marker,
+    the reader must refuse and say so, not parse either.
+
+    Both reports here are clean, so nothing except the ambiguity itself can
+    make this fail.
+    """
+    _stub_build_submit_and_wait(monkeypatch)
+    clean = '<testsuite tests="4" failures="0" errors="0" skipped="0"></testsuite>'
+    log_dir = os.path.join(str(tmp_path / "out"), "qdc_logs")
+    os.makedirs(log_dir, exist_ok=True)
+    paths = [
+        _write_log(log_dir, job.RESULTS_MARKER, clean),
+        _write_log(log_dir, "run2/" + job.RESULTS_MARKER, clean),
+        _write_log(log_dir, "hexlib_selftest.log", GOOD_LOG),
+    ]
+    monkeypatch.setattr(job, "fetch", lambda job_id, dest: paths)
+
+    rc = cli._qdc_submit(_args(tmp_path))
+    assert rc != 0, (
+        "two files matched the results marker and one of them was parsed "
+        "anyway -- a verdict read from a guess"
+    )
+    err = capsys.readouterr().err.lower()
+    assert "2 files match" in err or "refusing to guess" in err
 
 
 def test_a_clean_result_missing_the_measurement_lines_is_still_a_failure(
