@@ -61,7 +61,7 @@ from __future__ import annotations
 import os
 from typing import Sequence
 
-from hexlib.exec.runner import RunnerSpec, Scalar
+from hexlib.exec.runner import RunnerSpec, Scalar, WIRE_RAW
 from hexlib.runtime.wire import DTYPE_ID, LAYOUT_ID
 
 KIND_ID: dict[str, int] = {
@@ -85,6 +85,16 @@ KIND_ID: dict[str, int] = {
 # refused by `pack_batch` as an unknown dtype, and a KeyError here at generate
 # time. test_runtime_wire.py binds the three key sets so they cannot drift again.
 _CTYPE = {"fp16": "hexlib_hf", "fp32": "float", "int32": "int"}
+
+# BLOCK-QUANTIZED BUFFERS ARE HANDED OVER AS BYTES, deliberately. A q4_0 weight
+# is a stream of 18-byte blocks (an fp16 scale then 32 4-bit values) and there is
+# no C scalar type for one element of it -- so the entry does not invent one. The
+# kernel receives `const unsigned char *` and the block layout is its business,
+# which is also why `hexlib_dsp.h` enumerates `q4_0_repacked` as a LAYOUT: the
+# guard `_layout_check` emits is what stops an un-repacked weight being read as a
+# repacked one. Casting these to `hexlib_hf *` instead would compile fine and
+# read the fp16 scale bytes as data.
+_RAW_CTYPE = "unsigned char"
 
 # C types for values packed into the `a->params` blob, matching
 # `Scalar.ctype` / `RunnerSpec._STRUCT_CODE` ('i' -> int, 'f' -> float). Both
@@ -135,13 +145,23 @@ def _dtype_check(idx: int, dtype: str, role: str) -> str:
     fp32 buffer where the kernel wants fp16 is read (or written) at half
     stride, over half the tensor, and returns HEXLIB_DSP_OK.
     """
-    return (
-        _comment(
+    if dtype in WIRE_RAW:
+        detail = (
+            f"{role} buf[{idx}] is handed over as {_RAW_CTYPE} * -- a stream of "
+            f"block-quantized {dtype} data -- so the batch must have declared it "
+            f"{dtype} ({DTYPE_ID[dtype]} in hexlib.runtime.wire.DTYPE_ID). A "
+            f"dense buffer arriving here would be read as blocks: its values "
+            f"decoded as 4-bit fields against scales that are really data."
+        )
+    else:
+        detail = (
             f"{role} buf[{idx}] is cast to {_CTYPE[dtype]} *, so the batch must "
             f"have declared it {dtype} ({DTYPE_ID[dtype]} in "
             f"hexlib.runtime.wire.DTYPE_ID). Casting a wider or narrower dtype "
             f"would silently halve or double every stride."
         )
+    return (
+        _comment(detail)
         + f"\n    if (a->dtype[{idx}] != {DTYPE_ID[dtype]}u) "
         f"return HEXLIB_DSP_ERR_REQUIRES;"
     )
@@ -251,7 +271,8 @@ def emit_entry(name: str, spec: RunnerSpec) -> str:
 
     args: list[str] = []
     for i, in_dtype in enumerate(spec.inputs):
-        args.append(f"(const {_CTYPE[in_dtype]} *) a->buf[{i}]")
+        ctype = _RAW_CTYPE if in_dtype in WIRE_RAW else _CTYPE[in_dtype]
+        args.append(f"(const {ctype} *) a->buf[{i}]")
     args.append(f"({_CTYPE[spec.out_dtype]} *) a->buf[{out_idx}]")
 
     param_index = 0

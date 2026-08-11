@@ -40,6 +40,28 @@ WIRE_DTYPE: dict[str, np.dtype] = {
     "int32": np.dtype("<i4"),
 }
 
+# BLOCK-QUANTIZED STORAGE, which is not a numpy dtype and never will be.
+#
+# A q4_0 tensor is a stream of 18-byte blocks -- one fp16 scale then 32 4-bit
+# values, `llama.cpp`'s `block_q4_0` (see hexlib/graph/ir.py, which is the
+# authority on the byte count and enforces that the last dimension is a multiple
+# of 32). There is no numpy scalar dtype describing one element of that, so these
+# dtypes cannot go in WIRE_DTYPE and `__post_init__` used to refuse them outright:
+# "block-quantized inputs are staged as raw bytes and need their own path". This
+# is that path, and 75 of the encoder's 308 plan steps need it.
+#
+# A raw input is staged VERBATIM from a `RawTensor`. hexlib does not quantize
+# here; whatever produced the checkpoint did.
+#
+# ITS `ne` IS STILL THE LOGICAL ELEMENT SHAPE, not the byte shape, because
+# `hexlib_tensor` carries `nbytes` and `ne[]` as separate fields and `wire.py`
+# never asserts `nbytes == prod(ne) * itemsize` -- it only checks the buffer
+# actually holds `offset + nbytes`. So a (768, 768) q4_0 weight says ne=(768,768)
+# and nbytes=331776, both true. Writing the byte shape into `ne` would be a lie on
+# the wire, and every `dim:` scalar and every kernel reading `a->ne` would inherit
+# it.
+WIRE_RAW: frozenset[str] = frozenset({"q4_0"})
+
 _STRUCT_CODE = {"int": "i", "float": "f"}
 
 # THE LAYOUT NAMES ARE IMPORTED, NOT RESPELLED, unlike WIRE_DTYPE above. That
@@ -49,6 +71,79 @@ _STRUCT_CODE = {"int": "i", "float": "f"}
 # that left main.c emitting layout 0 while pack_batch could emit something else.
 # wire.py imports nothing but the stdlib, so this cannot cycle.
 from hexlib.runtime.wire import LAYOUT_ID as WIRE_LAYOUT  # noqa: E402
+
+
+@dataclass(frozen=True)
+class RawTensor:
+    """An already-quantized input: opaque bytes plus its LOGICAL element shape.
+
+    A separate type rather than a numpy array, for two reasons. `np.ndarray` does
+    not accept arbitrary attributes, so the logical shape cannot simply be
+    attached to a uint8 array -- and more importantly, a bare uint8 array would
+    make the dangerous mistake silent. Handing `payload` an fp32 weight array and
+    staging its bytes as though they were q4_0 blocks yields either a buffer of
+    the wrong size or, when the sizes happen to line up, a correctly-shaped
+    answer computed from noise; numpy never objects, because `.tobytes()` on any
+    array is always willing. Requiring a distinct type at the call site means the
+    caller has to have known what they were passing.
+
+    `shape` is the ELEMENT shape -- (768, 768) for a q4_0 weight, not the 331776
+    bytes it occupies. That is what goes in `ne` on the wire; `nbytes` carries the
+    byte count separately, and `wire.py` never conflates them.
+    """
+
+    dtype: str
+    shape: tuple[int, ...]
+    data: bytes
+
+    def __post_init__(self) -> None:
+        from hexlib.graph import ir
+
+        if self.dtype not in WIRE_RAW:
+            raise ValueError(
+                f"RawTensor is for block-quantized storage only; {self.dtype!r} "
+                f"is not in WIRE_RAW ({sorted(WIRE_RAW)})"
+            )
+        # ir.nbytes is the authority on q4_0's 18-bytes-per-32-elements block and
+        # already refuses a last dimension that is not a multiple of 32. Asking it
+        # here rather than recomputing means the two cannot disagree, and it is
+        # what makes a truncated or mis-shaped weight a construction-time error
+        # instead of a wrong answer.
+        want = ir.nbytes(tuple(self.shape), self.dtype)
+        if len(self.data) != want:
+            raise ValueError(
+                f"a {self.dtype} tensor of logical shape {tuple(self.shape)} is "
+                f"{want} bytes of blocks, but {len(self.data)} were given"
+            )
+
+    @property
+    def nbytes(self) -> int:
+        return len(self.data)
+
+    @property
+    def size(self) -> int:
+        """Element count, so `numel:` scalars read the LOGICAL count."""
+        n = 1
+        for d in self.shape:
+            n *= int(d)
+        return n
+
+
+def raw_bytes(kind: str, idx: int, dtype: str, value) -> bytes:
+    """The already-quantized bytes of one raw input, verbatim."""
+    if not isinstance(value, RawTensor):
+        raise ValueError(
+            f"{kind}: input {idx} is declared {dtype!r}, which is staged as raw "
+            f"quantized bytes, so it must be a RawTensor and not a "
+            f"{type(value).__name__}. hexlib does not quantize here -- pass the "
+            f"already-quantized bytes with their logical shape."
+        )
+    if value.dtype != dtype:
+        raise ValueError(
+            f"{kind}: input {idx} is declared {dtype!r} but the RawTensor says "
+            f"{value.dtype!r}"
+        )
+    return value.data
 
 
 @dataclass(frozen=True)
@@ -135,12 +230,24 @@ class RunnerSpec:
                 )
 
     def __post_init__(self) -> None:
-        for dtype in self.inputs + (self.out_dtype,):
-            if dtype not in WIRE_DTYPE:
+        for dtype in self.inputs:
+            if dtype not in WIRE_DTYPE and dtype not in WIRE_RAW:
                 raise ValueError(
-                    f"{self.kind}: {dtype!r} has no wire form; block-quantized "
-                    "inputs are staged as raw bytes and need their own path"
+                    f"{self.kind}: {dtype!r} is neither a dense wire dtype "
+                    f"({sorted(WIRE_DTYPE)}) nor a raw block-quantized one "
+                    f"({sorted(WIRE_RAW)})"
                 )
+        # THE OUTPUT MAY NOT BE RAW, and that is a real restriction rather than an
+        # oversight. `decode` reads the result back through `np.frombuffer` with a
+        # numpy dtype, and no kernel in this encoder writes a quantized result --
+        # the weights arrive quantized and everything computed is fp16. Allowing it
+        # would mean a `decode` that cannot decode.
+        if self.out_dtype not in WIRE_DTYPE:
+            raise ValueError(
+                f"{self.kind}: out_dtype {self.out_dtype!r} is not a dense wire "
+                f"dtype. A kernel may READ block-quantized bytes (see WIRE_RAW) "
+                f"but not write them: the result has to be decodable."
+            )
         for s in self.scalars:
             if s.ctype not in _STRUCT_CODE:
                 raise ValueError(f"{self.kind}: unknown scalar ctype {s.ctype!r}")
@@ -181,8 +288,11 @@ class RunnerSpec:
                 f"{self.kind} takes {len(self.inputs)} inputs, got {len(arrays)}"
             )
         out = bytearray()
-        for array, dtype in zip(arrays, self.inputs):
-            out += np.ascontiguousarray(array, dtype=WIRE_DTYPE[dtype]).tobytes()
+        for i, (array, dtype) in enumerate(zip(arrays, self.inputs)):
+            if dtype in WIRE_RAW:
+                out += raw_bytes(self.kind, i, dtype, array)
+            else:
+                out += np.ascontiguousarray(array, dtype=WIRE_DTYPE[dtype]).tobytes()
         return bytes(out)
 
     def encode(

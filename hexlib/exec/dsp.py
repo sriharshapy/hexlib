@@ -80,7 +80,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from hexlib import toolchain as tc
-from hexlib.exec.runner import RunnerSpec, SPECS, WIRE_DTYPE
+from hexlib.exec.runner import RawTensor, RunnerSpec, SPECS, WIRE_DTYPE, WIRE_RAW
 from hexlib.runtime import build as rb
 from hexlib.runtime import wire
 from hexlib.runtime.genentry import KIND_ID
@@ -372,10 +372,23 @@ class DspSimBackend:
                 "the op naming a tensor that was never packed"
             )
 
+        # A RAW input passes through untouched. `np.ascontiguousarray(rawtensor)`
+        # would build a 0-d object array and every downstream `.nbytes`/`.shape`
+        # would then describe a Python pointer rather than the weight. RawTensor
+        # carries `.shape`, `.nbytes` and `.size`, so everything below that reads
+        # those three works on either kind without knowing which it has.
         arrays = tuple(
-            np.ascontiguousarray(a, dtype=WIRE_DTYPE[dt])
+            a if dt in WIRE_RAW
+            else np.ascontiguousarray(a, dtype=WIRE_DTYPE[dt])
             for a, dt in zip(arrays, spec.inputs)
         )
+        for i, (a, dt) in enumerate(zip(arrays, spec.inputs)):
+            if dt in WIRE_RAW and not isinstance(a, RawTensor):
+                raise DspSimError(
+                    f"{kind} input {i} is declared {dt!r}, which is staged as "
+                    f"raw quantized bytes, so it must be a RawTensor and not a "
+                    f"{type(a).__name__} -- see hexlib/exec/runner.py's RawTensor"
+                )
         out_shape = _out_shape(spec, arrays, attrs)
         out_dtype = WIRE_DTYPE[spec.out_dtype]
         out_nbytes = int(np.prod(out_shape)) * out_dtype.itemsize if out_shape else out_dtype.itemsize
@@ -392,12 +405,18 @@ class DspSimBackend:
         tensors = []
         offset = 0
         for i, (a, dt) in enumerate(zip(arrays, spec.inputs)):
+            # `nbytes` is the BYTE count and `ne` is the ELEMENT shape, and for a
+            # q4_0 weight those are not related by an item size: (768, 768)
+            # elements occupy 331776 bytes of 18-byte blocks. `wire.py` checks
+            # only that the buffer holds `offset + nbytes`, never that
+            # `nbytes == prod(ne) * itemsize`, so both fields stay true and a
+            # kernel reading `a->ne` gets the shape it needs to index blocks with.
             nbytes = a.nbytes
             tensors.append(wire.TensorDesc(
                 bi=0, offset=offset, nbytes=nbytes, dtype=dt,
-                layout=buf_layouts[i], ne=_ne(a.shape),
+                layout=buf_layouts[i], ne=_ne(tuple(a.shape)),
             ))
-            payload += a.tobytes()
+            payload += a.data if dt in WIRE_RAW else a.tobytes()
             offset += nbytes
             aligned = _align_up(offset)
             if aligned != offset:
