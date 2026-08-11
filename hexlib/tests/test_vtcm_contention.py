@@ -106,6 +106,73 @@ def test_a_fully_contended_partition_is_refused_with_its_own_status():
     )
 
 
+# --------------------------------------------------------------------------
+# The simulator/device asymmetry, pinned so it stays a decision
+# --------------------------------------------------------------------------
+
+SIMHOST_C = "hexlib/runtime/simhost/simhost.c"
+SESSION_C = "hexlib/runtime/host/session.c"
+
+
+def _start_args(path, _fn=None):
+    """The argument list of the hexlib_iface_start CALL in `path`.
+
+    Whole-file, comment-blanked: the call sites are in different functions on
+    the two sides and the argument list contains a cast (`(uint64) MAX_BLOB`),
+    so this anchors on the `);` that ends the statement rather than on the
+    first close paren.
+    """
+    src = csource.code_only(_src(path))
+    m = re.search(r"hexlib_iface_start\s*\((.*?)\)\s*;", src, re.DOTALL)
+    assert m, f"{path} must call hexlib_iface_start"
+    return [a.strip() for a in m.group(1).split(",")]
+
+
+def test_the_simulator_requests_hmx_and_the_device_host_does_not():
+    """THE GATE EXERCISES A DIFFERENT ACQUISITION PATH THAN PRODUCTION.
+
+    `skel_vtcm.c` only calls `HAP_compute_res_attr_set_hmx_param` when
+    `ctx->n_hmx > 0`, and n_hmx is whatever start() was passed. simhost passes
+    1, the device host passes 0 -- so stage 1 acquires VTCM *with* an HMX
+    request and a device never has. That is a real difference in the one call
+    most likely to fail first on unfamiliar silicon, and it was pinned by
+    nothing.
+
+    This test does not judge which is right. It fails if either side changes
+    silently, so the asymmetry stays a recorded decision. The trigger to
+    revisit is the first HMX kernel, which is what skel_vtcm.c also says.
+    """
+    sim = _start_args(SIMHOST_C, "main")
+    assert len(sim) == 5, f"unexpected simhost start signature: {sim}"
+    assert sim[3] == "1", (
+        f"simhost passes n_hmx={sim[3]}; this test and skel.c's hwinfo comment "
+        "both record it as 1. If you changed it, the asymmetry note needs updating"
+    )
+
+    dev = _start_args(SESSION_C, "hexlib_open")
+    n_hmx = dev[3]
+    assert re.fullmatch(r"/\*\s*n_hmx\s*\*/\s*0|0", n_hmx), (
+        f"the device host passes n_hmx={n_hmx!r}; it was 0, meaning the device "
+        "never requests HMX. Changing this changes compute-res acquisition on "
+        "hardware that has never run this code -- see skel.c's hwinfo comment"
+    )
+
+
+def test_hwinfo_does_not_claim_the_echoed_fields_are_dsp_facts():
+    """The IDL said "what the DSP says about itself" for five fields when it is
+    true of one. A doc asserting a guarantee the code does not deliver counts
+    the same as a code defect here, because these files are the handoff record."""
+    idl = _src("hexlib/runtime/idl/hexlib_iface.idl")
+    assert "ONLY vtcm_size IS A DSP FACT" in idl, (
+        "the hwinfo block must state which outputs are queried and which are "
+        "compile-time constants or host echoes"
+    )
+    body = csource.function_body(_src(SKEL_C), "hexlib_iface_hwinfo")
+    assert re.search(r"\*n_threads\s*=\s*1\s*;", body), (
+        "n_threads is hardcoded; if that changed, the IDL note must change too"
+    )
+
+
 def test_start_does_not_flatten_the_vtcm_status_into_a_bare_failure():
     """`return AEE_EFAILED` threw away which of 14 statuses occurred."""
     body = csource.function_body(_src(SKEL_C), "hexlib_iface_start")

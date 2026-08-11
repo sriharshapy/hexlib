@@ -66,26 +66,47 @@ def test_size_comes_from_the_runtime_never_a_constant(src):
     """`STATE.md`: the part total is not the usable budget. VTCM is acquired at
     session start, so the size must come from the runtime.
 
-    THE OUT-PARAMETER, AND NOTHING ELSE, MAY SET `vtcm_size`. `"HAP_compute_
-    res_query_VTCM" in src` was satisfied by this file's own FARF error string,
-    and the literal bans below only covered 8 MiB -- so deleting the call and
-    writing `vtcm_size = 4*1024*1024` passed. The positive check now requires
-    the real call with `&vtcm_size` among its arguments, and the negative check
-    enumerates every assignment to the local and allows only the `= 0`
-    initializer: any other constant, of any magnitude or spelling, fails."""
+    THE OUT-PARAMETER, AND NOTHING ELSE, MAY SET THE REQUESTED SIZE.
+    `"HAP_compute_res_query_VTCM" in src` was satisfied by this file's own FARF
+    error string, and the literal bans below only covered 8 MiB -- so deleting
+    the call and writing `= 4*1024*1024` passed. The positive check now requires
+    the real call with that variable's address among its arguments, and the
+    negative check enumerates every assignment to it and allows only the `= 0`
+    initializer: any other constant, of any magnitude or spelling, fails.
+
+    NAME-AGNOSTIC, deliberately. This used to hardcode the local as `vtcm_size`,
+    and broke when the fix for the "absolute requirement" bug split it into
+    `vtcm_total` and `vtcm_avail` -- a rename that satisfies the requirement
+    fully. A test that fails on a rename it should not care about is
+    over-specified: it makes the test dictate code layout, which is the defect,
+    not the code. So the name is now DERIVED from the size actually handed to
+    `set_vtcm_param_v2`, and the requirement is unchanged and applies to
+    whatever that variable is called."""
     alloc = _function_body(src, "hexlib_vtcm_alloc")
-    assert re.search(r"HAP_compute_res_query_VTCM\s*\([^;]*&\s*vtcm_size", alloc), (
-        "hexlib_vtcm_alloc must ask the runtime for the size, passing "
-        "&vtcm_size as the out-parameter -- naming the function in a log "
-        "message is not asking it"
+
+    param = re.search(r"HAP_compute_res_attr_set_vtcm_param_v2\s*\(([^()]*)\)", alloc)
+    assert param, "hexlib_vtcm_alloc must set the v2 VTCM params"
+    requested = [a.strip() for a in param.group(1).split(",")][1]
+    assert re.fullmatch(r"[A-Za-z_]\w*", requested), (
+        f"the requested VTCM size must be a variable, not the expression "
+        f"{requested!r} -- a constant here is the bug this test exists for"
     )
-    # `(?<![\w>.])` so this sees the LOCAL `vtcm_size`, not `ctx->vtcm_size`.
-    for m in re.finditer(r"(?<![\w>.])vtcm_size\s*=\s*([^;=]+);", alloc):
+
+    assert re.search(
+        rf"HAP_compute_res_query_VTCM\s*\([^;]*&\s*{re.escape(requested)}\b", alloc
+    ), (
+        f"hexlib_vtcm_alloc must ask the runtime for `{requested}`, passing its "
+        f"address as an out-parameter -- naming the function in a log message is "
+        f"not asking it"
+    )
+
+    # `(?<![\w>.])` so this sees the LOCAL, not `ctx->...`.
+    for m in re.finditer(rf"(?<![\w>.]){re.escape(requested)}\s*=\s*([^;=]+);", alloc):
         rhs = m.group(1).strip()
         assert rhs == "0", (
-            f"vtcm_size must only ever be set by the runtime query's "
+            f"`{requested}` must only ever be set by the runtime query's "
             f"out-parameter (the `= 0` initializer aside); found "
-            f"`vtcm_size = {rhs};`"
+            f"`{requested} = {rhs};`"
         )
     # Belt: the 8 MiB part total, in both the decimal and hex forms the v75
     # spec and the address quote it in, must not appear anywhere in the code.

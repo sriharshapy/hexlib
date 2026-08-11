@@ -111,7 +111,25 @@ AEEResult hexlib_iface_hwinfo(remote_handle64 handle, uint32 *arch,
      * (not assumed) to expand to 75 when compiled -mv75 on the 19.0.04
      * toolchain -- see task-6-report.md for how. */
     *arch      = __HEXAGON_ARCH__;
+    /* HARDCODED, NOT QUERIED. There is no runtime thread count here; the skel
+     * runs single-threaded. Reported so the wire struct has the field, not
+     * because the DSP was asked. */
     *n_threads = 1;
+    /* ECHOES, AND CIRCULAR BY CONSTRUCTION. These are whatever the host passed
+     * to start(), returned unchanged. hexlib_open (session.c) passes 0 for both
+     * and then stores what comes back as ctx->n_hvx/n_hmx -- so the host reads
+     * back its own zero and records it as a DSP capability. The real values are
+     * on the DRIVER side: hexlib_caps already carries hvx_support_128b and
+     * hmx_support_depth from remote_dsp_capability.
+     *
+     * NOT "fixed" by forwarding the driver's values, deliberately: start()'s
+     * n_hmx is what decides whether hexlib_vtcm_alloc requests HMX from the
+     * compute-res manager, so changing what the host sends changes acquisition
+     * behaviour on hardware that has never run this code. The simulator already
+     * passes 1, 1 where the device host passes 0, 0, so the two take DIFFERENT
+     * branches there -- pinned by test_vtcm_contention.py so it stays a
+     * recorded decision instead of a surprise. Revisit when an HMX kernel
+     * lands, which is the same trigger skel_vtcm.c names. */
     *n_hvx     = ctx->n_hvx;
     *n_hmx     = ctx->n_hmx;
     /* The ACQUIRED size, never the part's total: vtcm_size test guards this. */
