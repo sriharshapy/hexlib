@@ -27,8 +27,16 @@
  */
 #include "hexlib_host.h"
 #include "hexlib_dsp.h"
+#include "hexlib_iface.h"   /* hexlib_iface_mmap/_munmap -- needed ONLY for
+                             * --unmapped's deliberately-skipped registration
+                             * call; see alloc_maybe_unmapped() below. Every
+                             * ordinary allocation still goes through
+                             * hexlib_alloc() (buffers.c), which already
+                             * pulls this header in the same way. */
 
 #include <remote.h>
+#include <rpcmem.h>         /* RPCMEM_HEAP_ID_SYSTEM / RPCMEM_DEFAULT_FLAGS,
+                             * for the same reason as above. */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,6 +55,16 @@
 #define SELF_TEST_N       4100      /* 64*64 + 4: exercises the scalar tail. */
 #define SELF_TEST_FACTOR  0.125f    /* A power of two: exact in fp16. */
 
+/* --coherency-check's two constants -- see run_coherency_check()'s own
+ * header comment for why each one is what it is. */
+#define COHERENCY_SENTINEL 1.0f     /* Any nonzero, finite fp16 value works;
+                                     * the expected result is bit-exact zero,
+                                     * so this can never be confused with it. */
+#define COHERENCY_FACTOR   0.0f     /* x * 0.0 is bit-exact zero in fp16 for
+                                     * any finite, non-NaN x -- no numerically
+                                     * ambiguous case, so a wrong result here
+                                     * cannot be blamed on kernel arithmetic. */
+
 enum {
     HEXLIB_EXIT_OK             = 0,
     HEXLIB_EXIT_USAGE          = 1,
@@ -54,12 +72,17 @@ enum {
     HEXLIB_EXIT_NO_RESPONSE    = 3,   /* absent / truncated / wrong-magic */
     HEXLIB_EXIT_OP_FAILED      = 4,
     HEXLIB_EXIT_MISMATCH       = 5,
+    HEXLIB_EXIT_COHERENCY_MISS = 6,   /* --coherency-check: status OK, op OK,
+                                       * but the sentinel survived -- either a
+                                       * dispatch bug or a real coherency miss;
+                                       * see run_coherency_check()'s printed
+                                       * cycles_total to tell which. */
 };
 
 static void usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s --caps\n"
-            "       %s --self-test\n"
+            "       %s --self-test [--unmapped | --coherency-check]\n"
             "       %s --batch <file> --in <file> --out <file>\n",
             argv0, argv0, argv0);
 }
@@ -119,7 +142,8 @@ static void print_caps(void) {
  * produce). So this function fills the real C structs and memcpy()s them
  * into the blob -- no hand-rolled byte packing, and nothing here can drift
  * from hexlib_dsp.h the way independently-maintained packing code could. */
-static uint8_t *build_scale_batch(int fd_x, int fd_y, size_t nbytes, size_t *out_len) {
+static uint8_t *build_scale_batch(int fd_x, int fd_y, size_t nbytes, float factor,
+                                  size_t *out_len) {
     size_t total = sizeof(struct hexlib_batch_hdr)
                  + 2 * sizeof(struct hexlib_buf_desc)
                  + 2 * sizeof(struct hexlib_tensor)
@@ -179,13 +203,14 @@ static uint8_t *build_scale_batch(int fd_x, int fd_y, size_t nbytes, size_t *out
     memset(&op, 0, sizeof(op));
     op.kind  = HEXLIB_KIND_SCALE;
     op.flags = 0;
-    /* `factor` is a float attr, so its wire slot carries the IEEE-754 bit
-     * pattern of 0.125f, not the integer 0 that `(int32_t) 0.125f` would
+    /* `factor` is a float attr, so its wire slot carries the caller's IEEE-754
+     * bit pattern (0.125f from run_self_test, 0.0f from
+     * run_coherency_check), not the integer 0 that `(int32_t) factor` would
      * silently produce -- genentry.py's generated entry reads it back as
      * `((const float *) a->params)[0]`, a raw reinterpretation, not a
      * numeric conversion. */
     union { float f; int32_t i; } factor_bits;
-    factor_bits.f = SELF_TEST_FACTOR;
+    factor_bits.f = factor;
     op.params[0] = factor_bits.i;
     for (int i = 1; i < HEXLIB_MAX_PARAMS; i++) {
         op.params[i] = 0;
@@ -204,7 +229,129 @@ static uint8_t *build_scale_batch(int fd_x, int fd_y, size_t nbytes, size_t *out
     return blob;
 }
 
-static int run_self_test(void) {
+/* ==========================================================================
+ * --unmapped -- THE LOAD-BEARING CHECK.
+ *
+ * On the simulator, host and DSP share one address space: `HAP_mmap` is
+ * `return (void*)(uintptr_t)fd;` and `rpcmem_to_fd` is
+ * `return (int)(uintptr_t)po;` there, so the whole pointer -> fd -> map ->
+ * base chain is an IDENTITY FUNCTION and the "mapped" address is always the
+ * real host pointer. No comparison of VALUES can tell a correct DSP
+ * implementation apart from one that simply read the host's own address --
+ * which would work perfectly on the simulator and fail instantly on real
+ * hardware. The ONLY thing that discriminates is a table lookup:
+ * `hexlib_bufs_map` (skel_bufs.c) consults a table that only
+ * `hexlib_bufs_register` populates, and that only happens in response to a
+ * genuine `hexlib_iface_mmap` call. So this mode allocates rpcmem and gets
+ * an fd exactly as `hexlib_alloc()` (buffers.c) does, but DELIBERATELY SKIPS
+ * the `hexlib_iface_mmap` registration call -- mirroring
+ * `hexlib/runtime/simhost/simhost.c`'s own `--unmapped`, which withholds the
+ * identical call for the identical reason (see that file's header comment).
+ * `hexlib_dispatch_batch` (skel_dispatch.c) must then refuse with
+ * `HEXLIB_DSP_ERR_UNMAPPED` (7) as the batch's TOP-LEVEL status -- no new
+ * print statement is needed for that refusal to be visible: run_self_test's
+ * own `status != HEXLIB_DSP_OK` branch already reports it and returns
+ * HEXLIB_EXIT_OP_FAILED (4).
+ *
+ * buffers.c is out of scope for this change (only this file may move) and
+ * `hexlib_alloc()` has no knob for skipping its registration call, so this
+ * is a small, local duplicate of its allocation sequence -- not an edit to
+ * it. The CPU-side rpcmem_alloc/rpcmem_to_fd/fastrpc_mmap sequence still
+ * runs in full ("the host allocates its rpcmem buffer and gets its fd as
+ * usual"); only the DSP-side registration is withheld.
+ * ========================================================================*/
+static int alloc_maybe_unmapped(hexlib_ctx *ctx, hexlib_buf **out, size_t size,
+                                int skip_dsp_register) {
+    *out = NULL;
+
+    void *ptr = hexlib_rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS,
+                                    (int) size);
+    if (ptr == NULL) {
+        fprintf(stderr, "hexlib: rpcmem_alloc(%zu bytes) failed\n", size);
+        return -1;
+    }
+
+    int fd = hexlib_rpcmem_to_fd(ptr);
+    if (fd < 0) {
+        fprintf(stderr, "hexlib: rpcmem_to_fd failed\n");
+        hexlib_rpcmem_free(ptr);
+        return -1;
+    }
+
+    int rc = hexlib_fastrpc_mmap(ctx->domain, fd, ptr, 0, size, FASTRPC_MAP_FD);
+    if (rc != 0) {
+        fprintf(stderr,
+                "hexlib: fastrpc_mmap(fd=%d, size=%zu) failed (rc %d)\n",
+                fd, size, rc);
+        hexlib_rpcmem_free(ptr);
+        return -1;
+    }
+
+    if (skip_dsp_register) {
+        /* DELIBERATELY NOT REGISTERED WITH THE SKEL. hexlib_bufs_map()'s
+         * table lookup (skel_bufs.c) has nothing to find for this fd, so a
+         * batch that references it must be refused with
+         * HEXLIB_DSP_ERR_UNMAPPED (7) -- never silently succeed by reading a
+         * host address, which is the one failure mode the simulator's
+         * identity-mapped HAP_mmap/rpcmem_to_fd cannot rule out. See the
+         * file header comment above this function. */
+        printf("hexlib: --unmapped: fd %d deliberately not registered with the skel\n", fd);
+    } else {
+        /* Registers the SAME fd with the DSP-side skel (hexlib_iface_mmap ->
+         * hexlib_bufs_register -> HAP_mmap in skel_bufs.c) -- the ordinary
+         * path, identical to hexlib_alloc()'s own second mapping call. */
+        int arc = hexlib_iface_mmap(ctx->handle, (uint32_t) fd, (uint32_t) size);
+        if (arc != AEE_SUCCESS) {
+            fprintf(stderr, "hexlib: hexlib_iface_mmap(fd=%d) failed (rc %d)\n", fd, arc);
+            hexlib_fastrpc_munmap(ctx->domain, fd, ptr, size);
+            hexlib_rpcmem_free(ptr);
+            return -1;
+        }
+    }
+
+    hexlib_buf *buf = (hexlib_buf *) calloc(1, sizeof(*buf));
+    if (buf == NULL) {
+        if (!skip_dsp_register) {
+            hexlib_iface_munmap(ctx->handle, (uint32_t) fd);
+        }
+        hexlib_fastrpc_munmap(ctx->domain, fd, ptr, size);
+        hexlib_rpcmem_free(ptr);
+        return -1;
+    }
+    buf->ptr  = ptr;
+    buf->fd   = fd;
+    buf->size = size;
+    *out = buf;
+    return 0;
+}
+
+/* Mirror of hexlib_free() (buffers.c), for a buffer allocated by
+ * alloc_maybe_unmapped() above. `was_unmapped` must match the
+ * `skip_dsp_register` the buffer was allocated with -- calling
+ * hexlib_iface_munmap() on an fd that was never registered would just be
+ * one more no-op RPC, but skipping this parameter entirely and always
+ * calling it would silently paper over a mismatch between allocation and
+ * teardown, which is exactly the kind of asymmetry this file's callers must
+ * get right by construction rather than by accident. */
+static void free_maybe_unmapped(hexlib_ctx *ctx, hexlib_buf *buf, int was_unmapped) {
+    if (buf == NULL) {
+        return;
+    }
+    if (!was_unmapped) {
+        hexlib_iface_munmap(ctx->handle, (uint32_t) buf->fd);
+    }
+    hexlib_fastrpc_munmap(ctx->domain, buf->fd, buf->ptr, buf->size);
+    hexlib_rpcmem_free(buf->ptr);
+    free(buf);
+}
+
+/* `unmapped`: when true, both self-test buffers are allocated via
+ * alloc_maybe_unmapped() with DSP-side registration withheld -- see that
+ * function's header comment. The rest of this function is otherwise
+ * unchanged; the DSP is expected to refuse with HEXLIB_DSP_ERR_UNMAPPED (7),
+ * which the existing `status != HEXLIB_DSP_OK` branch below already reports
+ * and turns into HEXLIB_EXIT_OP_FAILED (4). */
+static int run_self_test(int unmapped) {
     hexlib_ctx *ctx = NULL;
     if (hexlib_open(&ctx, CDSP_DOMAIN_ID) != 0) {
         fprintf(stderr, "hexlib: --self-test: could not open a CDSP session\n");
@@ -213,10 +360,20 @@ static int run_self_test(void) {
 
     size_t nbytes = (size_t) SELF_TEST_N * sizeof(__fp16);
     hexlib_buf *bx = NULL, *by = NULL;
-    if (hexlib_alloc(ctx, &bx, nbytes) != 0 || hexlib_alloc(ctx, &by, nbytes) != 0) {
+    int alloc_failed = unmapped
+        ? (alloc_maybe_unmapped(ctx, &bx, nbytes, 1) != 0 ||
+           alloc_maybe_unmapped(ctx, &by, nbytes, 1) != 0)
+        : (hexlib_alloc(ctx, &bx, nbytes) != 0 ||
+           hexlib_alloc(ctx, &by, nbytes) != 0);
+    if (alloc_failed) {
         fprintf(stderr, "hexlib: --self-test: buffer allocation failed\n");
-        hexlib_free(ctx, bx);
-        hexlib_free(ctx, by);
+        if (unmapped) {
+            free_maybe_unmapped(ctx, bx, 1);
+            free_maybe_unmapped(ctx, by, 1);
+        } else {
+            hexlib_free(ctx, bx);
+            hexlib_free(ctx, by);
+        }
         hexlib_close(ctx);
         return HEXLIB_EXIT_SESSION_FAILED;
     }
@@ -233,11 +390,16 @@ static int run_self_test(void) {
     }
 
     size_t batch_len = 0;
-    uint8_t *batch = build_scale_batch(bx->fd, by->fd, nbytes, &batch_len);
+    uint8_t *batch = build_scale_batch(bx->fd, by->fd, nbytes, SELF_TEST_FACTOR, &batch_len);
     if (batch == NULL) {
         fprintf(stderr, "hexlib: --self-test: out of memory building the batch\n");
-        hexlib_free(ctx, bx);
-        hexlib_free(ctx, by);
+        if (unmapped) {
+            free_maybe_unmapped(ctx, bx, 1);
+            free_maybe_unmapped(ctx, by, 1);
+        } else {
+            hexlib_free(ctx, bx);
+            hexlib_free(ctx, by);
+        }
         hexlib_close(ctx);
         return HEXLIB_EXIT_SESSION_FAILED;
     }
@@ -283,6 +445,175 @@ static int run_self_test(void) {
                 exit_code = HEXLIB_EXIT_MISMATCH;
             } else {
                 printf("hexlib: --self-test: PASS (%d values, bit-exact)\n", SELF_TEST_N);
+                /* The response header's own PCYCLE-measured total (see
+                 * skel_dispatch.c) -- the only DSP-measured cycle count this
+                 * binary can report at all, and the execution-proof signal
+                 * --coherency-check's discriminator depends on. Previously
+                 * validated by response_is_valid() above and read fresh here
+                 * rather than threaded through as an extra out-parameter. */
+                struct hexlib_batch_rsp_hdr full_hdr;
+                memcpy(&full_hdr, rsp, sizeof(full_hdr));
+                printf("hexlib: --self-test: cycles_total=%llu\n",
+                       (unsigned long long) full_hdr.cycles_total);
+            }
+        }
+    }
+
+    free(rsp);
+    free(batch);
+    if (unmapped) {
+        free_maybe_unmapped(ctx, bx, 1);
+        free_maybe_unmapped(ctx, by, 1);
+    } else {
+        hexlib_free(ctx, bx);
+        hexlib_free(ctx, by);
+    }
+    hexlib_close(ctx);
+    return exit_code;
+}
+
+/* ==========================================================================
+ * --coherency-check -- distinguishes a cache-coherency miss from a
+ * marshalling/dispatch bug. Design doc §6.1 (corrected 2026-08-11).
+ *
+ * WHY THIS EXISTS. `buffers.c` maps rpcmem with FASTRPC_MAP_FD, which
+ * <remote.h> documents as putting cache maintenance on US; `rpcmem`
+ * allocates CACHED memory by default; and there is no CPU-side flush or
+ * invalidate call anywhere in the SDK. So a DSP write that never becomes
+ * visible to the CPU is a real possibility on real hardware, and it
+ * presents EXACTLY like a marshalling bug: status OK, wrong bytes. This is
+ * the one place marshalling is exercised at all (see main.c's own file
+ * header), so the two failure modes would otherwise confound each other
+ * with no cheaper way to tell them apart.
+ *
+ * THE SENTINEL ALONE IS NOT ENOUGH -- READ THIS BEFORE CHANGING ANYTHING
+ * BELOW. An earlier version of this design pre-wrote a sentinel into the
+ * output buffer and ran scale_fp16 with factor=0.0 so the correct result is
+ * bit-exact zero, then just checked whether the sentinel survived. That
+ * FAILS TO DISCRIMINATE: if dispatch silently no-ops and still returns
+ * HEXLIB_DSP_OK -- a marshalling bug, not a coherency one -- the observable
+ * is IDENTICAL to a coherency miss (status OK, sentinel intact). What
+ * actually separates the two is an execution-proof signal: `cycles_total`,
+ * the DSP's own PCYCLE-measured total around the kernel call
+ * (skel_dispatch.c), which is exactly zero unless the kernel genuinely ran.
+ *
+ *     cycles 0,  sentinel intact      -> the kernel never ran: a dispatch bug
+ *     cycles >0, sentinel intact      -> it ran; the write never reached the
+ *                                        host: COHERENCY
+ *     cycles >0, sentinel overwritten -> both fine, for THIS direction
+ *
+ * This function prints BOTH the cycles_total line and the COHERENCY
+ * verdict line unconditionally (once the batch status and op status are
+ * both confirmed OK), so all three rows of that table are distinguishable
+ * from stdout alone -- never just "the bad thing is absent" (see this
+ * file's project-wide discipline on that, stated in the header above main()).
+ *
+ * WHAT THIS DOES NOT PROVE -- DO NOT READ MORE INTO A PASS THAN THIS.
+ * This exercises only the DSP-write -> host-read direction (the DSP writes
+ * `y`, the CPU reads it back afterwards). A host-write -> DSP-read miss (the
+ * CPU writes `x`, the DSP reads something stale from ITS cache) is a
+ * different direction through the same cache hierarchy and is NOT covered
+ * here at all. Nor is this kernel-independent: it says something about
+ * scale_fp16's one write pattern and this one buffer size, not about every
+ * kernel or every buffer size hexlib might ever dispatch.
+ * ========================================================================*/
+static int run_coherency_check(void) {
+    hexlib_ctx *ctx = NULL;
+    if (hexlib_open(&ctx, CDSP_DOMAIN_ID) != 0) {
+        fprintf(stderr, "hexlib: --coherency-check: could not open a CDSP session\n");
+        return HEXLIB_EXIT_SESSION_FAILED;
+    }
+
+    size_t nbytes = (size_t) SELF_TEST_N * sizeof(__fp16);
+    hexlib_buf *bx = NULL, *by = NULL;
+    if (hexlib_alloc(ctx, &bx, nbytes) != 0 || hexlib_alloc(ctx, &by, nbytes) != 0) {
+        fprintf(stderr, "hexlib: --coherency-check: buffer allocation failed\n");
+        hexlib_free(ctx, bx);
+        hexlib_free(ctx, by);
+        hexlib_close(ctx);
+        return HEXLIB_EXIT_SESSION_FAILED;
+    }
+
+    /* `x` need not be anything special -- factor=0.0 makes the correct
+     * result bit-exact zero regardless of its contents, for any finite,
+     * non-NaN input. Reused shape from run_self_test purely for a
+     * reasonable non-degenerate input. */
+    __fp16 *x = (__fp16 *) bx->ptr;
+    for (int i = 0; i < SELF_TEST_N; i++) {
+        x[i] = (__fp16) ((float) ((i % 17) - 8) * 0.5f);
+    }
+
+    /* THE SENTINEL. Written into the OUTPUT buffer, before invoke, so that
+     * only the DSP's own write to `y` -- or the CPU's failure to observe it
+     * -- can change what this side reads back. */
+    __fp16 *y = (__fp16 *) by->ptr;
+    for (int i = 0; i < SELF_TEST_N; i++) {
+        y[i] = (__fp16) COHERENCY_SENTINEL;
+    }
+
+    size_t batch_len = 0;
+    uint8_t *batch = build_scale_batch(bx->fd, by->fd, nbytes, COHERENCY_FACTOR, &batch_len);
+    if (batch == NULL) {
+        fprintf(stderr, "hexlib: --coherency-check: out of memory building the batch\n");
+        hexlib_free(ctx, bx);
+        hexlib_free(ctx, by);
+        hexlib_close(ctx);
+        return HEXLIB_EXIT_SESSION_FAILED;
+    }
+
+    size_t rsp_cap = sizeof(struct hexlib_batch_rsp_hdr) + sizeof(struct hexlib_op_result);
+    uint8_t *rsp = (uint8_t *) calloc(1, rsp_cap);
+    size_t rsp_len = 0;
+    int rc = hexlib_invoke(ctx, batch, batch_len, rsp, rsp_cap, &rsp_len);
+
+    uint32_t status = 0;
+    int exit_code = HEXLIB_EXIT_OK;
+    if (rc != 0 || !response_is_valid(rsp, rsp_len, &status)) {
+        fprintf(stderr,
+                "hexlib: --coherency-check: no valid response from the DSP (rc=%d) "
+                "-- absence of a response is a failure, never a pass\n", rc);
+        exit_code = HEXLIB_EXIT_NO_RESPONSE;
+    } else if (status != HEXLIB_DSP_OK) {
+        fprintf(stderr, "hexlib: --coherency-check: batch status %u, not HEXLIB_DSP_OK\n",
+                status);
+        exit_code = HEXLIB_EXIT_OP_FAILED;
+    } else {
+        const struct hexlib_op_result *result =
+            (const struct hexlib_op_result *) (rsp + sizeof(struct hexlib_batch_rsp_hdr));
+        if (rsp_len < sizeof(struct hexlib_batch_rsp_hdr) + sizeof(*result) ||
+            result->status != HEXLIB_DSP_OK) {
+            fprintf(stderr, "hexlib: --coherency-check: op result missing or not OK\n");
+            exit_code = HEXLIB_EXIT_OP_FAILED;
+        } else {
+            /* STATUS OK, PROVEN: marshalling and dispatch both genuinely
+             * succeeded (both the batch-level status and this op's own
+             * status say so). Only now is reading the sentinel back
+             * meaningful at all -- see this function's own header comment. */
+            struct hexlib_batch_rsp_hdr full_hdr;
+            memcpy(&full_hdr, rsp, sizeof(full_hdr));
+
+            const __fp16 *yr = (const __fp16 *) by->ptr;
+            __fp16 zero = (__fp16) 0.0f;
+            int overwritten = 1;
+            for (int i = 0; i < SELF_TEST_N; i++) {
+                if (memcmp(&yr[i], &zero, sizeof(__fp16)) != 0) {
+                    overwritten = 0;
+                    break;
+                }
+            }
+
+            /* Both lines, always -- see the file header on why cycles_total
+             * must be printed unconditionally rather than only on failure:
+             * it is what tells a genuine coherency miss apart from a
+             * dispatch bug, and a test reading only the COHERENCY line could
+             * not make that distinction on its own. */
+            printf("hexlib: --coherency-check: cycles_total=%llu\n",
+                   (unsigned long long) full_hdr.cycles_total);
+            if (overwritten) {
+                printf("COHERENCY sentinel_overwritten\n");
+            } else {
+                printf("COHERENCY sentinel_unchanged\n");
+                exit_code = HEXLIB_EXIT_COHERENCY_MISS;
             }
         }
     }
@@ -473,7 +804,25 @@ int main(int argc, char **argv) {
         return HEXLIB_EXIT_OK;
     }
     if (argc >= 2 && strcmp(argv[1], "--self-test") == 0) {
-        return run_self_test();
+        /* Two independent modifiers, either optional, checked past argv[1]:
+         * `--unmapped` (run_self_test's own unmapped-buffer path) and
+         * `--coherency-check` (a distinct function, since it needs a
+         * pre-written sentinel and a different scale factor). If both are
+         * given, --coherency-check wins and --unmapped is ignored -- that
+         * combination is not part of this project's on-device test plan and
+         * is left unspecified rather than given a third code path. */
+        int unmapped = 0, coherency = 0;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--unmapped") == 0) {
+                unmapped = 1;
+            } else if (strcmp(argv[i], "--coherency-check") == 0) {
+                coherency = 1;
+            }
+        }
+        if (coherency) {
+            return run_coherency_check();
+        }
+        return run_self_test(unmapped);
     }
     if (argc >= 2 && strcmp(argv[1], "--batch") == 0) {
         const char *batch_path = NULL, *in_path = NULL, *out_path = NULL;

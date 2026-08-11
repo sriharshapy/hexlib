@@ -281,3 +281,184 @@ def test_absence_of_a_response_is_a_failure(main):
         "the output file must never be opened before the response is "
         "confirmed valid"
     )
+
+
+# ==============================================================================
+# --unmapped, --self-test's printed cycles_total, and --coherency-check.
+#
+# NONE of these three can be exercised by actually running hexlib_run (no
+# device here) -- see test_runtime_device_build.py's own "NEITHER ARTIFACT IS
+# EVER RUN HERE" note. So, like every other test in this file, these check
+# SOURCE STRUCTURE: real call order, real branches, real string literals --
+# never merely "the flag's name appears somewhere in the file", which a stale
+# comment or a dead branch would also satisfy.
+# ==============================================================================
+
+
+def test_unmapped_alloc_skips_only_the_dsp_registration_call(main):
+    """alloc_maybe_unmapped() must still run the ordinary CPU-side
+    rpcmem_alloc -> rpcmem_to_fd -> fastrpc_mmap sequence in full ("the host
+    allocates its rpcmem buffer and gets its fd as usual") -- only the
+    DSP-side hexlib_iface_mmap() registration (hexlib_bufs_register's table,
+    skel_bufs.c) is withheld when skip_dsp_register is true. Scoped to the
+    function itself and to each branch of its own if/else, not merely
+    "hexlib_iface_mmap is absent somewhere in the file", which the sibling
+    branch satisfying it would also make trivially true."""
+    body = _function_body(main, "alloc_maybe_unmapped")
+    i_alloc = body.index("hexlib_rpcmem_alloc(")
+    i_fd = body.index("hexlib_rpcmem_to_fd(")
+    i_map = body.index("hexlib_fastrpc_mmap(")
+    assert i_alloc < i_fd < i_map, (
+        "the CPU-side allocation sequence must run in the same order "
+        "hexlib_alloc() (buffers.c) uses, unconditionally"
+    )
+
+    skip_if = re.search(r"if\s*\(\s*skip_dsp_register\s*\)", body)
+    assert skip_if, "alloc_maybe_unmapped must branch on skip_dsp_register"
+    skip_block = _block_from(body, skip_if.end())
+    assert "hexlib_iface_mmap(" not in skip_block, (
+        "the skip_dsp_register branch must NOT call hexlib_iface_mmap -- "
+        "withholding exactly that call is the whole point of --unmapped"
+    )
+
+    else_pos = body.index("else", skip_if.end())
+    else_block = _block_from(body, else_pos)
+    assert "hexlib_iface_mmap(" in else_block, (
+        "the ordinary (mapped) branch must still register the fd with the "
+        "skel, exactly like hexlib_alloc() does"
+    )
+
+
+def test_run_self_test_unmapped_path_uses_the_unmapped_allocator(main):
+    """run_self_test(unmapped): when the flag is set, BOTH self-test buffers
+    must go through alloc_maybe_unmapped(..., 1)/free_maybe_unmapped(..., 1)
+    -- not the ordinary hexlib_alloc()/hexlib_free() -- so the DSP's
+    hexlib_bufs_map() table lookup (skel_bufs.c) genuinely has nothing to
+    find for either fd."""
+    body = _function_body(main, "run_self_test")
+    assert "alloc_maybe_unmapped(ctx, &bx, nbytes, 1)" in body
+    assert "alloc_maybe_unmapped(ctx, &by, nbytes, 1)" in body
+    assert "free_maybe_unmapped(ctx, bx, 1)" in body
+    assert "free_maybe_unmapped(ctx, by, 1)" in body
+
+
+def test_self_test_prints_cycles_total_after_the_existing_pass_line(main):
+    """The response header's cycles_total (skel_dispatch.c's PCYCLE bracket
+    around the kernel call) must be printed AFTER, never instead of, the
+    existing 'PASS (%d values, bit-exact)' line -- so the exact success
+    string test_on_device.py's `test_scale_fp16_runs_on_the_dsp_and_is_
+    correct` already asserts on stays byte-for-byte intact, and the new
+    cycles line is strictly additive."""
+    body = _function_body(main, "run_self_test")
+    pass_idx = body.index("PASS (%d values, bit-exact)")
+    cycles_idx = body.index("cycles_total=%llu", pass_idx)
+    assert pass_idx < cycles_idx
+    assert "full_hdr.cycles_total" in body
+
+
+def test_self_test_flag_parsing_routes_unmapped_and_coherency_correctly(main):
+    """main()'s --self-test branch must recognize both --unmapped and
+    --coherency-check past argv[1], route --coherency-check to
+    run_coherency_check(), and thread the --unmapped flag straight into
+    run_self_test(unmapped) -- not merely mention both flag strings
+    somewhere in the function, which a comment or an unreachable branch
+    would also satisfy."""
+    body = _function_body(main, "main")
+    self_test_pos = body.index('"--self-test"')
+    self_test_block = _block_from(body, self_test_pos)
+
+    assert '"--unmapped"' in self_test_block
+    assert '"--coherency-check"' in self_test_block
+    assert re.search(r"run_coherency_check\s*\(\s*\)", self_test_block)
+    assert re.search(r"run_self_test\s*\(\s*unmapped\s*\)", self_test_block)
+
+    coherency_if = re.search(r"if\s*\(\s*coherency\s*\)", self_test_block)
+    assert coherency_if, "--coherency-check must be checked as its own branch"
+    coherency_block = _block_from(self_test_block, coherency_if.end())
+    assert re.search(r"run_coherency_check\s*\(\s*\)", coherency_block), (
+        "the coherency branch must actually call run_coherency_check(), not "
+        "merely check the flag and fall through"
+    )
+
+
+def test_usage_mentions_the_new_self_test_modifiers(main):
+    body = _function_body(main, "usage")
+    assert "--unmapped" in body
+    assert "--coherency-check" in body
+
+
+def test_build_scale_batch_factor_is_call_site_specific(main):
+    """run_self_test must build its batch with SELF_TEST_FACTOR (0.125f, a
+    power of two, exact in fp16) and run_coherency_check must use
+    COHERENCY_FACTOR (0.0f) -- never the other's constant, since a nonzero
+    factor in the coherency check would let a wrong result be blamed on
+    kernel arithmetic instead of ruling that out entirely."""
+    self_test_body = _function_body(main, "run_self_test")
+    coherency_body = _function_body(main, "run_coherency_check")
+    assert re.search(r"build_scale_batch\([^)]*SELF_TEST_FACTOR", self_test_body)
+    assert re.search(r"build_scale_batch\([^)]*COHERENCY_FACTOR", coherency_body)
+    assert "SELF_TEST_FACTOR" not in coherency_body, (
+        "the coherency check must never fall back to the self-test's own "
+        "nonzero factor"
+    )
+
+
+def test_coherency_check_writes_the_sentinel_before_invoking(main):
+    """The sentinel must be written into the OUTPUT buffer strictly before
+    hexlib_invoke() -- writing it afterwards would prove nothing about
+    whether the DSP's own write reached the host."""
+    body = _function_body(main, "run_coherency_check")
+    sentinel_idx = body.index("COHERENCY_SENTINEL")
+    invoke_idx = body.index("hexlib_invoke(")
+    assert sentinel_idx < invoke_idx
+
+
+def test_coherency_check_reads_the_sentinel_only_after_both_statuses_are_ok(main):
+    """The sentinel read-back (and both printed verdict lines) must live
+    strictly inside the branch reached only once the batch-level status AND
+    the op's own result status are both confirmed HEXLIB_DSP_OK -- reading it
+    any earlier would make a marshalling failure indistinguishable from a
+    coherency one, exactly the confusion this check exists to resolve."""
+    body = _function_body(main, "run_coherency_check")
+    op_ok_check = re.search(r"result->status\s*!=\s*HEXLIB_DSP_OK", body)
+    assert op_ok_check, "must check the op's own status, not merely the batch-level one"
+    else_pos = body.index("else", op_ok_check.end())
+    success_block = _block_from(body, else_pos)
+
+    assert "memcmp(&yr[i]" in success_block, (
+        "the sentinel must only be read back once both statuses are "
+        "confirmed OK"
+    )
+    cycles_idx = success_block.index("cycles_total=%llu")
+    overwritten_idx = success_block.index('"COHERENCY sentinel_overwritten\\n"')
+    unchanged_idx = success_block.index('"COHERENCY sentinel_unchanged\\n"')
+    assert cycles_idx < overwritten_idx
+    assert cycles_idx < unchanged_idx, (
+        "cycles_total must be printed before either COHERENCY verdict line "
+        "-- it is the signal that tells a dispatch bug (0 cycles) apart from "
+        "a genuine coherency miss (>0 cycles), and both must be visible "
+        "together regardless of which branch runs"
+    )
+
+
+def test_coherency_miss_has_its_own_distinct_exit_code(main):
+    """A coherency miss (or a dispatch bug -- see the function's own header
+    comment on why cycles_total, not this exit code, is what tells the two
+    apart) must exit with something other than 0-5, which are all already
+    claimed by other outcomes."""
+    assert re.search(r"HEXLIB_EXIT_COHERENCY_MISS\s*=\s*6", main)
+    body = _function_body(main, "run_coherency_check")
+    assert "exit_code = HEXLIB_EXIT_COHERENCY_MISS;" in body
+
+
+def test_coherency_check_documents_its_own_scope_limits(main):
+    """Design doc §6.1 (corrected 2026-08-11): the table that makes
+    cycles_total load-bearing covers ONLY the DSP-write -> host-read
+    direction, for scale_fp16's own write pattern -- not the reverse
+    direction, and not every kernel. That caveat must live in this file's
+    own comments, not only in the on-device test's docstring, or a future
+    reader of just this file could believe a pass here is a general
+    coherency proof."""
+    assert "DSP-write" in main and "host-read" in main
+    assert "host-write" in main and "DSP-read" in main
+    assert "kernel-independent" in main.lower()
