@@ -292,21 +292,36 @@ def _patch_hdr_word(blob: bytes, index: int, value: int) -> bytes:
 
 
 @sdk
-def test_an_out_of_range_off_bufs_is_refused_by_the_dsp_not_by_a_host_crash(backend):
-    """off_bufs=0xFFFFFF00 with n_bufs=1 -- a ~4 GiB out-of-range write.
+def test_an_out_of_range_off_bufs_is_recognised_by_the_host_and_left_unpatched(
+    backend,
+):
+    """off_bufs=0xFFFFFF00 with n_bufs=1, and THE STATUS ALONE DOES NOT PIN IT.
 
-    The point is WHICH LAYER SAYS NO. Getting a status back at all means the
-    host survived long enough to invoke, and `ERR_TRUNCATED` is the skel's own
-    section-bounds check (`off_bufs + n_bufs * sizeof(buf_desc) > len`, widened
-    to 64-bit so a large n_bufs cannot wrap it). Before the bound in simhost.c
-    this was `memcpy(g_batch + 0xFFFFFF00, &b, 24)` and the run died with an
-    opaque simulator failure instead.
+    That was this test's first form and removing the bound left it green, which
+    is the only reason the real behaviour here is written down. `size_t` is 32
+    bits on this target, so `g_batch + 0xFFFFFF00` is `g_batch - 256`: the
+    unbounded loop did not fault at all, it wrote 24 bytes into whatever static
+    lives before `g_batch` and then invoked normally, and the skel returned the
+    same ERR_TRUNCATED it returns now. Silent corruption of a neighbouring
+    object, reported as a clean refusal -- worse than the crash the finding
+    described, and invisible to any assertion on the response.
+
+    So this pins the HOST's own recognition, printed by simhost.c, which is the
+    thing that actually differs between patched and unpatched. The skel's
+    verdict is asserted too: an unpatched batch must still be SENT, because
+    refusing to send it here would substitute the host's judgement for the
+    DSP's, and `run_raw` exists to observe the DSP's.
     """
     blob = backend.build_batch("scale", N, FACTOR)
-    res = backend.run_raw(_patch_hdr_word(blob, _HDR_I_OFF_BUFS, 0xFFFFFF00))
+    res, out = backend.run_raw_verbose(_patch_hdr_word(blob, _HDR_I_OFF_BUFS, 0xFFFFFF00))
+    assert "bufs_out_of_range_not_patched" in out, (
+        "simhost patched (or silently wrapped past) a buffer table that does "
+        "not lie inside the blob; the loop is unbounded again. stdout:\n"
+        + out[-2000:]
+    )
     assert res.status == dspmod.wire.STATUS["ERR_TRUNCATED"], (
-        f"expected the skel's own TRUNCATED refusal, got "
-        f"{dspmod.wire.STATUS_NAME.get(res.status, res.status)}"
+        f"the unpatched batch must still reach the skel and be refused BY the "
+        f"skel; got {dspmod.wire.STATUS_NAME.get(res.status, res.status)}"
     )
 
 
@@ -320,7 +335,11 @@ def test_an_enormous_n_bufs_is_refused_by_the_dsp_not_by_a_host_crash(backend):
     g_rsp and the skel's own static bufs[]/tens[] on the way there.
     """
     blob = backend.build_batch("scale", N, FACTOR)
-    res = backend.run_raw(_patch_hdr_word(blob, _HDR_I_N_BUFS, 0x01000000))
+    res, out = backend.run_raw_verbose(_patch_hdr_word(blob, _HDR_I_N_BUFS, 0x01000000))
+    assert "bufs_out_of_range_not_patched" in out, (
+        "simhost tried to patch 16.7M buffer descriptors out of a 64 KiB "
+        "array. stdout:\n" + out[-2000:]
+    )
     assert res.status in (
         dspmod.wire.STATUS["ERR_INVAL_PARAMS"],
         dspmod.wire.STATUS["ERR_TRUNCATED"],

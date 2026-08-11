@@ -506,9 +506,29 @@ class DspSimBackend:
         `wire.pack_batch`'s own host-side checks entirely -- so a bad magic, a
         truncated blob or an unknown op kind exercises the DSP's OWN
         validation in `hexlib_dispatch_batch`, not the Python serializer's."""
+        return self.run_raw_verbose(blob)[0]
+
+    def run_raw_verbose(self, blob: bytes) -> tuple[wire.BatchResponse, str]:
+        """`run_raw`, plus the simulator's own stdout.
+
+        THE RESPONSE ALONE CANNOT DISTINGUISH SOME MALFORMED BLOBS from the
+        host mishandling them, which is why this exists. simhost.c patches the
+        real fd into the buffer table before invoking, and refuses to patch a
+        table that does not lie inside the blob (see its comment). With
+        `off_bufs = 0xFFFFFF00` and a 32-bit `size_t`, the unbounded loop
+        computed `g_batch - 256`, corrupted whatever static preceded it, and
+        invoked anyway -- and the skel returned the SAME ERR_TRUNCATED it
+        returns when the table is correctly left alone. A test asserting only
+        on `status` was green either way.
+
+        The host's own `SIMHOST note=...` line is the only place that
+        difference is observable, so a caller that needs to tell the two apart
+        reads it here rather than inferring it from a status that does not
+        carry it.
+        """
         self._write_call(blob, b"")
-        run_sim(self.work_dir, sdk_root=self.sdk_root)
-        return self._read_response()
+        sim = run_sim(self.work_dir, sdk_root=self.sdk_root)
+        return self._read_response(), sim.stdout
 
     def build_batch(self, kind: str, n: int, factor: float,
                     kind_override: int | None = None) -> bytes:
