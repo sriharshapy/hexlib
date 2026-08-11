@@ -45,6 +45,45 @@ def test_stage_refuses_a_missing_binary(tmp_path):
         artifact.stage([str(tmp_path / "nope")], None, str(tmp_path / "job"))
 
 
+# --- 0-byte inputs -------------------------------------------------------
+#
+# `stage` checked existence only, and was VERIFIED to accept four 0-byte files
+# and produce a perfectly submittable zip. A link or copy that fails part way
+# leaves exactly that: a `libhexlib_skel.so` of length zero, present, correctly
+# named, and completely unrunnable -- discovered on the device as a dlopen
+# failure with no obvious cause, after the minutes are spent.
+
+
+def test_stage_refuses_a_zero_byte_binary(tmp_path):
+    (tmp_path / "hexlib_run").write_bytes(b"\x7fELF fake")
+    (tmp_path / "libhexlib_skel.so").write_bytes(b"")        # a truncated link
+    with pytest.raises(artifact.StagingError, match="0 bytes"):
+        artifact.stage(
+            [str(tmp_path / "hexlib_run"), str(tmp_path / "libhexlib_skel.so")],
+            None, str(tmp_path / "job"),
+        )
+
+
+def test_stage_refuses_a_zero_byte_test_script(tmp_path):
+    (tmp_path / "hexlib_run").write_bytes(b"\x7fELF fake")
+    (tmp_path / "test_on_device.py").write_text("")
+    with pytest.raises(artifact.StagingError, match="0 bytes"):
+        artifact.stage(
+            [str(tmp_path / "hexlib_run")],
+            str(tmp_path / "test_on_device.py"), str(tmp_path / "job"),
+        )
+
+
+def test_stage_produces_no_zip_at_all_when_an_input_is_empty(tmp_path):
+    """The refusal must happen BEFORE anything submittable exists on disk --
+    a zip left behind by a failed staging run is a zip somebody can submit."""
+    (tmp_path / "hexlib_run").write_bytes(b"")
+    out_base = tmp_path / "job"
+    with pytest.raises(artifact.StagingError):
+        artifact.stage([str(tmp_path / "hexlib_run")], None, str(out_base))
+    assert not (tmp_path / "job.zip").exists()
+
+
 def test_submission_requires_an_explicit_timeout(tmp_path):
     z = tmp_path / "a.zip"
     z.write_bytes(b"PK")
@@ -125,6 +164,149 @@ def test_a_job_with_no_results_xml_is_not_complete(monkeypatch):
                         lambda c, j: [F()], raising=False)
     monkeypatch.setattr(job, "POLL_S", 0)
     assert job.wait(1234, cap_s=0) is False
+
+
+# --- wait() is a completion detector, NOT a verdict ----------------------
+#
+# `_has_results` was `RESULTS_MARKER in filename`, a bare substring test, so
+# `TestLogs/results.xml.part` -- the half-written intermediate whose appearance
+# is the one thing a completion detector must not fire on -- counted as
+# "finished". And even a genuine match proves only that a NAME appeared:
+# `wait()` never opens the file, so a zero-byte results.xml satisfies it. That
+# is why the real check lives in `hexlib/cli.py::_qdc_check_results`, and why
+# job.py's docstrings now say so instead of claiming wait() makes a false pass
+# impossible.
+
+
+@pytest.mark.parametrize("name", [
+    "TestLogs/results.xml.part",
+    "TestLogs/results.xml.tmp",
+    "TestLogs/results.xml.gz",
+    "TestLogs/results.xmlx",
+    "TestLogs/my_results.xml.bak",
+])
+def test_a_partially_written_results_file_is_not_completion(monkeypatch, name):
+    class F:
+        filename = None
+
+    F.filename = name
+    monkeypatch.setattr(job, "_client", lambda: object())
+    monkeypatch.setattr(job.qdc_api, "get_job_log_files",
+                        lambda c, j: [F()], raising=False)
+    monkeypatch.setattr(job, "POLL_S", 0)
+    assert job.wait(1234, cap_s=0) is False, (
+        f"{name!r} is not TestLogs/results.xml -- a substring match on it "
+        "declares a job complete off a half-written file"
+    )
+
+
+@pytest.mark.parametrize("name", [
+    "TestLogs/results.xml",
+    "job-1234/TestLogs/results.xml",
+    "job-1234\\TestLogs\\results.xml",
+])
+def test_the_real_results_file_is_recognized_however_it_is_pathed(monkeypatch, name):
+    class F:
+        filename = None
+
+    F.filename = name
+    monkeypatch.setattr(job, "_client", lambda: object())
+    monkeypatch.setattr(job.qdc_api, "get_job_log_files",
+                        lambda c, j: [F()], raising=False)
+    monkeypatch.setattr(job, "POLL_S", 0)
+    assert job.wait(1234, cap_s=0) is True
+
+
+def test_a_log_entry_with_no_filename_at_all_does_not_crash_wait(monkeypatch):
+    class F:
+        filename = None
+
+    class G:
+        pass
+
+    monkeypatch.setattr(job, "_client", lambda: object())
+    monkeypatch.setattr(job.qdc_api, "get_job_log_files",
+                        lambda c, j: [F(), G()], raising=False)
+    monkeypatch.setattr(job, "POLL_S", 0)
+    assert job.wait(1234, cap_s=0) is False
+
+
+# --- fetch() mirrors QDC's directory layout ------------------------------
+#
+# `os.path.join(dest, os.path.basename(name))` FLATTENED it. QDC's listings are
+# not flat, so `TestLogs/results.xml` and `logs/results.xml` both became
+# `dest/results.xml`: one silently overwrote the other, the returned `paths`
+# held two entries pointing at ONE file, and cli.py's results check then read
+# whichever download happened to land last. The one file this whole path exists
+# to read is identified by that basename.
+
+
+def _fake_downloads(monkeypatch, names):
+    """A fake QDC that lists `names` and 'downloads' each by writing its own
+    remote name into the local file, so a collision is detectable by content."""
+    class F:
+        def __init__(self, filename):
+            self.filename = filename
+
+    monkeypatch.setattr(job, "_client", lambda: object())
+    monkeypatch.setattr(job.qdc_api, "get_job_log_files",
+                        lambda c, j: [F(n) for n in names], raising=False)
+
+    def fake_download(client, remote, local):
+        with open(local, "w", encoding="utf-8") as f:
+            f.write(remote)
+        return True
+
+    monkeypatch.setattr(job.qdc_api, "download_log_file", fake_download,
+                        raising=False)
+
+
+def test_fetch_does_not_let_two_logs_with_one_basename_overwrite_each_other(
+    monkeypatch, tmp_path
+):
+    _fake_downloads(monkeypatch, ["TestLogs/results.xml", "logs/results.xml"])
+    paths = job.fetch(1234, str(tmp_path / "d"))
+
+    assert len(set(paths)) == 2, (
+        f"two distinct remote logs collapsed onto one local path: {paths}"
+    )
+    contents = sorted(open(p, encoding="utf-8").read() for p in paths)
+    assert contents == ["TestLogs/results.xml", "logs/results.xml"], (
+        "one download overwrote the other -- the returned paths pointed at a "
+        "single file holding whichever finished last"
+    )
+
+
+def test_fetch_keeps_the_results_basename_findable_by_the_cli(monkeypatch, tmp_path):
+    """cli._qdc_check_results locates the report with
+    `os.path.basename(p) == "results.xml"`, so mirroring the directory layout
+    must not change what that sees."""
+    import os as _os
+
+    _fake_downloads(monkeypatch, ["TestLogs/results.xml", "TestLogs/logcat.txt"])
+    paths = job.fetch(1234, str(tmp_path / "d"))
+    assert any(_os.path.basename(p) == "results.xml" for p in paths)
+    assert all(_os.path.isfile(p) for p in paths)
+
+
+@pytest.mark.parametrize("evil", [
+    "../../escaped.txt",
+    "TestLogs/../../escaped.txt",
+    "/etc/passwd",
+    "C:/Windows/System32/evil.txt",
+    "",
+    "   ",
+])
+def test_fetch_refuses_a_remote_name_that_would_escape_the_destination(
+    monkeypatch, tmp_path, evil
+):
+    """QDC's own names have never looked like this, which is exactly why
+    nothing would notice if one did."""
+    dest = tmp_path / "d"
+    _fake_downloads(monkeypatch, [evil])
+    paths = job.fetch(1234, str(dest))
+    assert paths == []
+    assert not (tmp_path / "escaped.txt").exists()
 
 
 def _inject_fake_sdk(monkeypatch, *, get_public_api_client_using_api_key, client_ctor=None):

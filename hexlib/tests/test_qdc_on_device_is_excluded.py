@@ -38,8 +38,26 @@ The self-referential node id is deliberate. Asserting on some OTHER file's test
 name couples this file to a name it does not own; asserting that the
 subprocess collected THIS file's own first test cannot drift, and is impossible
 to satisfy with empty stdout or a collection error.
+
+THIRD DEFECT, FIXED 2026-08-11: THE ABSENCE CHECK MATCHED BARE SUBSTRINGS
+AGAINST THE WHOLE OF STDOUT. It was `assert "test_on_device.py" not in
+result.stdout` plus `assert "device/qdc" not in result.stdout`. Collection
+output is a list of NODE IDS, but those assertions searched every byte of it,
+so any new parametrize id, test name, or (in the failure path) traceback text
+that merely NAMED that file or that directory tripped them -- and the failure
+message then claimed the on-device file WAS collected when it was not, which is
+a confusing thing to debug under merge pressure. It was hit for real. The
+checks below parse the node ids out of stdout and match a node-id PREFIX
+instead, and `test_the_absence_check_does_not_fire_on_a_mere_mention` /
+`test_the_absence_check_still_fires_on_a_real_device_node_id` pin both
+directions of that against fabricated output, so neither half is taken on
+trust.
+
+THE EXCLUSION MECHANISM ITSELF IS UNCHANGED -- still the root conftest.py's
+`collect_ignore`. Only how this file VERIFIES it changed.
 """
 import os
+import re
 import subprocess
 import sys
 
@@ -98,6 +116,44 @@ def hexlib_path_collection():
     return _collect("-q", "hexlib")
 
 
+# A collected node id, as `--collect-only -q` prints one per line:
+# `hexlib/tests/test_x.py::test_y`, or `...::test_y[param]` when parametrized.
+# Anchored, with no whitespace before the `::`, so a line of prose that happens
+# to contain both a `.py` and a `::` (a traceback, a message quoting a node id
+# mid-sentence) is not mistaken for a collected test.
+_NODE_ID_LINE = re.compile(r"\A(?P<file>\S+\.py)::(?P<rest>\S+)\Z")
+
+# Node ids from the on-device tree, which is what WOULD appear if the root
+# conftest.py's `collect_ignore` stopped working. The whole DIRECTORY, not just
+# test_on_device.py's own name: a second on-device file added next to it must be
+# caught without anyone having to remember to come back here.
+_ON_DEVICE_NODE_PREFIX = "hexlib/device/"
+
+
+def _collected_node_ids(stdout):
+    """Every collected node id in `--collect-only` output, separators
+    normalized to forward slashes.
+
+    PARSED, NOT SUBSTRING-SEARCHED. This is the whole fix for the third defect
+    in this file's docstring: the previous version searched raw stdout, so any
+    line that merely mentioned a filename or a directory counted as evidence
+    that it had been collected.
+    """
+    ids = []
+    for raw in stdout.splitlines():
+        m = _NODE_ID_LINE.match(raw.strip().replace("\\", "/"))
+        if m:
+            ids.append(m.group(0))
+    return ids
+
+
+def _on_device_node_ids(stdout):
+    return [
+        n for n in _collected_node_ids(stdout)
+        if n.startswith(_ON_DEVICE_NODE_PREFIX)
+    ]
+
+
 def _assert_collection_succeeded(result, how):
     """The two things the old version of this file never checked. Order
     matters: report the rc first, because a collection error is what makes
@@ -108,29 +164,22 @@ def _assert_collection_succeeded(result, how):
         "proved anything about what was or was not collected:\n"
         f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
     )
-    assert _KNOWN_GOOD_NODE_ID in result.stdout, (
+    collected = _collected_node_ids(result.stdout)
+    assert _KNOWN_GOOD_NODE_ID in collected, (
         f"`pytest --collect-only {how}` exited 0 but did not collect "
         f"{_KNOWN_GOOD_NODE_ID} -- this file's own first test. Empty or "
         "unrecognizable output must never be read as 'the on-device test was "
-        f"excluded':\n--- stdout ---\n{result.stdout}"
+        f"excluded'. Parsed {len(collected)} node id(s) from:\n"
+        f"--- stdout ---\n{result.stdout}"
     )
 
 
 def _assert_device_qdc_absent(result, how):
-    assert "test_on_device.py" not in result.stdout, (
-        f"hexlib/device/qdc/test_on_device.py was collected by `pytest {how}` "
-        f"-- it must run only on the phone:\n{result.stdout}"
+    offenders = _on_device_node_ids(result.stdout)
+    assert not offenders, (
+        f"`pytest {how}` collected node id(s) under {_ON_DEVICE_NODE_PREFIX} "
+        f"-- those tests run only on the phone: {offenders}"
     )
-    # The DIRECTORY, not merely this one file's node id: catches a second
-    # on-device file added next to test_on_device.py that the check above
-    # would not, by name, think to look for. Unlike the version of this
-    # assertion that named `hexlib/tests` on the command line -- where a node
-    # id could never have contained `device/qdc` in the first place, so it had
-    # no discriminating power at all -- both invocations here start at or
-    # above `hexlib`, so `hexlib/device/qdc/...` node ids are exactly what
-    # WOULD appear if the exclusion were removed.
-    assert "device/qdc" not in result.stdout
-    assert "device" + os.sep + "qdc" not in result.stdout
 
 
 def test_the_bare_command_ci_runs_collects_cleanly(ci_collection):
@@ -159,3 +208,68 @@ def test_naming_a_path_does_not_reach_the_on_device_test_either(
     the other, this test is the only thing that notices."""
     _assert_collection_succeeded(hexlib_path_collection, "hexlib")
     _assert_device_qdc_absent(hexlib_path_collection, "hexlib")
+
+
+# ==============================================================================
+# BOTH DIRECTIONS OF THE ABSENCE CHECK, against fabricated output.
+#
+# The previous version of that check (`assert "test_on_device.py" not in
+# result.stdout`) was wrong in the FALSE-POSITIVE direction: any test name,
+# parametrize id or traceback line that merely NAMED the file failed it, with a
+# message claiming the file had been collected when it had not. It was hit for
+# real. Fixing that without also pinning the true-positive direction would just
+# trade one silent failure for another, so both are checked here -- and neither
+# needs a subprocess, so they cannot be skipped for being slow.
+# ==============================================================================
+
+
+def test_the_absence_check_does_not_fire_on_a_mere_mention():
+    """A collected test whose NAME contains the on-device filename, plus prose
+    quoting the full path -- neither is a collected on-device node id."""
+    stdout = (
+        f"{_KNOWN_GOOD_NODE_ID}\n"
+        "hexlib/tests/test_cli_device_flag.py::test_error_names_test_on_device_py\n"
+        "hexlib/tests/test_x.py::test_paths[hexlib/device/qdc/test_on_device.py]\n"
+        "  the staged script hexlib/device/qdc/test_on_device.py runs on the phone\n"
+        "3 tests collected in 0.42s\n"
+    )
+    assert _on_device_node_ids(stdout) == [], (
+        "a mention is not a collection -- this is the false positive that made "
+        "the previous check claim the on-device file had been collected when it "
+        "had not"
+    )
+    assert _KNOWN_GOOD_NODE_ID in _collected_node_ids(stdout)
+
+
+def test_the_absence_check_still_fires_on_a_real_device_node_id():
+    """The direction that matters: an actually-collected on-device test must be
+    reported. Without this, the fix above could have been "match nothing"."""
+    stdout = (
+        f"{_KNOWN_GOOD_NODE_ID}\n"
+        "hexlib/device/qdc/test_on_device.py::test_binaries_are_present\n"
+        "2 tests collected in 0.42s\n"
+    )
+    offenders = _on_device_node_ids(stdout)
+    assert offenders == [
+        "hexlib/device/qdc/test_on_device.py::test_binaries_are_present"
+    ]
+
+
+def test_the_absence_check_catches_a_second_on_device_file_and_windows_paths():
+    """The DIRECTORY, not one filename: a new on-device file next to
+    test_on_device.py is caught without anyone editing this test. Backslash
+    node ids are normalized rather than needing their own assertion."""
+    stdout = (
+        f"{_KNOWN_GOOD_NODE_ID}\n"
+        "hexlib/device/qdc/test_something_new.py::test_z\n"
+        "hexlib\\device\\qdc\\test_on_device.py::test_w\n"
+    )
+    assert len(_on_device_node_ids(stdout)) == 2
+
+
+def test_a_collection_error_cannot_look_like_a_clean_exclusion():
+    """Empty or error output yields ZERO node ids, so `_assert_collection_
+    succeeded`'s known-good-id assertion fails -- absence is never read as
+    success here."""
+    assert _collected_node_ids("") == []
+    assert _collected_node_ids("Interrupted: 1 error during collection\n") == []

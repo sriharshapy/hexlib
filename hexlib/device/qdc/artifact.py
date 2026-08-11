@@ -9,10 +9,22 @@ no subdirectory nesting here on purpose -- the on-farm scripts invoke a plain
 exactly the kind of thing that fails silently on real hardware and nowhere
 else.
 
-StagingError is raised the moment any declared input is missing, and again
-if -- somehow -- something staged does not make it into the zip. A job that
-runs against a binary that silently wasn't there is how you burn device
+StagingError is raised the moment any declared input is missing OR EMPTY, and
+again if -- somehow -- something staged does not make it into the zip. A job
+that runs against a binary that silently wasn't there is how you burn device
 minutes for nothing.
+
+WHY EMPTINESS IS CHECKED AND NOT JUST EXISTENCE. `os.path.isfile` was the
+whole test, and `stage` was verified to accept four 0-byte files and produce a
+perfectly submittable zip. A link or a copy that fails part-way leaves exactly
+that: a `libhexlib_skel.so` of length zero, present, named correctly, and
+completely unrunnable -- discovered on the device, after the minutes are spent,
+as a dlopen failure with no obvious cause. Size zero is the one truncation
+that is unambiguous and free to detect here; deeper validation (ELF magic,
+machine type) deliberately is NOT done in this function, because `binaries`
+also legitimately carries a `.py` file (see cli.py's own call, which stages
+`utils.py` through this list) and a check that has to special-case its inputs
+by extension is a check that will be wrong about the next input added.
 """
 from __future__ import annotations
 
@@ -25,9 +37,23 @@ _REQUIREMENTS = "pytest\n"
 
 
 class StagingError(Exception):
-    """A declared binary or test script does not exist, or did not survive
-    into the zip. Never produce an artifact that is missing what it claims
-    to carry."""
+    """A declared binary or test script does not exist, is empty, or did not
+    survive into the zip. Never produce an artifact that is missing what it
+    claims to carry."""
+
+
+def _require_real_file(path: str, what: str) -> None:
+    """Present AND non-empty. See the module docstring for why the second
+    half is not pedantry."""
+    if not os.path.isfile(path):
+        raise StagingError(f"{what} not found: {path}")
+    if os.path.getsize(path) == 0:
+        raise StagingError(
+            f"{what} is 0 bytes, refusing to stage it: {path} -- an empty "
+            "artifact is what a failed link or a truncated copy leaves "
+            "behind, and it would be discovered on the device after the "
+            "minutes are spent"
+        )
 
 
 def stage(binaries: list[str], test_script: str | None, out_base: str) -> str:
@@ -35,14 +61,13 @@ def stage(binaries: list[str], test_script: str | None, out_base: str) -> str:
     next to a generated pytest.ini and requirements.txt, zip it to
     `<out_base>.zip`, and return that path.
 
-    Raises StagingError if any input is missing, or if the zip that would
-    result is missing anything that was staged.
+    Raises StagingError if any input is missing or empty, or if the zip that
+    would result is missing anything that was staged.
     """
     for b in binaries:
-        if not os.path.isfile(b):
-            raise StagingError(f"binary not found: {b}")
-    if test_script is not None and not os.path.isfile(test_script):
-        raise StagingError(f"test script not found: {test_script}")
+        _require_real_file(b, "binary")
+    if test_script is not None:
+        _require_real_file(test_script, "test script")
 
     stage_dir = out_base + "_stage"
     if os.path.exists(stage_dir):

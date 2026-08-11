@@ -10,9 +10,21 @@ THREE MEASURED FACTS, do not re-derive or contradict them:
      get_job_status returns state=None on this account. get_jobs_list
      lagged more than 30 minutes on both jobs observed. Completion is
      detected by the *appearance* of TestLogs/results.xml among a job's
-     log files. A job that ran zero tests once reported passing on this
-     account because something declared success on weaker evidence than
-     that -- wait() exists to make that impossible.
+     log files.
+
+     WHAT wait() IS AND IS NOT. It is a COMPLETION DETECTOR, not a verdict.
+     `wait() -> True` means one thing and only one thing: a log file whose
+     name ends in TestLogs/results.xml showed up. It does not open that file,
+     so it cannot distinguish a real report from a zero-byte placeholder, and
+     an earlier version of this docstring claiming "wait() exists to make
+     [a false pass] impossible" was overclaiming: it makes DECLARING
+     COMPLETION EARLY impossible, which is a different (and narrower) thing.
+     A job that ran zero tests once reported passing on this account, and the
+     check that actually rules that out lives in
+     `hexlib/cli.py::_qdc_check_results` -- it parses the report, requires
+     tests > 0 with no failures/errors/skips, and requires hexlib's own
+     measurement lines in the fetched logs. Any new caller of wait() needs
+     that check too; wait()'s True is its precondition, never its conclusion.
   3. Artifact is a zip, TestFramework.APPIUM, entry_script=None, extracted
      at /qdc/appium, logs collected from /data/local/tmp/QDC_logs. On-farm
      scripts have a plain `adb`.
@@ -56,8 +68,11 @@ TARGET_ID = 3625030
 POLL_S = 30
 RESULTS_MARKER = "TestLogs/results.xml"
 
-_MIN_TIMEOUT_MIN = 1
-_MAX_TIMEOUT_MIN = 240
+# PUBLIC on purpose: hexlib/cli.py range-checks `--timeout-min` against these
+# before it runs a full SDK build, and it must not respell the bounds. This
+# module stays the single authority for them.
+MIN_TIMEOUT_MIN = 1
+MAX_TIMEOUT_MIN = 240
 
 _API_KEY_ENV = "QDC_API_KEY"
 _BASE_URL_ENV = "QDC_BASE_URL"
@@ -257,9 +272,9 @@ def submit(zip_path: str, *, timeout_min: int) -> int:
     """Submit `zip_path` (from artifact.stage) as a job on TARGET_ID and
     return the job id. timeout_min is required -- there is no default --
     and must be in 1..240; a runaway job spends real money."""
-    if not _MIN_TIMEOUT_MIN <= timeout_min <= _MAX_TIMEOUT_MIN:
+    if not MIN_TIMEOUT_MIN <= timeout_min <= MAX_TIMEOUT_MIN:
         raise QdcError(
-            f"timeout_min must be {_MIN_TIMEOUT_MIN}..{_MAX_TIMEOUT_MIN}, "
+            f"timeout_min must be {MIN_TIMEOUT_MIN}..{MAX_TIMEOUT_MIN}, "
             f"got {timeout_min}"
         )
     if not os.path.isfile(zip_path):
@@ -273,19 +288,56 @@ def submit(zip_path: str, *, timeout_min: int) -> int:
     return job_id
 
 
+def _results_filename(name: object) -> bool:
+    """True if `name` IS the results file, by path suffix -- not merely a name
+    that CONTAINS the marker somewhere. `RESULTS_MARKER in name` also matched
+    `TestLogs/results.xml.part` and `TestLogs/results.xml.tmp`, i.e. exactly
+    the half-written intermediate whose appearance is the one thing a
+    completion detector must not fire on. Separators are normalized because
+    QDC's own filenames use forward slashes and nothing guarantees a future
+    field will."""
+    if not isinstance(name, str) or not name:
+        return False
+    return name.replace("\\", "/").endswith(RESULTS_MARKER)
+
+
 def _has_results(files) -> bool:
-    return any(RESULTS_MARKER in (getattr(f, "filename", "") or "") for f in files)
+    """PURELY A FILENAME TEST -- it never opens anything. A zero-byte
+    results.xml satisfies it. That is deliberate (this module cannot read a
+    file it has not downloaded yet) and it is why `wait()` is not a verdict;
+    see `wait()` and fact 2 in the module docstring."""
+    return any(_results_filename(getattr(f, "filename", None)) for f in files)
 
 
 def wait(job_id: int, cap_s: int = 1800) -> bool:
-    """Block until TestLogs/results.xml appears among job_id's log files,
-    or until cap_s seconds have passed.
+    """Block until a log file named TestLogs/results.xml APPEARS among
+    job_id's log files, or until cap_s seconds have passed.
 
-    Returns True only once results.xml has actually appeared -- never a
-    guess. Returns False at the cap rather than hanging forever; False at
-    the cap must never be confused with success, and nothing here lets it
-    be. Never touches get_job_status or the jobs list: see the module
-    docstring for why.
+    WHAT True GUARANTEES, EXACTLY: that a file with that name now exists in
+    QDC's log listing for this job. NOTHING MORE. This function does not
+    download it, does not open it, does not parse it, and cannot tell a real
+    JUnit report from a zero-byte file with the right name -- `_has_results`
+    is a filename test (see its own docstring). True therefore means
+    "finished, probably" and is a PRECONDITION for judging the job, never the
+    judgement.
+
+    WHERE THE REAL CHECK LIVES: `hexlib/cli.py::_qdc_check_results`, called by
+    `_qdc_submit` after `fetch()`. It parses the report and requires
+    tests > 0, no failures, no errors, no skips, and hexlib's own measurement
+    lines (`hexlib: --self-test: PASS`, a positive `cycles_total=`) in the
+    fetched logs. A caller that treats this function's True as a pass
+    reintroduces this account's own history -- a job that ran zero tests and
+    reported passing -- with the check one level further away.
+
+    THE CAP IS THE CALLER'S TO CHOOSE, and the default is not a safe one for
+    every job: 1800 s is SMALLER than the 240 minutes `submit()` accepts, so
+    passing a job's own timeout through is the caller's responsibility (cli.py
+    derives it in `_qdc_wait_cap_s`). Returns False at the cap rather than
+    hanging forever; False must never be confused with success, and it also
+    does not mean the job failed -- it means this function stopped watching,
+    which is why cli.py fetches whatever logs exist before reporting it.
+
+    Never touches get_job_status or the jobs list: see the module docstring.
     """
     client = _client()
     deadline = time.monotonic() + cap_s
@@ -298,10 +350,42 @@ def wait(job_id: int, cap_s: int = 1800) -> bool:
         time.sleep(POLL_S)
 
 
+def _local_log_path(dest: str, name: str) -> str | None:
+    """Where QDC's log file `name` should land under `dest`, PRESERVING QDC's
+    own directory structure, or None if `name` cannot be mapped safely.
+
+    `os.path.join(dest, os.path.basename(name))` flattened it, and QDC's
+    listings are not flat: `TestLogs/results.xml` and `logs/results.xml` both
+    became `dest/results.xml`, so one silently overwrote the other and the
+    returned `paths` list held two entries pointing at one file -- with
+    cli.py's results check then reading whichever download happened to finish
+    last. Flattening is not a cosmetic problem here: the one file this whole
+    path is built to read is identified by that basename.
+
+    Returns None for anything that would escape `dest` -- an absolute path, a
+    drive letter, or a `..` component. QDC's own names have never looked like
+    that, which is exactly why nothing would notice if one did.
+    """
+    unified = name.replace("\\", "/").strip()
+    if not unified:
+        return None
+    parts = [p for p in unified.split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts):
+        return None
+    if os.path.isabs(unified) or os.path.splitdrive(unified)[0]:
+        return None
+    return os.path.join(dest, *parts)
+
+
 def fetch(job_id: int, dest: str) -> list[str]:
-    """Download every log file QDC has for job_id into dest, and return the
-    local paths written. Only meaningful after wait() has returned True --
-    fetching before results.xml exists proves nothing."""
+    """Download every log file QDC has for job_id into dest, MIRRORING QDC's
+    own directory layout beneath it, and return the local paths written.
+
+    Only meaningful after wait() has returned True -- and note that wait()
+    returning True proves only that a file with the right NAME appeared, so
+    even a full fetch is not a verdict: `hexlib/cli.py::_qdc_check_results`
+    is what judges the job.
+    """
     client = _client()
     files = qdc_api.get_job_log_files(client, job_id)
     os.makedirs(dest, exist_ok=True)
@@ -309,9 +393,12 @@ def fetch(job_id: int, dest: str) -> list[str]:
     paths = []
     for f in files:
         name = getattr(f, "filename", None)
-        if not name:
+        if not name or not isinstance(name, str):
             continue
-        local = os.path.join(dest, os.path.basename(name))
+        local = _local_log_path(dest, name)
+        if local is None:
+            continue
+        os.makedirs(os.path.dirname(local), exist_ok=True)
         if qdc_api.download_log_file(client, name, local):
             paths.append(local)
     return paths

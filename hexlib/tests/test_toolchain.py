@@ -8,7 +8,40 @@ from hexlib import toolchain as tc
 def test_base_flags_are_pinned():
     assert tc.HVX_CFLAGS == [
         "-mv75", "-mhvx", "-mhvx-length=128B", "-std=gnu11", "-O2",
+        "-Wall", "-Werror",
     ]
+
+
+def test_warnings_are_errors_because_nothing_else_reads_them():
+    """-Werror IS LOAD-BEARING, not tidiness. Every caller of `tc.run` decides
+    success from `rc != 0` alone (hexlib/runtime/build.py's compile loops,
+    hexlib/build.py, hexlib/exec/hexagon.py), so a warning is emitted and then
+    discarded. The diagnostic that matters is
+    -Wincompatible-pointer-types-discards-qualifiers: genentry.py emits each
+    kernel's DSP entry by ARGUMENT ORDER, and swapping the `const` input with
+    the mutable output is not a crash and not a bad status -- it is a plausible
+    wrong answer, and that warning is the only automatic notice of it.
+
+    MEASURED on toolchain 19.0.04 with the real generated scale_fp16_entry.c:
+    with the two buffer casts swapped, `-Wall -Werror` -> rc=1 with that exact
+    diagnostic; the same file under the OLD flags -> rc=0 with the same text as
+    a warning. Removing either flag here restores that silence.
+    """
+    assert "-Werror" in tc.HVX_CFLAGS
+    assert "-Wall" in tc.HVX_CFLAGS
+    # -Wextra and -Wpedantic were measured and rejected -- see toolchain.py's
+    # own comment for the numbers. Pinned so re-adding one is a deliberate act.
+    assert "-Wpedantic" not in tc.HVX_CFLAGS
+    assert "-Wextra" not in tc.HVX_CFLAGS
+
+
+def test_the_hmx_flag_still_lands_after_the_warning_flags():
+    """`cflags_for_caps` appends -mhmx, and `test_hmx_cap_adds_compiler_and_sim_
+    flags` asserts it is LAST. Adding flags to HVX_CFLAGS must not have quietly
+    changed which flag that is."""
+    flags = tc.cflags_for_caps(["hmx"])
+    assert flags[-1] == "-mhmx"
+    assert flags[:-1] == tc.HVX_CFLAGS
 
 
 def test_compiler_is_the_c_driver():

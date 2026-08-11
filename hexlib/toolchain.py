@@ -64,7 +64,53 @@ BUS_RATIO = 2
 STD = "gnu11"
 COMPILER = "hexagon-clang"
 
-HVX_CFLAGS = [f"-m{DSP_ARCH}", "-mhvx", "-mhvx-length=128B", f"-std={STD}", "-O2"]
+# -Wall -Werror: THE ONLY AUTOMATIC BACKSTOP AGAINST A MIS-ORDERED GENERATED
+# KERNEL CALL, and until 2026-08-11 it was thrown away. `hexlib/runtime/
+# genentry.py` emits each kernel's DSP entry point by ORDER -- inputs (cast to
+# `const T *`) then the output (cast to `T *`) -- and getting that order wrong
+# is not a crash and not a wrong status; it is a plausible wrong answer. What
+# catches it is the compiler: passing the `const` input where the mutable
+# output belongs is `-Wincompatible-pointer-types-discards-qualifiers`. Every
+# caller of `tc.run` checks only `rc != 0`, and a warning leaves rc == 0, so
+# that diagnostic was emitted and discarded on every build.
+#
+# MEASURED, NOT ASSUMED (2026-08-11, toolchain 19.0.04, the real generated
+# scale_fp16_entry.c with its two buffer casts swapped):
+#   original,        -Wall -Werror -> rc=0
+#   swapped casts,   -Wall -Werror -> rc=1, "error: passing 'const hexlib_hf *'
+#                                     ... discards qualifiers [-Werror,
+#                                     -Wincompatible-pointer-types-discards-
+#                                     qualifiers]"
+#   swapped casts,   old flags     -> rc=0, the SAME text as a warning
+# So the mis-order was, and is, exactly one warning away from shipping.
+#
+# -Werror WHOLESALE, NOT A HAND-PICKED LIST, because it turned out not to
+# break anything: the full SDK-gated build set (kernel ELFs via
+# hexlib/build.py, the QuRT-hosted simulator .so, the device skel .so, and the
+# aarch64 hexlib_run) compiles with ZERO warnings under -Wall on this
+# toolchain, so there was no existing diagnostic to grandfather in and no
+# reason to enumerate a subset that would then quietly not cover the next one.
+# If a future kernel legitimately needs a warning suppressed, suppress THAT
+# warning at THAT site (`#pragma clang diagnostic`) where a reader can see it
+# -- do not widen this list back out.
+#
+# TWO FLAGS CONSIDERED AND REJECTED, both MEASURED rather than guessed at:
+#
+#   -Wpedantic: 29 warnings across the skel + the six kernels today
+#   (26 -Wgnu-zero-variadic-macro-arguments, 3 -Wlanguage-extension-token).
+#   Under -Werror that is an immediate build failure, and the two classes are
+#   inherent: this codebase is GNU C on purpose (see STD above) and the HVX
+#   types are extensions. Rejected.
+#
+#   -Wextra: measured CLEAN (0 warnings) on the same set, so it would build
+#   today -- and it is still rejected, because what it adds over -Wall is
+#   dominated by -Wunused-parameter/-Wsign-compare, which say nothing about
+#   the argument-order class this exists to catch, while making -Werror fire
+#   on ordinary in-progress kernel code (a stubbed kernel that ignores a
+#   parameter). It costs a contributor a build for no safety. Revisit only
+#   with a specific defect it would have caught.
+HVX_CFLAGS = [f"-m{DSP_ARCH}", "-mhvx", "-mhvx-length=128B", f"-std={STD}", "-O2",
+              "-Wall", "-Werror"]
 
 SIM_TIMEOUT_S = 60
 # An XL kernel gets more time, but this still kills genuine infinite loops.

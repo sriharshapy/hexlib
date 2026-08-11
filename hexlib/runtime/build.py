@@ -775,7 +775,16 @@ def build_device_binary(out_dir: str, sdk_root: str | None = None) -> str:
     # linking libcdsprpc.so at build time, so the driver stays exclusively
     # dlopen'd, exactly as designed.
     exe = os.path.join(out_dir, "hexlib_run")
-    cmd = [clang, "-O2"]
+    # -Wall -Werror for the SAME reason tc.HVX_CFLAGS carries them (see the long
+    # comment there): every caller of tc.run checks only `rc != 0`, so a warning
+    # is emitted and discarded. This side of the wire assembles the batch blob
+    # and the buffer table by hand in host/*.c, which is exactly the kind of
+    # code where a pointer/qualifier diagnostic is the only automatic notice
+    # that two things were swapped. MEASURED before enabling: this link
+    # produces ZERO warnings under -Wall on the pinned NDK (r25c, API 33), so
+    # nothing is being grandfathered in. NOT tc.HVX_CFLAGS itself -- that list
+    # is Hexagon-specific (-mv75/-mhvx) and means nothing to an aarch64 clang.
+    cmd = [clang, "-O2", "-Wall", "-Werror"]
     for d in includes:
         cmd.append(f"-I{d}")
     cmd += sources

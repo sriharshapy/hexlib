@@ -36,8 +36,16 @@ CYCLES_LINE = "hexlib: --self-test: cycles_total=886"
 GOOD_LOG = f"{PASS_LINE}\n{CYCLES_LINE}\n"
 
 
-def _args(tmp_path):
-    return argparse.Namespace(out=str(tmp_path / "out"), timeout_min=5, yes=False)
+def _args(tmp_path, kernel="scale_fp16", timeout_min=5):
+    """A REALISTIC Namespace, `kernel` included. It used to be built with no
+    `kernel` attribute at all and `_qdc_submit` ran fine -- which was itself
+    the evidence that `--device qdc` ignored the argument and would spend real
+    minutes measuring scale_fp16 no matter which kernel was asked for.
+    `_qdc_submit` now refuses an args object with no kernel on it, so leaving
+    it out here would fail loudly instead of passing silently."""
+    return argparse.Namespace(
+        out=str(tmp_path / "out"), timeout_min=timeout_min, yes=False, kernel=kernel
+    )
 
 
 def _stub_build_submit_and_wait(monkeypatch):
@@ -89,7 +97,7 @@ def test_a_good_run_with_measurements_present_exits_zero(monkeypatch, tmp_path):
     _stub_build_submit_and_wait(monkeypatch)
     paths = _fake_fetch(
         tmp_path,
-        results_xml='<testsuite tests="4" failures="0" errors="0"></testsuite>',
+        results_xml='<testsuite tests="4" failures="0" errors="0" skipped="0"></testsuite>',
         extra_logs={"hexlib_selftest.log": GOOD_LOG},
     )
     monkeypatch.setattr(job, "fetch", lambda job_id, dest: paths)
@@ -103,7 +111,7 @@ def test_zero_tests_is_a_failure_never_a_pass(monkeypatch, tmp_path, capsys):
     _stub_build_submit_and_wait(monkeypatch)
     paths = _fake_fetch(
         tmp_path,
-        results_xml='<testsuite tests="0" failures="0" errors="0"></testsuite>',
+        results_xml='<testsuite tests="0" failures="0" errors="0" skipped="0"></testsuite>',
         extra_logs={"hexlib_selftest.log": GOOD_LOG},
     )
     monkeypatch.setattr(job, "fetch", lambda job_id, dest: paths)
@@ -117,7 +125,7 @@ def test_any_failures_is_a_failure(monkeypatch, tmp_path, capsys):
     _stub_build_submit_and_wait(monkeypatch)
     paths = _fake_fetch(
         tmp_path,
-        results_xml='<testsuite tests="5" failures="1" errors="0"></testsuite>',
+        results_xml='<testsuite tests="5" failures="1" errors="0" skipped="0"></testsuite>',
         extra_logs={"hexlib_selftest.log": GOOD_LOG},
     )
     monkeypatch.setattr(job, "fetch", lambda job_id, dest: paths)
@@ -131,7 +139,7 @@ def test_any_errors_is_a_failure(monkeypatch, tmp_path, capsys):
     _stub_build_submit_and_wait(monkeypatch)
     paths = _fake_fetch(
         tmp_path,
-        results_xml='<testsuite tests="5" failures="0" errors="2"></testsuite>',
+        results_xml='<testsuite tests="5" failures="0" errors="2" skipped="0"></testsuite>',
         extra_logs={"hexlib_selftest.log": GOOD_LOG},
     )
     monkeypatch.setattr(job, "fetch", lambda job_id, dest: paths)
@@ -180,7 +188,7 @@ def test_a_clean_result_missing_the_measurement_lines_is_still_a_failure(
     _stub_build_submit_and_wait(monkeypatch)
     paths = _fake_fetch(
         tmp_path,
-        results_xml='<testsuite tests="4" failures="0" errors="0"></testsuite>',
+        results_xml='<testsuite tests="4" failures="0" errors="0" skipped="0"></testsuite>',
         extra_logs={"hexlib_selftest.log": "nothing useful in this log\n"},
     )
     monkeypatch.setattr(job, "fetch", lambda job_id, dest: paths)
@@ -196,7 +204,7 @@ def test_a_clean_result_missing_only_the_pass_line_is_still_a_failure(
     _stub_build_submit_and_wait(monkeypatch)
     paths = _fake_fetch(
         tmp_path,
-        results_xml='<testsuite tests="4" failures="0" errors="0"></testsuite>',
+        results_xml='<testsuite tests="4" failures="0" errors="0" skipped="0"></testsuite>',
         extra_logs={"hexlib_selftest.log": f"{CYCLES_LINE}\n"},
     )
     monkeypatch.setattr(job, "fetch", lambda job_id, dest: paths)
@@ -210,7 +218,7 @@ def test_a_clean_result_missing_only_cycles_total_is_still_a_failure(
     _stub_build_submit_and_wait(monkeypatch)
     paths = _fake_fetch(
         tmp_path,
-        results_xml='<testsuite tests="4" failures="0" errors="0"></testsuite>',
+        results_xml='<testsuite tests="4" failures="0" errors="0" skipped="0"></testsuite>',
         extra_logs={"hexlib_selftest.log": f"{PASS_LINE}\n"},
     )
     monkeypatch.setattr(job, "fetch", lambda job_id, dest: paths)
@@ -233,8 +241,8 @@ def test_a_testsuite_nested_inside_another_testsuite_is_refused_not_summed(
     _stub_build_submit_and_wait(monkeypatch)
     xml = (
         "<testsuites>"
-        '<testsuite tests="5" failures="0" errors="0">'
-        '<testsuite tests="2" failures="0" errors="0"></testsuite>'
+        '<testsuite tests="5" failures="0" errors="0" skipped="0">'
+        '<testsuite tests="2" failures="0" errors="0" skipped="0"></testsuite>'
         "</testsuite>"
         "</testsuites>"
     )
@@ -255,8 +263,8 @@ def test_testsuites_wrapper_with_multiple_suites_is_summed(monkeypatch, tmp_path
     _stub_build_submit_and_wait(monkeypatch)
     xml = (
         '<testsuites>'
-        '<testsuite tests="2" failures="0" errors="0"></testsuite>'
-        '<testsuite tests="3" failures="0" errors="0"></testsuite>'
+        '<testsuite tests="2" failures="0" errors="0" skipped="0"></testsuite>'
+        '<testsuite tests="3" failures="0" errors="0" skipped="0"></testsuite>'
         "</testsuites>"
     )
     paths = _fake_fetch(
@@ -280,19 +288,19 @@ def test_testsuites_wrapper_with_multiple_suites_is_summed(monkeypatch, tmp_path
 
 def test_parse_bare_testsuite_root(tmp_path):
     p = tmp_path / "results.xml"
-    p.write_text('<testsuite tests="4" failures="1" errors="0"></testsuite>')
-    assert cli._qdc_parse_results_xml(str(p)) == (4, 1, 0)
+    p.write_text('<testsuite tests="4" failures="1" errors="0" skipped="2"></testsuite>')
+    assert cli._qdc_parse_results_xml(str(p)) == (4, 1, 0, 2)
 
 
 def test_parse_testsuites_wrapper_sums_direct_children_only(tmp_path):
     p = tmp_path / "results.xml"
     p.write_text(
         "<testsuites>"
-        '<testsuite tests="2" failures="0" errors="1"></testsuite>'
-        '<testsuite tests="3" failures="1" errors="0"></testsuite>'
+        '<testsuite tests="2" failures="0" errors="1" skipped="1"></testsuite>'
+        '<testsuite tests="3" failures="1" errors="0" skipped="0"></testsuite>'
         "</testsuites>"
     )
-    assert cli._qdc_parse_results_xml(str(p)) == (5, 1, 1)
+    assert cli._qdc_parse_results_xml(str(p)) == (5, 1, 1, 1)
 
 
 def test_parse_refuses_a_testsuite_nested_inside_a_testsuite(tmp_path):
@@ -305,8 +313,8 @@ def test_parse_refuses_a_testsuite_nested_inside_a_testsuite(tmp_path):
     p = tmp_path / "results.xml"
     p.write_text(
         "<testsuites>"
-        '<testsuite tests="5" failures="0" errors="0">'
-        '<testsuite tests="2" failures="0" errors="0"></testsuite>'
+        '<testsuite tests="5" failures="0" errors="0" skipped="0">'
+        '<testsuite tests="2" failures="0" errors="0" skipped="0"></testsuite>'
         "</testsuite>"
         "</testsuites>"
     )
@@ -320,8 +328,8 @@ def test_parse_refuses_a_testsuite_nested_directly_under_bare_testsuite_root(tmp
     not accepted just because the root tag matched the simple case."""
     p = tmp_path / "results.xml"
     p.write_text(
-        '<testsuite tests="5" failures="0" errors="0">'
-        '<testsuite tests="2" failures="0" errors="0"></testsuite>'
+        '<testsuite tests="5" failures="0" errors="0" skipped="0">'
+        '<testsuite tests="2" failures="0" errors="0" skipped="0"></testsuite>'
         "</testsuite>"
     )
     with pytest.raises(cli._QdcResultsError, match="nested"):
@@ -368,7 +376,7 @@ def test_a_zero_cycle_count_is_a_failure_never_a_pass(monkeypatch, tmp_path, cap
     _stub_build_submit_and_wait(monkeypatch)
     paths = _fake_fetch(
         tmp_path,
-        results_xml='<testsuite tests="5" failures="0" errors="0"></testsuite>',
+        results_xml='<testsuite tests="5" failures="0" errors="0" skipped="0"></testsuite>',
         extra_logs={"hexlib_selftest.log": f"{PASS_LINE}\n{ZERO_CYCLES_LINE}\n"},
     )
     monkeypatch.setattr(job, "fetch", lambda job_id, dest: paths)
@@ -390,7 +398,7 @@ def test_a_malformed_cycle_count_is_a_failure(monkeypatch, tmp_path, capsys):
     _stub_build_submit_and_wait(monkeypatch)
     paths = _fake_fetch(
         tmp_path,
-        results_xml='<testsuite tests="5" failures="0" errors="0"></testsuite>',
+        results_xml='<testsuite tests="5" failures="0" errors="0" skipped="0"></testsuite>',
         extra_logs={
             "hexlib_selftest.log": f"{PASS_LINE}\nhexlib: cycles_total=<gar\n"
         },
@@ -413,7 +421,7 @@ def test_a_positive_cycle_count_alongside_a_zero_one_still_passes(monkeypatch, t
     _stub_build_submit_and_wait(monkeypatch)
     paths = _fake_fetch(
         tmp_path,
-        results_xml='<testsuite tests="5" failures="0" errors="0"></testsuite>',
+        results_xml='<testsuite tests="5" failures="0" errors="0" skipped="0"></testsuite>',
         extra_logs={
             "hexlib_selftest.log": f"{PASS_LINE}\n{ZERO_CYCLES_LINE}\n{CYCLES_LINE}\n"
         },
@@ -466,3 +474,338 @@ def test_cycles_verdict_takes_the_largest_positive_value():
     )
     assert ok is True
     assert "1287" in detail
+
+
+# ==============================================================================
+# `skipped` -- COLLECTED BUT NEVER RUN IS NOT PASSED.
+#
+# `skipped` was parsed NOWHERE. VERIFIED before this fix:
+# `<testsuite tests="5" failures="0" errors="0" skipped="5">` plus a good
+# self-test log printed "job 999: 5 test(s), 0 failures, 0 errors, measurement
+# lines present" and EXITED 0 -- five tests collected, none run, reported as a
+# clean pass, with the skip count not even mentioned in the output.
+#
+# It is reachable the moment anyone `skipif`s the two aspirational
+# discriminators in device/qdc/test_on_device.py (the unmapped-fd and the
+# coherency check), and commit 6ac7c3e ("stop skipping silently") is the record
+# of that being a live temptation. On device a skip cannot mean "not applicable
+# here": every test in that file is unconditional, so a skip means the farm
+# collected a test and then did not run it.
+# ==============================================================================
+
+
+def test_every_test_skipped_is_a_failure_never_a_pass(monkeypatch, tmp_path, capsys):
+    """THE DEFECT ITSELF: a report whose every test was skipped, with a
+    perfectly good measurement log beside it."""
+    _stub_build_submit_and_wait(monkeypatch)
+    paths = _fake_fetch(
+        tmp_path,
+        results_xml='<testsuite tests="5" failures="0" errors="0" skipped="5"></testsuite>',
+        extra_logs={"hexlib_selftest.log": GOOD_LOG},
+    )
+    monkeypatch.setattr(job, "fetch", lambda job_id, dest: paths)
+    rc = cli._qdc_submit(_args(tmp_path))
+    assert rc != 0, (
+        "5 collected, 5 skipped, 0 run exited 0 before this fix -- a skip is "
+        "not a pass, and on device it means the test could not run at all"
+    )
+    err = capsys.readouterr().err.lower()
+    assert "skip" in err
+    assert "5" in err
+
+
+def test_even_one_skipped_test_is_a_failure(monkeypatch, tmp_path, capsys):
+    """Not a threshold. One test silently not running is one discriminator
+    silently not applied."""
+    _stub_build_submit_and_wait(monkeypatch)
+    paths = _fake_fetch(
+        tmp_path,
+        results_xml='<testsuite tests="5" failures="0" errors="0" skipped="1"></testsuite>',
+        extra_logs={"hexlib_selftest.log": GOOD_LOG},
+    )
+    monkeypatch.setattr(job, "fetch", lambda job_id, dest: paths)
+    rc = cli._qdc_submit(_args(tmp_path))
+    assert rc != 0
+    assert "skip" in capsys.readouterr().err.lower()
+
+
+def test_the_skip_count_is_reported_on_the_pass_line_too(monkeypatch, tmp_path, capsys):
+    """A success line that omits a count it checked leaves a reader unable to
+    tell "0 skipped" from "skips were never looked at" -- which is exactly the
+    state this line was in."""
+    _stub_build_submit_and_wait(monkeypatch)
+    paths = _fake_fetch(
+        tmp_path,
+        results_xml='<testsuite tests="4" failures="0" errors="0" skipped="0"></testsuite>',
+        extra_logs={"hexlib_selftest.log": GOOD_LOG},
+    )
+    monkeypatch.setattr(job, "fetch", lambda job_id, dest: paths)
+    assert cli._qdc_submit(_args(tmp_path)) == 0
+    assert "0 skipped" in capsys.readouterr().out
+
+
+# ==============================================================================
+# A MISSING COUNT ATTRIBUTE IS A MALFORMED REPORT, NEVER A ZERO.
+#
+# `suite.get("failures", "0")` / `suite.get("errors", "0")` defaulted the two
+# attributes that decide the verdict. VERIFIED before this fix:
+# `<testsuite tests="5"></testsuite>` plus a good log EXITED 0 and printed
+# "5 test(s), 0 failures, 0 errors". That directly contradicted
+# `_QdcResultsError`'s own docstring, which says the exception exists for a
+# report "missing the attributes a JUnit report always carries".
+# ==============================================================================
+
+
+@pytest.mark.parametrize("xml", [
+    '<testsuite tests="5"></testsuite>',
+    '<testsuite tests="5" errors="0" skipped="0"></testsuite>',        # no failures
+    '<testsuite tests="5" failures="0" skipped="0"></testsuite>',      # no errors
+    '<testsuite tests="5" failures="0" errors="0"></testsuite>',       # no skipped
+    '<testsuite failures="0" errors="0" skipped="0"></testsuite>',     # no tests
+])
+def test_a_results_xml_missing_any_count_attribute_is_a_failure(
+    monkeypatch, tmp_path, capsys, xml
+):
+    _stub_build_submit_and_wait(monkeypatch)
+    paths = _fake_fetch(
+        tmp_path, results_xml=xml, extra_logs={"hexlib_selftest.log": GOOD_LOG}
+    )
+    monkeypatch.setattr(job, "fetch", lambda job_id, dest: paths)
+    rc = cli._qdc_submit(_args(tmp_path))
+    assert rc != 0, f"{xml} must not be read as a clean report"
+    assert "attribute" in capsys.readouterr().err.lower()
+
+
+@pytest.mark.parametrize("attr", ["tests", "failures", "errors", "skipped"])
+def test_parse_refuses_a_suite_missing_any_required_attribute(tmp_path, attr):
+    attrs = {"tests": "5", "failures": "0", "errors": "0", "skipped": "0"}
+    del attrs[attr]
+    body = " ".join(f'{k}="{v}"' for k, v in attrs.items())
+    p = tmp_path / "results.xml"
+    p.write_text(f"<testsuite {body}></testsuite>")
+    with pytest.raises(cli._QdcResultsError, match=attr):
+        cli._qdc_parse_results_xml(str(p))
+
+
+def test_parse_refuses_a_missing_attribute_on_a_later_suite_too(tmp_path):
+    """Summing across a <testsuites> wrapper must not let a well-formed first
+    suite cover for a malformed second one."""
+    p = tmp_path / "results.xml"
+    p.write_text(
+        "<testsuites>"
+        '<testsuite tests="2" failures="0" errors="0" skipped="0"></testsuite>'
+        '<testsuite tests="3" errors="0" skipped="0"></testsuite>'
+        "</testsuites>"
+    )
+    with pytest.raises(cli._QdcResultsError, match="failures"):
+        cli._qdc_parse_results_xml(str(p))
+
+
+# ==============================================================================
+# NEGATIVE AND ZERO COUNTS.
+#
+# `if tests == 0` was the whole bound. VERIFIED before this fix:
+# `<testsuite tests="-1" failures="0" errors="0">` plus a good log EXITED 0 and
+# printed "-1 test(s)".
+# ==============================================================================
+
+
+@pytest.mark.parametrize("xml", [
+    '<testsuite tests="-1" failures="0" errors="0" skipped="0"></testsuite>',
+    '<testsuite tests="5" failures="-1" errors="0" skipped="0"></testsuite>',
+    '<testsuite tests="5" failures="0" errors="-2" skipped="0"></testsuite>',
+    '<testsuite tests="5" failures="0" errors="0" skipped="-1"></testsuite>',
+])
+def test_a_negative_count_anywhere_is_a_failure(monkeypatch, tmp_path, capsys, xml):
+    _stub_build_submit_and_wait(monkeypatch)
+    paths = _fake_fetch(
+        tmp_path, results_xml=xml, extra_logs={"hexlib_selftest.log": GOOD_LOG}
+    )
+    monkeypatch.setattr(job, "fetch", lambda job_id, dest: paths)
+    assert cli._qdc_submit(_args(tmp_path)) != 0, f"{xml} must not read as a pass"
+
+
+def test_parse_refuses_a_negative_count(tmp_path):
+    p = tmp_path / "results.xml"
+    p.write_text('<testsuite tests="-1" failures="0" errors="0" skipped="0"></testsuite>')
+    with pytest.raises(cli._QdcResultsError, match="NEGATIVE"):
+        cli._qdc_parse_results_xml(str(p))
+
+
+# ==============================================================================
+# THE PARSER STRICTNESS IS CHECKED AGAINST A REPORT PYTEST ACTUALLY WROTE.
+#
+# Requiring all four attributes is only safe if the producer really emits all
+# four. Rather than assert that from memory, this runs pytest's own --junitxml
+# and reads the result back: if a future pytest stops emitting one of them,
+# this fails HERE (with a report in hand) instead of the device gate refusing
+# every genuine results.xml after the minutes are spent.
+# ==============================================================================
+
+
+def test_a_real_pytest_junitxml_carries_all_four_counts_and_parses(tmp_path):
+    import subprocess
+    import sys
+    import xml.etree.ElementTree as ET
+
+    probe = tmp_path / "test_probe.py"
+    probe.write_text(
+        "import pytest\n"
+        "def test_pass(): pass\n"
+        '@pytest.mark.skip(reason="probe")\n'
+        "def test_skipped(): pass\n"
+    )
+    xml_path = tmp_path / "results.xml"
+    subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         f"--junitxml={xml_path}", str(probe)],
+        cwd=str(tmp_path), capture_output=True, text=True,
+    )
+    assert xml_path.is_file(), "pytest wrote no junitxml at all"
+
+    root = ET.parse(str(xml_path)).getroot()
+    suite = root if root.tag == "testsuite" else root.find("testsuite")
+    for attr in cli._REQUIRED_SUITE_ATTRS:
+        assert suite.get(attr) is not None, (
+            f"pytest's own --junitxml did not emit {attr!r} -- cli.py requires "
+            "it, so this is the check that must fail, not the device gate "
+            "after the minutes are spent"
+        )
+
+    counts = cli._qdc_parse_results_xml(str(xml_path))
+    assert counts.tests == 2
+    assert counts.skipped == 1
+    assert (counts.failures, counts.errors) == (0, 0)
+
+
+# ==============================================================================
+# THE WAIT CAP COMES FROM THE JOB'S OWN TIMEOUT, AND A TIMEOUT FETCHES LOGS.
+#
+# `job.wait(job_id)` was called with no cap_s, taking job.py's 1800 s default
+# while `submit()` accepts 240 minutes. Scenario: `--timeout-min 60` on a job
+# that legitimately finishes at 35 minutes -- at 30 minutes the CLI printed
+# "produced no results.xml within the wait cap", exited 1, and downloaded ZERO
+# log files. The minutes were spent, the results.xml that appeared five minutes
+# later was never fetched, and the operator had nothing to diagnose from.
+# ==============================================================================
+
+
+def test_the_wait_cap_is_derived_from_the_jobs_own_timeout(monkeypatch, tmp_path):
+    seen = {}
+
+    def recording_wait(job_id, **kw):
+        seen.update(kw)
+        return True
+
+    _stub_build_submit_and_wait(monkeypatch)
+    monkeypatch.setattr(job, "wait", recording_wait)
+    paths = _fake_fetch(
+        tmp_path,
+        results_xml='<testsuite tests="4" failures="0" errors="0" skipped="0"></testsuite>',
+        extra_logs={"hexlib_selftest.log": GOOD_LOG},
+    )
+    monkeypatch.setattr(job, "fetch", lambda job_id, dest: paths)
+    assert cli._qdc_submit(_args(tmp_path, timeout_min=60)) == 0
+    assert seen.get("cap_s", 0) >= 60 * 60, (
+        "the wait cap must be at least the job's own timeout -- 1800s against "
+        f"a 60-minute job abandons it half way; got {seen}"
+    )
+
+
+def test_the_wait_cap_covers_the_largest_timeout_submit_accepts():
+    from hexlib.device.qdc import job as jobmod
+
+    assert cli._qdc_wait_cap_s(jobmod.MAX_TIMEOUT_MIN) > jobmod.MAX_TIMEOUT_MIN * 60
+    assert cli._qdc_wait_cap_s(1) > 60
+
+
+def test_a_wait_timeout_still_fetches_whatever_logs_exist(monkeypatch, tmp_path, capsys):
+    """A timeout that discards the evidence is worse than one that waits. The
+    minutes are already spent; the partial logs are all the operator has."""
+    _stub_build_submit_and_wait(monkeypatch)
+    monkeypatch.setattr(job, "wait", lambda job_id, **kw: False)
+    fetched = []
+    paths = _fake_fetch(tmp_path, results_xml=None,
+                        extra_logs={"logcat.txt": "some device noise\n"})
+
+    def recording_fetch(job_id, dest):
+        fetched.append(dest)
+        return paths
+
+    monkeypatch.setattr(job, "fetch", recording_fetch)
+    rc = cli._qdc_submit(_args(tmp_path, timeout_min=60))
+    assert rc != 0, "no results.xml within the cap is a failure, never a pass"
+    assert fetched, (
+        "the timeout branch downloaded ZERO log files before giving up -- the "
+        "minutes are spent and this is the only evidence there is"
+    )
+    err = capsys.readouterr().err
+    assert "results.xml" in err
+    assert "1 log file" in err
+
+
+def test_a_wait_timeout_whose_log_fetch_also_fails_still_fails_cleanly(
+    monkeypatch, tmp_path, capsys
+):
+    """Best-effort means best-effort: the fetch blowing up on the giving-up
+    path must not turn an exit-1 into a traceback."""
+    _stub_build_submit_and_wait(monkeypatch)
+    monkeypatch.setattr(job, "wait", lambda job_id, **kw: False)
+
+    def boom_fetch(job_id, dest):
+        raise job.QdcError("QDC refused the log listing")
+
+    monkeypatch.setattr(job, "fetch", boom_fetch)
+    rc = cli._qdc_submit(_args(tmp_path, timeout_min=20))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "results.xml" in err
+    assert "QDC refused the log listing" in err
+
+
+def test_a_fetch_failure_on_the_happy_path_is_a_failure_never_a_pass(
+    monkeypatch, tmp_path, capsys
+):
+    _stub_build_submit_and_wait(monkeypatch)
+
+    def boom_fetch(job_id, dest):
+        raise job.QdcError("connection reset while downloading")
+
+    monkeypatch.setattr(job, "fetch", boom_fetch)
+    rc = cli._qdc_submit(_args(tmp_path))
+    assert rc != 0
+    assert "fetch" in capsys.readouterr().err.lower()
+
+
+# ==============================================================================
+# `_qdc_submit` READS args.kernel. It is the function that spends the minutes,
+# and it is reachable without going through `_cmd_test_qdc`'s guards at all --
+# this file's own `_args` used to prove that by omitting `kernel` entirely.
+# ==============================================================================
+
+
+@pytest.mark.parametrize("kernel", ["add_fp16", "kernels/rmsnorm_fp16", "", None])
+def test_qdc_submit_refuses_a_kernel_stage_three_cannot_run(
+    monkeypatch, tmp_path, capsys, kernel
+):
+    def boom_build(build_dir, sdk_root=None):
+        raise AssertionError("the device build must not start for a bad kernel")
+
+    monkeypatch.setattr(runtime_build, "build_device_binary", boom_build)
+    rc = cli._qdc_submit(_args(tmp_path, kernel=kernel))
+    assert rc == 2
+    assert "scale_fp16" in capsys.readouterr().err
+
+
+def test_qdc_submit_refuses_an_args_object_with_no_kernel_attribute(
+    monkeypatch, tmp_path, capsys
+):
+    """The exact shape this file used to pass in. A missing attribute is a
+    refusal, not a default."""
+    def boom_build(build_dir, sdk_root=None):
+        raise AssertionError("the device build must not start for a bad kernel")
+
+    monkeypatch.setattr(runtime_build, "build_device_binary", boom_build)
+    args = argparse.Namespace(out=str(tmp_path / "out"), timeout_min=5, yes=False)
+    assert cli._qdc_submit(args) == 2
+    assert "scale_fp16" in capsys.readouterr().err

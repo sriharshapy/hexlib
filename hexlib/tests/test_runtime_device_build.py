@@ -52,6 +52,34 @@ def test_ndk_clang_uses_the_cmd_wrapper_on_windows():
         assert not p.endswith(".cmd"), p
 
 
+def test_the_aarch64_host_link_treats_warnings_as_errors():
+    """The Hexagon side gets -Wall -Werror from tc.HVX_CFLAGS; this aarch64
+    link builds its own command line, so it needs them spelled out here or the
+    host half of the wire (host/*.c, which assembles the batch blob and the
+    buffer table by hand) keeps compiling with its diagnostics discarded --
+    every caller of tc.run decides success from `rc != 0` alone.
+
+    Source-text rather than behavioural because building hexlib_run needs the
+    SDK and the NDK, and this must fail on a machine with neither. Comment
+    lines are excluded for the same reason
+    test_runtime_sim_build.py's -fpic check excludes them: the flag appears in
+    this function's own explanatory comment, and a `re.search` over the whole
+    body would keep passing after the real flag was deleted.
+    """
+    import inspect
+    import re
+
+    live = [
+        ln for ln in inspect.getsource(rb.build_device_binary).splitlines()
+        if not ln.strip().startswith("#")
+    ]
+    joined = "\n".join(live)
+    assert re.search(r'cmd\s*=\s*\[clang[^\]]*"-Werror"', joined), (
+        "build_device_binary no longer passes -Werror to the aarch64 clang"
+    )
+    assert '"-Wall"' in joined
+
+
 def test_device_skel_link_flags_are_the_dll_recipe_not_the_sim_one():
     """Recovered from the SDK's OWN defines_hexagon_1_9.min DLL_LD_FLAGS, a
     DIFFERENT recipe from SIM_SO_LINK_FLAGS -- the distinguishing content is
