@@ -263,3 +263,68 @@ def test_layernorm_reaches_the_kernel_with_its_dimensions_and_eps_intact(backend
     assert np.allclose(y_huge.astype(np.float32),
                        _ln_reference(x, w, b, 4.0).astype(np.float32),
                        atol=2e-3), "eps=4.0 did not match the reference"
+
+
+# ---------------------------------------------------------------------------
+# The host's own fd-patch loop, bounded
+# ---------------------------------------------------------------------------
+#
+# `run_raw` exists so a bad magic, a truncated blob or an unknown op kind
+# exercises the DSP'S OWN validation. That makes n_bufs and off_bufs untrusted
+# BY DESIGN on this path -- and simhost.c's fd-patch loop read both straight
+# out of the blob and wrote 24 bytes per iteration into a fixed 64 KiB static
+# array BEFORE `hexlib_iface_invoke` handed them to the code that validates
+# them. So the two tests below could not have reported what they claim to:
+# they would have crashed hexagon-sim inside the host, and a crash is not the
+# DSP refusing anything.
+#
+# skel_dispatch.c has always validated these fields correctly, and main.c does
+# on the device path. The asymmetry was the defect.
+
+_HDR_I_N_BUFS = 3       # struct order in wire._HDR: magic, version, total,
+_HDR_I_OFF_BUFS = 6     # n_bufs, n_tensors, n_ops, off_bufs, ...
+
+
+def _patch_hdr_word(blob: bytes, index: int, value: int) -> bytes:
+    out = bytearray(blob)
+    out[index * 4:(index + 1) * 4] = int(value).to_bytes(4, "little")
+    return bytes(out)
+
+
+@sdk
+def test_an_out_of_range_off_bufs_is_refused_by_the_dsp_not_by_a_host_crash(backend):
+    """off_bufs=0xFFFFFF00 with n_bufs=1 -- a ~4 GiB out-of-range write.
+
+    The point is WHICH LAYER SAYS NO. Getting a status back at all means the
+    host survived long enough to invoke, and `ERR_TRUNCATED` is the skel's own
+    section-bounds check (`off_bufs + n_bufs * sizeof(buf_desc) > len`, widened
+    to 64-bit so a large n_bufs cannot wrap it). Before the bound in simhost.c
+    this was `memcpy(g_batch + 0xFFFFFF00, &b, 24)` and the run died with an
+    opaque simulator failure instead.
+    """
+    blob = backend.build_batch("scale", N, FACTOR)
+    res = backend.run_raw(_patch_hdr_word(blob, _HDR_I_OFF_BUFS, 0xFFFFFF00))
+    assert res.status == dspmod.wire.STATUS["ERR_TRUNCATED"], (
+        f"expected the skel's own TRUNCATED refusal, got "
+        f"{dspmod.wire.STATUS_NAME.get(res.status, res.status)}"
+    )
+
+
+@sdk
+def test_an_enormous_n_bufs_is_refused_by_the_dsp_not_by_a_host_crash(backend):
+    """n_bufs=0x01000000 with off_bufs left valid -- 384 MiB of forward walk.
+
+    The other shape, and the one that does NOT trip the section-bounds check
+    first: the skel answers `ERR_INVAL_PARAMS` from `n_bufs > HEXLIB_MAX_BUFS`.
+    Before the bound, simhost's loop would have stepped 24 bytes at a time over
+    g_rsp and the skel's own static bufs[]/tens[] on the way there.
+    """
+    blob = backend.build_batch("scale", N, FACTOR)
+    res = backend.run_raw(_patch_hdr_word(blob, _HDR_I_N_BUFS, 0x01000000))
+    assert res.status in (
+        dspmod.wire.STATUS["ERR_INVAL_PARAMS"],
+        dspmod.wire.STATUS["ERR_TRUNCATED"],
+    ), (
+        f"expected the skel to refuse the buffer count, got "
+        f"{dspmod.wire.STATUS_NAME.get(res.status, res.status)}"
+    )
