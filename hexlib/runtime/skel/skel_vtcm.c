@@ -50,7 +50,18 @@ int hexlib_vtcm_alloc(struct hexlib_ctx *ctx) {
      * is not available we fail rather than silently accepting less. */
     HAP_compute_res_attr_set_vtcm_param_v2(&attr, vtcm_size, 0, 0);
     HAP_compute_res_attr_set_release_callback(&attr, release_callback, (void *) ctx);
-    HAP_compute_res_attr_set_hmx_param(&attr, 1);
+    /* CONDITIONAL ON THE SESSION ACTUALLY ASKING FOR HMX. `ctx->n_hmx` is set
+     * by hexlib_iface_start() (skel.c) before this function ever runs; no
+     * kernel on this branch requests HMX, so hexlib_open (session.c) always
+     * passes n_hmx = 0. Requesting HMX unconditionally here, regardless of
+     * that, risked the CDSP refusing the whole compute-res reservation for an
+     * HMX-availability reason that HAP_compute_res_acquire's single status
+     * code cannot distinguish from a VTCM-size failure -- the operator would
+     * see a VTCM error for what was actually an HMX one. REVISIT THIS when an
+     * HMX kernel first lands: this parameter is not requested at all today. */
+    if (ctx->n_hmx > 0) {
+        HAP_compute_res_attr_set_hmx_param(&attr, 1);
+    }
 
     uint32_t rctx = HAP_compute_res_acquire(&attr, 1000000);
     if (!rctx) {

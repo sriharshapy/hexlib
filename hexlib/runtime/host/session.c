@@ -25,6 +25,21 @@
  * The two must agree -- disagreement means the wrong skel .so is loaded for
  * this part, a version-skew bug, not a hardware fact -- so hexlib_open
  * fails rather than proceeding on a mismatched measurement.
+ *
+ * THE TWO SIDES ARE IN DIFFERENT ENCODINGS -- DECODE, NEVER COMPARE RAW.
+ * `arch` (skel hwinfo) is plain decimal: __HEXAGON_ARCH__ is 75 on the
+ * measured target (see skel.c, test_dsp_sim.py). `caps.arch_ver` (driver
+ * ARCH_VER) is NOT the same number in the same base: on the identical part
+ * it reads 35957 = 0x8c75 (see device/qdc/test_on_device.py, job.py's own
+ * measured-facts header). The low byte packs the arch as two BCD digits --
+ * 0x75 means digits 7 and 5, i.e. 75, not the integer 0x75 = 117 and
+ * certainly not 35957. Comparing the raw values, as an earlier draft of
+ * this file did, is unconditionally false for every real device: no session
+ * could ever open. `hexlib_decode_bcd_arch` below does the same decode
+ * llama.cpp's `htpdrv_get_arch` does (ggml-hexagon/htp-drv.cpp:412-413, MIT;
+ * see ATTRIBUTION.md) -- `val = arch_ver & 0xff; arch = (val >> 4) * 10 +
+ * (val & 0x0f)` -- and hexlib_open compares ITS output against `arch`, never
+ * `caps.arch_ver` directly.
  */
 #include "hexlib_host.h"
 
@@ -89,6 +104,21 @@ static int enable_unsigned_pd(int domain) {
                 "hexlib: DSPRPC_CONTROL_UNSIGNED_MODULE failed (rc %d)\n", rc);
     }
     return rc;
+}
+
+/* Pure BCD-nibble decode of the driver's ARCH_VER capability -- byte-for-byte
+ * ported from llama.cpp's htpdrv_get_arch (ggml-hexagon/htp-drv.cpp:412-413,
+ * MIT; see ATTRIBUTION.md). ARCH_VER's low byte packs the arch as two BCD
+ * digits (0x8c75 -> low byte 0x75 -> nibbles 7 and 5 -> 75), not the plain
+ * integer __HEXAGON_ARCH__ encodes -- see this file's own header comment for
+ * why comparing the raw values can never agree. Kept as its own pure
+ * function (no I/O, no globals, no side effects) so it can be extracted and
+ * unit-tested directly against the one measured value this project has on
+ * record (0x8c75 -> 75) rather than only asserted by source pattern -- see
+ * hexlib/tests/test_session_arch_decode.py. */
+static uint32_t hexlib_decode_bcd_arch(uint32_t arch_ver) {
+    uint32_t val = arch_ver & 0xff;
+    return (val >> 4) * 10 + (val & 0x0f);
 }
 
 int hexlib_open(hexlib_ctx **out, int domain) {
@@ -174,12 +204,20 @@ int hexlib_open(hexlib_ctx **out, int domain) {
     /* CROSS-CHECK: the arch the DRIVER reports (queried above, from the CDSP
      * firmware itself) against the arch the SKEL reports (what THIS .so was
      * compiled for). See the file header -- disagreement is a version-skew
-     * bug and must fail, not merely log. */
-    if (arch != caps.arch_ver) {
+     * bug and must fail, not merely log.
+     *
+     * THE DRIVER'S VALUE IS DECODED FIRST -- see hexlib_decode_bcd_arch()
+     * and this file's own header comment. Comparing `arch` against
+     * `caps.arch_ver` directly (its raw, BCD-packed encoding) would be
+     * unconditionally false on every real device -- e.g. 75 != 35957 -- and
+     * every session would refuse before measuring anything. */
+    uint32_t driver_arch = hexlib_decode_bcd_arch(caps.arch_ver);
+    if (arch != driver_arch) {
         fprintf(stderr,
-                "hexlib: arch mismatch -- driver ARCH_VER reports %u, skel "
-                "hwinfo reports %u; refusing to run a mismatched binary\n",
-                caps.arch_ver, arch);
+                "hexlib: arch mismatch -- driver ARCH_VER raw=%u (0x%04x) "
+                "decodes to %u, skel hwinfo reports %u; refusing to run a "
+                "mismatched binary\n",
+                caps.arch_ver, caps.arch_ver, driver_arch, arch);
         hexlib_iface_stop(ctx->handle);
         hexlib_iface_close(ctx->handle);
         free(ctx);

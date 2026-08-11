@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import xml.etree.ElementTree as ET
 
 from hexlib import kerneldir as kd
 from hexlib.graph.plan import V75_VTCM_TOTAL_BYTES
@@ -25,6 +26,16 @@ DEVICES = ("sim", "local", "qdc")
 # therefore carries `--yes`), and above job.py's own docstring example of "a
 # single, cheap, short-timeout dry run."
 _QDC_YES_THRESHOLD_MIN = 15
+
+# The two measurement strings a genuinely successful device run must have
+# produced -- read directly out of hexlib/runtime/host/main.c (run_self_test's
+# own printf calls), never guessed. A results.xml that parses clean with
+# zero failures is NOT enough on its own: this project's own named failure
+# mode is a job that completed having run (or measured) nothing at all, and
+# a clean JUnit report with no measurements behind it is exactly that shape
+# of success again, one level up. See _qdc_submit's post-parse check below.
+_SELFTEST_PASS_MARKER = "hexlib: --self-test: PASS"
+_CYCLES_TOTAL_MARKER = "cycles_total="
 
 # The operator's own account budget, in minutes -- read from the environment,
 # exactly the way job.py reads QDC_API_KEY, because it is personal and this
@@ -102,6 +113,139 @@ def _qdc_submit(args) -> int:
     log_dir = os.path.join(args.out, "qdc_logs")
     paths = job.fetch(job_id, log_dir)
     print(f"fetched {len(paths)} log file(s) to {log_dir}")
+
+    return _qdc_check_results(job_id, paths)
+
+
+class _QdcResultsError(Exception):
+    """Raised by `_qdc_parse_results_xml` for any results.xml that must not
+    be treated as a pass -- unparseable, or missing the attributes a JUnit
+    report always carries. Caught by `_qdc_check_results`, never allowed to
+    propagate past `_qdc_submit`."""
+
+
+def _qdc_parse_results_xml(path: str) -> tuple[int, int, int]:
+    """Parse a JUnit-style results.xml and return `(tests, failures,
+    errors)` summed across every `<testsuite>` element -- the root may be a
+    single `<testsuite>` (as pytest emits by default) or a `<testsuites>`
+    wrapping several. Raises `_QdcResultsError` on anything that is not a
+    genuinely parseable report with real counts on it -- a truncated or
+    non-XML file, or a `<testsuites>`/`<testsuite>` tree with no testsuite
+    elements at all -- so the caller never has to guess whether "zero"
+    means "ran zero tests" or "could not even find the count".
+    """
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as e:
+        raise _QdcResultsError(f"{path} did not parse as XML: {e}") from e
+
+    if root.tag == "testsuite":
+        suites = [root]
+    else:
+        suites = root.findall(".//testsuite")
+    if not suites:
+        raise _QdcResultsError(
+            f"{path} contains no <testsuite> element -- not a JUnit report "
+            "this project recognizes"
+        )
+
+    tests = failures = errors = 0
+    for suite in suites:
+        try:
+            tests += int(suite.get("tests", "0"))
+            failures += int(suite.get("failures", "0"))
+            errors += int(suite.get("errors", "0"))
+        except ValueError as e:
+            raise _QdcResultsError(
+                f"{path} has a non-integer tests/failures/errors attribute: {e}"
+            ) from e
+    return tests, failures, errors
+
+
+def _qdc_check_results(job_id: int, paths: list[str]) -> int:
+    """The parse `job.wait`/`job.fetch` never do. A device job whose
+    TestLogs/results.xml merely *exists* proves nothing on its own -- this
+    project's own named failure mode is a job that completed having run (or
+    measured) NOTHING and still reported passing. Every one of the following
+    must hold before this returns 0, each with its own distinct message so a
+    real failure is diagnosable from which check tripped:
+
+      - a results.xml was actually fetched, and it PARSES as XML;
+      - it reports `tests > 0` -- zero tests is a failure, never a pass;
+      - `failures == 0` and `errors == 0`;
+      - the fetched logs actually CONTAIN the measurement lines
+        `hexlib_run` itself prints on a genuine pass (`cycles_total=` and
+        the `--self-test` PASS line, both read directly out of main.c) --
+        a clean JUnit report with none of hexlib's own evidence behind it
+        is exactly the "success constructible with zero measurements in
+        it" shape this check exists to rule out.
+    """
+    results_path = next(
+        (p for p in paths if os.path.basename(p) == "results.xml"), None
+    )
+    if results_path is None:
+        print(
+            f"error: job {job_id}: results.xml was not among the fetched log "
+            "files -- a job with no results is a failure, never a pass",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        tests, failures, errors = _qdc_parse_results_xml(results_path)
+    except _QdcResultsError as e:
+        print(
+            f"error: job {job_id}: could not parse results.xml as a JUnit "
+            f"report -- a truncated or unparseable results file is a "
+            f"failure, never a pass: {e}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if tests == 0:
+        print(
+            f"error: job {job_id}: results.xml reports 0 tests -- a job "
+            "that ran no tests is a failure, never a pass",
+            file=sys.stderr,
+        )
+        return 1
+
+    if failures != 0 or errors != 0:
+        print(
+            f"error: job {job_id}: results.xml reports {failures} failure(s) "
+            f"and {errors} error(s) across {tests} test(s)",
+            file=sys.stderr,
+        )
+        return 1
+
+    combined = ""
+    for p in paths:
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                combined += f.read()
+        except OSError:
+            continue
+
+    missing = [
+        marker
+        for marker in (_CYCLES_TOTAL_MARKER, _SELFTEST_PASS_MARKER)
+        if marker not in combined
+    ]
+    if missing:
+        print(
+            f"error: job {job_id}: results.xml reports {tests} test(s) with "
+            "no failures, but the fetched logs are missing the expected "
+            f"measurement line(s): {', '.join(missing)!r} -- a pass with no "
+            "measurements behind it is the exact failure mode this check "
+            "exists to rule out",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(
+        f"job {job_id}: {tests} test(s), 0 failures, 0 errors, "
+        "measurement lines present"
+    )
     return 0
 
 

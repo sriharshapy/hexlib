@@ -181,14 +181,47 @@ def test_arch_is_queried_from_the_driver_not_assumed(session):
     """hexlib_query_caps must actually issue the ARCH_VER / DSPRPC_GET_DSP_INFO
     query (function-scoped, not just present in the file), and hexlib_open
     must cross-check that value against what the skel itself reports, failing
-    on disagreement rather than trusting either side alone."""
+    on disagreement rather than trusting either side alone.
+
+    THE DECODE ITSELF IS PINNED HERE, NOT JUST THE COMPARISON. `arch` (skel
+    hwinfo, plain decimal, e.g. 75) and `caps.arch_ver` (driver ARCH_VER, BCD
+    nibble-packed, e.g. 0x8c75 = 35957) are in different encodings --
+    comparing them raw is unconditionally false on every real device (see
+    session.c's own file header). A test that only checked "a comparison and
+    a `return -1` exist" could not see that the two operands were
+    incommensurable; that is exactly the shape of the bug this pins. See
+    test_session_arch_decode.py for a genuine, compiled-and-run behavioural
+    test of the same decode function against the one measured value
+    (0x8c75 -> 75)."""
     caps_body = _function_body(session, "hexlib_query_caps")
     assert "ARCH_VER" in caps_body
     assert "DSPRPC_GET_DSP_INFO" in caps_body
 
+    decode_body = _function_body(session, "hexlib_decode_bcd_arch")
+    assert re.search(r">>\s*4", decode_body), "must extract the high BCD nibble"
+    assert re.search(r"\*\s*10", decode_body), "must weight the high nibble by 10"
+    assert re.search(r"&\s*0x0f\b", decode_body), "must extract the low BCD nibble"
+
     open_body = _function_body(session, "hexlib_open")
-    mismatch = re.search(r"arch\s*!=\s*caps\.arch_ver", open_body)
+    decode_call = re.search(
+        r"hexlib_decode_bcd_arch\s*\(\s*caps\.arch_ver\s*\)", open_body
+    )
+    assert decode_call, (
+        "hexlib_open must decode caps.arch_ver through hexlib_decode_bcd_arch "
+        "before comparing it against the skel's arch -- comparing the raw "
+        "ARCH_VER directly against __HEXAGON_ARCH__ can never agree "
+        "(0x8c75 != 75) and would refuse every device session unconditionally"
+    )
+    mismatch = re.search(r"arch\s*!=\s*\w+", open_body)
     assert mismatch, "hexlib_open must cross-check driver arch against skel arch"
+    assert not re.search(r"arch\s*!=\s*caps\.arch_ver\b", open_body), (
+        "hexlib_open must never compare the skel's arch against the raw, "
+        "undecoded caps.arch_ver"
+    )
+    assert mismatch.start() > decode_call.start(), (
+        "the decoded value, not the raw caps.arch_ver, must be what gets "
+        "compared against arch"
+    )
     mismatch_block = _block_from(open_body, mismatch.end())
     assert re.search(r"return\s+-1\s*;", mismatch_block), (
         "an arch mismatch must actually fail hexlib_open from inside its own "
@@ -449,6 +482,42 @@ def test_coherency_miss_has_its_own_distinct_exit_code(main):
     assert re.search(r"HEXLIB_EXIT_COHERENCY_MISS\s*=\s*6", main)
     body = _function_body(main, "run_coherency_check")
     assert "exit_code = HEXLIB_EXIT_COHERENCY_MISS;" in body
+
+
+def test_coherency_check_treats_negative_zero_as_the_expected_zero_result(main):
+    """`x * 0.0f` is -0.0, not +0.0, whenever `x` is negative -- true of many
+    lanes of the self-test's own input -- and there is no -ffast-math here
+    (toolchain.py) to make that not so. A bit-exact compare of the read-back
+    buffer against `(__fp16) 0.0f` would misclassify that HEALTHY result as
+    "sentinel unchanged" and report a coherency miss that never happened.
+    The classification must use a magnitude comparison (fabsf) instead."""
+    body = _function_body(main, "run_coherency_check")
+    assert "fabsf(" in body, (
+        "the expected-zero classification must compare MAGNITUDE (fabsf), "
+        "not bit-exact equality against +0.0 -- see this function's own "
+        "header comment on why -0.0 must count as zero"
+    )
+    assert not re.search(r"memcmp\(&yr\[i\],\s*&zero\b", body), (
+        "must not have regressed to a bit-exact memcmp against a literal "
+        "zero for the expected-result check"
+    )
+
+
+def test_coherency_check_verifies_the_surviving_bytes_are_really_the_sentinel(main):
+    """A buffer that is neither the expected zero result nor the intact
+    sentinel (garbled, or partially written) must not be folded into the
+    'sentinel_unchanged' / coherency-miss verdict just because it failed the
+    zero check -- it is a third, distinct outcome and must be its own
+    branch with its own exit code."""
+    body = _function_body(main, "run_coherency_check")
+    assert re.search(r"memcmp\(&yr\[i\],\s*&sentinel\b", body), (
+        "the surviving bytes must be compared, bit-exact, against the real "
+        "COHERENCY_SENTINEL value -- not merely assumed to be the sentinel "
+        "because they were not zero"
+    )
+    assert "HEXLIB_EXIT_COHERENCY_GARBLED" in main
+    assert "exit_code = HEXLIB_EXIT_COHERENCY_GARBLED;" in body
+    assert '"COHERENCY buffer_garbled\\n"' in body
 
 
 def test_coherency_check_documents_its_own_scope_limits(main):

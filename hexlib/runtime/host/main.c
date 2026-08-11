@@ -37,6 +37,8 @@
 #include <remote.h>
 #include <rpcmem.h>         /* RPCMEM_HEAP_ID_SYSTEM / RPCMEM_DEFAULT_FLAGS,
                              * for the same reason as above. */
+#include <math.h>           /* fabsf -- --coherency-check must treat -0.0 as
+                             * zero; see run_coherency_check()'s own header. */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,12 +60,27 @@
 /* --coherency-check's two constants -- see run_coherency_check()'s own
  * header comment for why each one is what it is. */
 #define COHERENCY_SENTINEL 1.0f     /* Any nonzero, finite fp16 value works;
-                                     * the expected result is bit-exact zero,
-                                     * so this can never be confused with it. */
-#define COHERENCY_FACTOR   0.0f     /* x * 0.0 is bit-exact zero in fp16 for
-                                     * any finite, non-NaN x -- no numerically
-                                     * ambiguous case, so a wrong result here
-                                     * cannot be blamed on kernel arithmetic. */
+                                     * the expected result is bit-exact zero
+                                     * IN MAGNITUDE, so this can never be
+                                     * confused with it. See
+                                     * run_coherency_check()'s own header on
+                                     * why "zero" must be checked by
+                                     * magnitude (fabsf), not bit-exact
+                                     * equality against +0.0. */
+#define COHERENCY_FACTOR   0.0f     /* x * 0.0 is zero in fp16 for any finite,
+                                     * non-NaN x -- no numerically ambiguous
+                                     * case, so a wrong result here cannot be
+                                     * blamed on kernel arithmetic. NOT
+                                     * necessarily +0.0, though: IEEE-754
+                                     * negative-zero rules mean x * 0.0 is
+                                     * -0.0 (sign bit set, 0x8000) whenever x
+                                     * is negative, which the self-test's own
+                                     * input (`x[i] = ((i % 17) - 8) * 0.5f`,
+                                     * negative for many i) genuinely is. A
+                                     * bit-exact compare against `(__fp16)
+                                     * 0.0f` would then read a HEALTHY result
+                                     * as "sentinel unchanged" and misreport a
+                                     * coherency miss that never happened. */
 
 enum {
     HEXLIB_EXIT_OK             = 0,
@@ -77,6 +94,14 @@ enum {
                                        * dispatch bug or a real coherency miss;
                                        * see run_coherency_check()'s printed
                                        * cycles_total to tell which. */
+    HEXLIB_EXIT_COHERENCY_GARBLED = 7, /* --coherency-check: status OK, op OK,
+                                        * but the output buffer is neither the
+                                        * expected zero result NOR the intact
+                                        * sentinel -- a THIRD outcome (garbled
+                                        * or partially-written buffer) that
+                                        * must never be folded into a
+                                        * coherency-miss claim; see
+                                        * run_coherency_check()'s own header. */
 };
 
 static void usage(const char *argv0) {
@@ -508,6 +533,32 @@ static int run_self_test(int unmapped) {
  * from stdout alone -- never just "the bad thing is absent" (see this
  * file's project-wide discipline on that, stated in the header above main()).
  *
+ * "SENTINEL INTACT" IS NOT A BIT-COMPARE AGAINST +0.0, AND IT IS A REAL
+ * CHECK OF THE SENTINEL'S BYTES, NOT JUST "NOT EXACTLY ZERO". Two defects
+ * were found here and both are fixed the same way: by classifying every
+ * lane of `y` on read-back, rather than testing a single condition.
+ *
+ *   1. "The expected result is zero" was checked as `memcmp` against
+ *      `(__fp16) 0.0f`. But COHERENCY_FACTOR is 0.0f and the self-test's own
+ *      input is negative for many lanes (`x[i] = ((i % 17) - 8) * 0.5f`), and
+ *      IEEE-754 makes `x * 0.0f` equal to -0.0 (0x8000) whenever `x` is
+ *      negative -- there is no -ffast-math here (toolchain.py) to paper over
+ *      that. A bit-exact compare against +0.0 therefore read HEALTHY
+ *      hardware as "sentinel unchanged" and reported a coherency miss that
+ *      never happened. Fixed by comparing MAGNITUDE (`fabsf`), which is
+ *      true of -0.0 and +0.0 alike and is the only thing "the write reached
+ *      the host and reads as zero" actually claims.
+ *   2. The code never verified the surviving bytes were genuinely the
+ *      SENTINEL before calling them "unchanged" -- a garbled or
+ *      partially-written buffer (neither the expected zero nor the intact
+ *      sentinel) would fall through to the same "sentinel_unchanged" /
+ *      COHERENCY_MISS verdict as a real miss, misattributing a THIRD, worse
+ *      failure mode to this one specific diagnosis. Fixed by requiring an
+ *      exact bit-compare against COHERENCY_SENTINEL before calling anything
+ *      "unchanged"; a buffer that is neither all-zero-magnitude nor all-
+ *      sentinel prints its own distinct verdict (`buffer_garbled`,
+ *      HEXLIB_EXIT_COHERENCY_GARBLED) instead of being folded into either.
+ *
  * WHAT THIS DOES NOT PROVE -- DO NOT READ MORE INTO A PASS THAN THIS.
  * This exercises only the DSP-write -> host-read direction (the DSP writes
  * `y`, the CPU reads it back afterwards). A host-write -> DSP-read miss (the
@@ -592,28 +643,49 @@ static int run_coherency_check(void) {
             struct hexlib_batch_rsp_hdr full_hdr;
             memcpy(&full_hdr, rsp, sizeof(full_hdr));
 
+            /* Classify every lane, not just "equal to +0.0" -- see this
+             * function's own header comment for why both halves of this
+             * matter. `all_zero` is a MAGNITUDE check (fabsf), so -0.0
+             * (bit pattern 0x8000, which `x * 0.0f` genuinely produces for
+             * negative `x`) counts as the expected zero result, not as
+             * "sentinel survived". `all_sentinel` is a real, exact
+             * bit-compare against COHERENCY_SENTINEL -- a buffer that is
+             * NEITHER all-zero-magnitude NOR bit-exact-sentinel is a third,
+             * distinct outcome (garbled or partially written) and must not
+             * be reported as either a clean pass or a coherency miss. */
             const __fp16 *yr = (const __fp16 *) by->ptr;
-            __fp16 zero = (__fp16) 0.0f;
-            int overwritten = 1;
+            __fp16 sentinel = (__fp16) COHERENCY_SENTINEL;
+            int all_zero = 1;
+            int all_sentinel = 1;
             for (int i = 0; i < SELF_TEST_N; i++) {
-                if (memcmp(&yr[i], &zero, sizeof(__fp16)) != 0) {
-                    overwritten = 0;
-                    break;
+                if (fabsf((float) yr[i]) != 0.0f) {
+                    all_zero = 0;
+                }
+                if (memcmp(&yr[i], &sentinel, sizeof(__fp16)) != 0) {
+                    all_sentinel = 0;
                 }
             }
 
-            /* Both lines, always -- see the file header on why cycles_total
+            /* Every line, always -- see the file header on why cycles_total
              * must be printed unconditionally rather than only on failure:
              * it is what tells a genuine coherency miss apart from a
              * dispatch bug, and a test reading only the COHERENCY line could
              * not make that distinction on its own. */
             printf("hexlib: --coherency-check: cycles_total=%llu\n",
                    (unsigned long long) full_hdr.cycles_total);
-            if (overwritten) {
+            if (all_zero) {
                 printf("COHERENCY sentinel_overwritten\n");
-            } else {
+            } else if (all_sentinel) {
                 printf("COHERENCY sentinel_unchanged\n");
                 exit_code = HEXLIB_EXIT_COHERENCY_MISS;
+            } else {
+                printf("COHERENCY buffer_garbled\n");
+                fprintf(stderr,
+                        "hexlib: --coherency-check: output buffer is neither "
+                        "the expected zero result nor the intact sentinel -- "
+                        "a garbled or partially-written buffer, not "
+                        "classifiable as a coherency miss or a clean pass\n");
+                exit_code = HEXLIB_EXIT_COHERENCY_GARBLED;
             }
         }
     }

@@ -5,6 +5,7 @@ import re
 import pytest
 
 from hexlib.tests.csource import block_after_call as _block_after_call
+from hexlib.tests.csource import block_from as _block_from
 from hexlib.tests.csource import function_body as _function_body
 
 SRC = pathlib.Path("hexlib/runtime/skel/skel_vtcm.c")
@@ -71,6 +72,31 @@ def test_every_hap_failure_path_returns_a_status(src):
 
     ptr_block = _block_after_call(alloc, "HAP_compute_res_attr_get_vtcm_ptr_v2")
     assert re.search(r"return\s+HEXLIB_DSP_ERR_\w+\s*;", ptr_block)
+
+
+def test_hmx_is_requested_only_when_the_session_asked_for_it(src):
+    """No kernel on this branch needs HMX, and `session.c` always passes
+    `n_hmx = 0` to `hexlib_iface_start`. Requesting HMX unconditionally here
+    risks `HAP_compute_res_acquire` refusing the WHOLE reservation for an
+    HMX-availability reason indistinguishable, from its single status code
+    alone, from a VTCM-size failure -- the operator would see a VTCM error
+    for what was actually an HMX one. `HAP_compute_res_attr_set_hmx_param`
+    must therefore be guarded by a real check of `ctx->n_hmx`, not called
+    unconditionally in `hexlib_vtcm_alloc`."""
+    alloc = _function_body(src, "hexlib_vtcm_alloc")
+    guard = re.search(r"if\s*\(\s*ctx->n_hmx\s*>\s*0\s*\)", alloc)
+    assert guard, (
+        "HAP_compute_res_attr_set_hmx_param must be guarded by ctx->n_hmx > 0"
+    )
+    guarded_block = _block_from(alloc, guard.end())
+    assert "HAP_compute_res_attr_set_hmx_param" in guarded_block, (
+        "the HMX request itself must live inside the ctx->n_hmx > 0 guard, "
+        "not merely have an unrelated if-block near it"
+    )
+    # And nowhere else in the function, unguarded -- a duplicate call outside
+    # the guard would defeat the whole point.
+    outside = alloc.replace(guarded_block, "", 1)
+    assert "HAP_compute_res_attr_set_hmx_param" not in outside
 
 
 def test_no_abort_or_assert_anywhere_in_the_file(src):
