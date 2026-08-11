@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import xml.etree.ElementTree as ET
 
@@ -36,6 +37,79 @@ _QDC_YES_THRESHOLD_MIN = 15
 # of success again, one level up. See _qdc_submit's post-parse check below.
 _SELFTEST_PASS_MARKER = "hexlib: --self-test: PASS"
 _CYCLES_TOTAL_MARKER = "cycles_total="
+
+# `cycles_total=0` CONTAINS `cycles_total=`. That is the whole reason this
+# regex exists. The presence check below (`marker not in combined`) was the
+# only thing standing between "the logs carry a real measurement" and "a
+# success value constructible with zero measurements in it" -- and a literal
+# ZERO measurement satisfied it. Verified against fabricated local log files:
+# `hexlib: --self-test: cycles_total=0` plus a clean `<testsuite tests="5"
+# failures="0" errors="0">` printed "measurement lines present" and exited 0.
+#
+# Zero is not a pedantic edge case here, it is the EXPECTED shape of the
+# failure this project is most exposed to. The DSP reads PCYCLE inside a
+# user-mode unsigned PD, where SYSCFG.PCYCLEEN cannot be set from
+# (skel_dispatch.c's own note, and include/hexlib/hexlib_harness.h's), so
+# `cycles_total=0` is precisely what the first silicon job would print if the
+# counter never advances there -- the single most important thing that job can
+# tell us, and the one thing this check used to swallow.
+#
+# BUILT FROM THE MARKER RATHER THAN RESPELLING IT, so the presence check and
+# the value check cannot drift apart. `(\S*)` deliberately captures whatever
+# follows, valid or not, so a malformed value is DISTINGUISHABLE from an
+# absent line instead of both silently reading as "no match".
+_CYCLES_TOTAL_RE = re.compile(re.escape(_CYCLES_TOTAL_MARKER) + r"(\S*)")
+_CYCLES_TOTAL_DIGITS = re.compile(r"[0-9]+")
+
+
+def _qdc_cycles_total_verdict(combined: str) -> tuple[bool, str]:
+    """`(ok, detail)` for the `cycles_total=` measurement in the fetched logs.
+
+    `ok` is True only if at least one `cycles_total=` line carries a value
+    that parses as a non-negative decimal integer AND is strictly greater
+    than zero. `detail` always says which of the four states was found, so a
+    caller's message names the real problem rather than "missing":
+
+      - no `cycles_total=` line anywhere;
+      - a line whose value is not a decimal integer at all (truncated log,
+        interleaved output, a format change nobody updated this for);
+      - every line reporting exactly 0 -- a measurement that measured
+        nothing, which is the state this function was added for;
+      - at least one positive value: the only pass.
+
+    AT LEAST ONE, not all: a single job's logs legitimately contain several
+    `cycles_total=` lines (`--self-test` prints one, `--coherency-check`
+    prints another), and there is no requirement that every mode a job ran
+    produced a nonzero count -- only that the run genuinely measured
+    something. If PCYCLE is dead in the unsigned PD, EVERY line reads 0 and
+    no `max` over them can rescue it, so taking the maximum cannot hide the
+    failure mode this exists to catch."""
+    found = _CYCLES_TOTAL_RE.findall(combined)
+    if not found:
+        return False, f"no `{_CYCLES_TOTAL_MARKER}` line anywhere in the fetched logs"
+
+    values: list[int] = []
+    malformed: list[str] = []
+    for raw in found:
+        if _CYCLES_TOTAL_DIGITS.fullmatch(raw):
+            values.append(int(raw, 10))
+        else:
+            malformed.append(raw)
+
+    positive = [v for v in values if v > 0]
+    if positive:
+        return True, f"{_CYCLES_TOTAL_MARKER}{max(positive)}"
+    if values:
+        return False, (
+            f"every `{_CYCLES_TOTAL_MARKER}` line reports 0 "
+            f"({len(values)} such line(s)) -- the DSP measured NOTHING, which "
+            "is what PCYCLE returns when SYSCFG.PCYCLEEN is clear, and a "
+            "user-mode unsigned PD cannot set it"
+        )
+    return False, (
+        f"`{_CYCLES_TOTAL_MARKER}` is present but its value is not a decimal "
+        f"integer: {malformed[0]!r}"
+    )
 
 # The operator's own account budget, in minutes -- read from the environment,
 # exactly the way job.py reads QDC_API_KEY, because it is personal and this
@@ -211,7 +285,14 @@ def _qdc_check_results(job_id: int, paths: list[str]) -> int:
         the `--self-test` PASS line, both read directly out of main.c) --
         a clean JUnit report with none of hexlib's own evidence behind it
         is exactly the "success constructible with zero measurements in
-        it" shape this check exists to rule out.
+        it" shape this check exists to rule out;
+      - and the `cycles_total=` line's VALUE is a real integer greater
+        than zero. The bullet above was for a while the whole of this
+        check, and `cycles_total=0` satisfied it -- the substring is
+        there, so a run in which the DSP measured literally nothing
+        printed "measurement lines present" and exited 0. See
+        `_qdc_cycles_total_verdict` for why zero is the expected shape of
+        the failure rather than a pedantic edge case.
     """
     results_path = next(
         (p for p in paths if os.path.basename(p) == "results.xml"), None
@@ -275,9 +356,22 @@ def _qdc_check_results(job_id: int, paths: list[str]) -> int:
         )
         return 1
 
+    # PRESENCE IS NOT MEASUREMENT. The check above only proved the substring
+    # `cycles_total=` appears; this one reads the number after it.
+    cycles_ok, cycles_detail = _qdc_cycles_total_verdict(combined)
+    if not cycles_ok:
+        print(
+            f"error: job {job_id}: results.xml reports {tests} test(s) with "
+            f"no failures, but the DSP's own cycle measurement is not usable: "
+            f"{cycles_detail} -- a pass whose only measurement is zero is "
+            "still a pass with no measurements behind it",
+            file=sys.stderr,
+        )
+        return 1
+
     print(
         f"job {job_id}: {tests} test(s), 0 failures, 0 errors, "
-        "measurement lines present"
+        f"measurement lines present ({cycles_detail})"
     )
     return 0
 

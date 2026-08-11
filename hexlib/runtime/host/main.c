@@ -92,10 +92,16 @@ enum {
     HEXLIB_EXIT_OP_FAILED      = 4,
     HEXLIB_EXIT_MISMATCH       = 5,
     HEXLIB_EXIT_COHERENCY_MISS = 6,   /* --coherency-check: status OK, op OK,
-                                       * but the sentinel survived -- either a
-                                       * dispatch bug or a real coherency miss;
-                                       * see run_coherency_check()'s printed
-                                       * cycles_total to tell which. */
+                                       * but the sentinel survived. "MISS" is
+                                       * the name, not the diagnosis: this is
+                                       * equally consistent with a kernel or
+                                       * generated entry that returned OK
+                                       * without writing `y`. cycles_total
+                                       * does NOT tell the two apart -- an
+                                       * earlier version of this comment said
+                                       * it did. See run_coherency_check()'s
+                                       * own header for why, and for what
+                                       * would. */
     HEXLIB_EXIT_COHERENCY_GARBLED = 7, /* --coherency-check: status OK, op OK,
                                         * but the output buffer is neither the
                                         * expected zero result NOR the intact
@@ -131,15 +137,26 @@ static int response_is_valid(const uint8_t *rsp, size_t rsp_len, uint32_t *statu
     return 1;
 }
 
-static void print_caps(void) {
+/* RETURNS AN EXIT CODE -- IT USED TO RETURN void, AND THAT WAS THE BUG.
+ * Both failure branches below printed to stderr and returned, and main()
+ * returned HEXLIB_EXIT_OK regardless. On a device whose image has no
+ * `libcdsprpc.so` for this ABI, `./hexlib_run --caps; echo RC=$?` printed
+ * "could not load the FastRPC driver" and `RC=0` -- so any `set -e` wrapper,
+ * shell step, or CI stage read a total driver-load failure as a pass. `--caps`
+ * is also the FIRST thing run on unfamiliar silicon and the mode most likely
+ * to fail there, which made it the worst possible place for the exit code to
+ * be a constant. HEXLIB_EXIT_SESSION_FAILED (2) is the right code for both:
+ * neither is a usage error, and both are exactly "the DSP side could not be
+ * reached", which is what that code already means everywhere else here. */
+static int print_caps(void) {
     if (hexlib_drv_init() != 0) {
         fprintf(stderr, "hexlib: --caps: could not load the FastRPC driver\n");
-        return;
+        return HEXLIB_EXIT_SESSION_FAILED;
     }
     struct hexlib_caps caps;
     if (hexlib_query_caps(CDSP_DOMAIN_ID, &caps) != 0) {
         fprintf(stderr, "hexlib: --caps: capability query failed\n");
-        return;
+        return HEXLIB_EXIT_SESSION_FAILED;
     }
     printf("domain              = CDSP (%d)\n", CDSP_DOMAIN_ID);
     printf("domain_support      = %u\n", caps.domain_support);
@@ -157,6 +174,7 @@ static void print_caps(void) {
     printf("hmx_support_depth   = %u (0 is not evidence HMX is absent -- "
            "settle by direct test, not by this query)\n",
            caps.hmx_support_depth);
+    return HEXLIB_EXIT_OK;
 }
 
 /* Build a one-op scale_fp16 batch: two buffers (x, y), one tensor per
@@ -474,10 +492,16 @@ static int run_self_test(int unmapped) {
                 printf("hexlib: --self-test: PASS (%d values, bit-exact)\n", SELF_TEST_N);
                 /* The response header's own PCYCLE-measured total (see
                  * skel_dispatch.c) -- the only DSP-measured cycle count this
-                 * binary can report at all, and the execution-proof signal
-                 * --coherency-check's discriminator depends on. Previously
-                 * validated by response_is_valid() above and read fresh here
-                 * rather than threaded through as an extra out-parameter. */
+                 * binary can report at all. WHAT IT IS FOR: proving the DSP
+                 * measured ANYTHING. A zero here means the counter did not
+                 * advance, which is what PCYCLE does when SYSCFG.PCYCLEEN is
+                 * clear and a user-mode unsigned PD cannot set it -- the one
+                 * thing about stage 3 no simulator run can answer. It is NOT
+                 * a discriminator between a coherency miss and a dispatch
+                 * no-op; --coherency-check's header explains why not.
+                 * Previously validated by response_is_valid() above and read
+                 * fresh here rather than threaded through as an extra
+                 * out-parameter. */
                 struct hexlib_batch_rsp_hdr full_hdr;
                 memcpy(&full_hdr, rsp, sizeof(full_hdr));
                 printf("hexlib: --self-test: cycles_total=%llu\n",
@@ -513,27 +537,91 @@ static int run_self_test(int unmapped) {
  * header), so the two failure modes would otherwise confound each other
  * with no cheaper way to tell them apart.
  *
- * THE SENTINEL ALONE IS NOT ENOUGH -- READ THIS BEFORE CHANGING ANYTHING
- * BELOW. An earlier version of this design pre-wrote a sentinel into the
- * output buffer and ran scale_fp16 with factor=0.0 so the correct result is
- * bit-exact zero, then just checked whether the sentinel survived. That
- * FAILS TO DISCRIMINATE: if dispatch silently no-ops and still returns
- * HEXLIB_DSP_OK -- a marshalling bug, not a coherency one -- the observable
- * is IDENTICAL to a coherency miss (status OK, sentinel intact). What
- * actually separates the two is an execution-proof signal: `cycles_total`,
- * the DSP's own PCYCLE-measured total around the kernel call
- * (skel_dispatch.c), which is exactly zero unless the kernel genuinely ran.
+ * THIS CHECK DOES NOT ACTUALLY DISCRIMINATE, AND THE PREVIOUS VERSION OF
+ * THIS COMMENT CLAIMED IT DID. Corrected 2026-08-11 (second correction).
+ * Read this whole block before believing any verdict this function prints.
  *
- *     cycles 0,  sentinel intact      -> the kernel never ran: a dispatch bug
- *     cycles >0, sentinel intact      -> it ran; the write never reached the
- *                                        host: COHERENCY
- *     cycles >0, sentinel overwritten -> both fine, for THIS direction
+ * The claim that was here was: `cycles_total == 0` means "the kernel never
+ * ran, a dispatch bug" and `cycles_total > 0` with the sentinel intact means
+ * "it ran and the write did not reach the host, COHERENCY". Both halves are
+ * wrong, for two independent reasons, and the table they formed had one
+ * unreachable row and one row carrying two different defects under one name.
  *
- * This function prints BOTH the cycles_total line and the COHERENCY
+ *   1. THE `cycles 0` ROW IS UNREACHABLE FROM HERE. Everything below runs
+ *      only after `status == HEXLIB_DSP_OK` AND `result->status ==
+ *      HEXLIB_DSP_OK`. In skel_dispatch.c those two are OK only if `k->fn(&a)`
+ *      was genuinely called and genuinely returned OK -- every other path
+ *      writes a specific non-OK status instead. PCYCLE brackets exactly that
+ *      call, so `t1 - t0 > 0` for any real call and this branch cannot be
+ *      reached with cycles_total == 0 while the counter works. The state row 1
+ *      was reaching for -- dispatch refused the batch -- IS distinguishable,
+ *      but by the exit code and the ABSENCE of any COHERENCY line (the
+ *      `status != HEXLIB_DSP_OK` branch above, HEXLIB_EXIT_OP_FAILED), never
+ *      by a cycle count printed here.
+ *
+ *   2. THE DEFECT THE CHECK NAMES IS THE ONE IT CANNOT SEE. "Dispatch
+ *      silently no-ops and still returns HEXLIB_DSP_OK" means a generated
+ *      entry (genentry.py) or a kernel that returns OK WITHOUT WRITING `y`.
+ *      PCYCLE still brackets a real, returning call, so cycles_total > 0 --
+ *      and the sentinel is intact, because nothing wrote over it. That is
+ *      bit-for-bit the same observable as a genuine coherency miss, and this
+ *      function prints `COHERENCY sentinel_unchanged` and exits 6 for it,
+ *      MISATTRIBUTING A DISPATCH BUG TO COHERENCY. That is precisely the
+ *      confusion §6.1 was added to prevent, reintroduced one level down.
+ *
+ *   3. IF PCYCLE READS 0 IN THE UNSIGNED PD, EVERY ROW INVERTS. SYSCFG.PCYCLEEN
+ *      gates whether the counter advances at all and a user-mode unsigned PD
+ *      cannot set it (see skel_dispatch.c's hexlib_read_pcycle and
+ *      include/hexlib/hexlib_harness.h, which sets the bit explicitly for the
+ *      standalone runtime). If HAP_perf_get_pcycles() returns 0 there, a
+ *      genuine coherency miss reads `cycles 0` + sentinel intact -- and the
+ *      old table called that "a dispatch bug".
+ *
+ * WHAT THE OBSERVABLES ACTUALLY MEAN. This is the honest table; it names what
+ * each output is CONSISTENT WITH, not what it proves.
+ *
+ *   cycles_total | read-back of `y`     | printed                 | exit
+ *   -------------+----------------------+-------------------------+-----
+ *   0            | any                  | (any COHERENCY line)    | 0/6/7
+ *       The COUNTER IS DEAD -- not "the kernel never ran". Reaching here at
+ *       all proves k->fn was called and returned OK (see 1). Expected reading
+ *       if PCYCLEEN is clear in the unsigned PD. Settle this before reading
+ *       any row below: with a dead counter no row below means anything.
+ *   -------------+----------------------+-------------------------+-----
+ *   > 0          | every lane magnitude | sentinel_overwritten    | 0
+ *                | zero (+0.0 or -0.0)  |                         |
+ *       The DSP's write reached the host. Healthy -- for scale_fp16's one
+ *       write pattern, this one buffer size, and the DSP-write -> host-read
+ *       direction only. Nothing more.
+ *   -------------+----------------------+-------------------------+-----
+ *   > 0          | every lane bit-exact | sentinel_unchanged      | 6
+ *                | the sentinel         |                         |
+ *       NOT DISCRIMINATED. Consistent with a genuine coherency miss, AND with
+ *       a kernel or generated entry that returned HEXLIB_DSP_OK without
+ *       writing `y`, AND with an fd mapped to a buffer other than the one
+ *       this side reads. Exit 6 says "one of these", never "coherency". DO
+ *       NOT spend a follow-up job on uncached rpcmem off this row alone:
+ *       rule the no-op out first (e.g. by checking the same batch's ordinary
+ *       --self-test, whose factor=0.125 result a no-op cannot produce).
+ *   -------------+----------------------+-------------------------+-----
+ *   > 0          | some lanes neither   | buffer_garbled          | 7
+ *       A partial write, or a write that landed somewhere else. Kept as its
+ *       own outcome precisely so it is never folded into the row above.
+ *
+ * WHAT WOULD ACTUALLY DISCRIMINATE, and is deliberately not built here: a
+ * skel-side echo or memset op with its own kind id, whose write is performed
+ * by the skel itself rather than by any generated kernel. Then "the write did
+ * not arrive" cannot be a kernel no-op, because no kernel is involved. §6.1
+ * notes and defers it; this comment exists so nobody reads the table above as
+ * a substitute for it.
+ *
+ * This function still prints BOTH the cycles_total line and the COHERENCY
  * verdict line unconditionally (once the batch status and op status are
- * both confirmed OK), so all three rows of that table are distinguishable
- * from stdout alone -- never just "the bad thing is absent" (see this
- * file's project-wide discipline on that, stated in the header above main()).
+ * both confirmed OK), so every row above is at least VISIBLE from stdout
+ * alone -- never just "the bad thing is absent" (see this file's
+ * project-wide discipline on that, stated in the header above main()).
+ * Visible is not the same as discriminated, which is the whole point of the
+ * three paragraphs above.
  *
  * "SENTINEL INTACT" IS NOT A BIT-COMPARE AGAINST +0.0, AND IT IS A REAL
  * CHECK OF THE SENTINEL'S BYTES, NOT JUST "NOT EXACTLY ZERO". Two defects
@@ -728,11 +816,12 @@ static int run_coherency_check(void) {
                 }
             }
 
-            /* Every line, always -- see the file header on why cycles_total
-             * must be printed unconditionally rather than only on failure:
-             * it is what tells a genuine coherency miss apart from a
-             * dispatch bug, and a test reading only the COHERENCY line could
-             * not make that distinction on its own. */
+            /* Every line, always. cycles_total is printed unconditionally
+             * because a zero here is the one thing that would invalidate
+             * every other row of this function's table at once (PCYCLEEN in
+             * the unsigned PD -- see this function's header), NOT because it
+             * separates a coherency miss from a dispatch no-op. It does not;
+             * that claim was wrong and is corrected in the header above. */
             printf("hexlib: --coherency-check: cycles_total=%llu\n",
                    (unsigned long long) full_hdr.cycles_total);
             if (all_zero) {
@@ -934,8 +1023,9 @@ static int run_batch_file(const char *batch_path, const char *in_path,
 
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "--caps") == 0) {
-        print_caps();
-        return HEXLIB_EXIT_OK;
+        /* NOT `print_caps(); return HEXLIB_EXIT_OK;` -- see print_caps()'s own
+         * header comment. That is what made a driver-load failure exit 0. */
+        return print_caps();
     }
     if (argc >= 2 && strcmp(argv[1], "--self-test") == 0) {
         /* Two independent modifiers, either optional, checked past argv[1]:

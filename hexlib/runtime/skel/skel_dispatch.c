@@ -25,11 +25,38 @@
 #include <string.h>
 
 #include "HAP_farf.h"
+#include "HAP_perf.h"
 
+/* THE SDK'S OWN READ, NOT A HAND-ROLLED ONE -- AND THE DIFFERENCE IS NOT
+ * COSMETIC. This was `__asm__ __volatile__("%0 = c15:14")`, issued directly.
+ * That instruction only advances if SYSCFG.PCYCLEEN is set, and A USER-MODE
+ * UNSIGNED PD CANNOT SET THAT BIT: this project's own
+ * include/hexlib/hexlib_harness.h sets it explicitly (`hexlib_enable_pcycle`,
+ * "bit 5 = PCYCLEEN") precisely because the standalone-ELF runtime it belongs
+ * to runs where that is permitted. The skel does not. So the hand-rolled read
+ * had no handling of the one precondition it depends on, in the one PD where
+ * that precondition may not hold -- and the SIMULATOR CANNOT TELL US, because
+ * there the bit is effectively always on and this path measures a plausible
+ * four-figure number either way.
+ *
+ * HAP_perf_get_pcycles() ($HEXAGON_SDK_ROOT/incs/HAP_perf.h) issues the
+ * IDENTICAL `C15:14` read -- so this is not a change of mechanism and the
+ * measured number is expected to be unchanged (it was: 1287 cycles on the
+ * simulator before and after). What changes is whose claim it is. If
+ * Qualcomm's own documented perf API returns 0 in an unsigned PD, that is a
+ * platform fact about the PD, discoverable from the SDK and reportable as
+ * such; if our own inline asm returned 0 it would be indistinguishable from
+ * our bug. Reading 0 on silicon remains POSSIBLE -- nothing here prevents it,
+ * and no simulator run can rule it out -- which is exactly why main.c prints
+ * cycles_total, cli.py now requires it to be > 0, and the on-device test
+ * asserts it. See docs §6.1 and this file's PCYCLE note above.
+ *
+ * KEPT AS A NAMED WRAPPER rather than calling HAP_perf_get_pcycles() at the
+ * two sites: the bracketing test (test_skel_dispatch_source.py) locates the
+ * before/after pair by this name and checks that ONLY `k->fn(&a)` sits between
+ * them, and one name is also the one place to state the above. */
 static inline uint64_t hexlib_read_pcycle(void) {
-    uint64_t v;
-    __asm__ __volatile__("%0 = c15:14" : "=r"(v));
-    return v;
+    return (uint64_t) HAP_perf_get_pcycles();
 }
 
 /* Shared with skel.c (see skel_internal.h): both callers write the same header

@@ -90,6 +90,45 @@ def test_total_size_is_checked_against_the_actual_length(d):
     assert "HEXLIB_DSP_ERR_TRUNCATED" in guard
 
 
+def test_the_cycle_counter_is_read_through_the_sdks_own_api(d):
+    """NOT hand-rolled inline asm. `__asm__("%0 = c15:14")` only advances if
+    SYSCFG.PCYCLEEN is set, and a user-mode unsigned PD -- which is what the
+    skel runs in -- cannot set that bit. This project's own
+    include/hexlib/hexlib_harness.h sets it explicitly for the standalone-ELF
+    runtime, so the register reading 0 with the bit clear is a fact this repo
+    already records. The simulator measures a plausible four-figure number
+    either way and therefore cannot discriminate.
+
+    So the read must go through HAP_perf_get_pcycles()
+    ($HEXAGON_SDK_ROOT/incs/HAP_perf.h), which issues the identical
+    instruction: same mechanism, but a documented SDK API rather than an
+    invented one, so a zero on silicon is a reportable platform fact about the
+    PD instead of an indistinguishable bug of ours.
+
+    BOTH HALVES ARE ASSERTED, and both are scoped to the wrapper's own body
+    (comments already blanked by `code_only`), so neither can be satisfied by
+    prose: the SDK call must be PRESENT, and the raw register read must be
+    ABSENT. A revert to inline asm fails the second half even if the first is
+    left behind as dead code."""
+    body = _function_body(d, "hexlib_read_pcycle")
+    assert re.search(r"\bHAP_perf_get_pcycles\s*\(\s*\)", body), (
+        "hexlib_read_pcycle must read the counter through the SDK's own "
+        f"HAP_perf_get_pcycles(), got: {body!r}"
+    )
+    assert "__asm__" not in body and "asm" not in body, (
+        "the cycle counter must not be read by hand-rolled inline asm -- "
+        "SYSCFG.PCYCLEEN is unsettable from a user-mode unsigned PD, so a raw "
+        f"`c15:14` read may simply return 0 there: {body!r}"
+    )
+    assert "c15:14" not in body and "C15:14" not in body, (
+        f"no raw register read may survive in this wrapper: {body!r}"
+    )
+    # And the include that makes it legal, in code rather than in a comment.
+    assert re.search(r'#\s*include\s+"HAP_perf\.h"', d), (
+        "HAP_perf.h must actually be included, not merely referred to"
+    )
+
+
 def test_pcycle_brackets_only_the_kernel_call(d):
     """Harness and RPC overhead is roughly constant, so including it
     manufactures ratios out of nothing. Same counter and same placement as
@@ -103,7 +142,12 @@ def test_pcycle_brackets_only_the_kernel_call(d):
     definition from consideration entirely, and the `()` (no-arg call syntax,
     vs. the definition's `(void)`) requirement in the pattern is a second,
     independent guard against the same confusion."""
-    assert "c15:14" in d or "PCYCLE" in d
+    # WAS `assert "c15:14" in d or "PCYCLE" in d` -- both halves were
+    # satisfiable by a comment before the fixtures were switched to
+    # `code_only`, and the first half pinned the hand-rolled asm this file now
+    # bans outright. The counter's provenance is
+    # test_the_cycle_counter_is_read_through_the_sdks_own_api's job above; this
+    # test is only about WHERE the pair of reads sits.
     body = _function_body(d, "hexlib_dispatch_batch")
     calls = [m.start() for m in re.finditer(r"hexlib_read_pcycle\s*\(\s*\)", body)]
     assert len(calls) >= 2, "expected at least a before/after pair of calls"
@@ -159,6 +203,48 @@ def test_invoke_before_start_is_refused(s):
         r"hexlib_write_rsp_hdr\s*\([^;]*HEXLIB_DSP_ERR_NOT_STARTED", guard
     ), "the refusal must write NOT_STARTED into the response, not just log it"
     assert "hexlib_dispatch_batch" not in guard, "invoke-before-start must not run any op"
+
+
+def test_both_wire_lengths_are_checked_for_a_negative_value(s):
+    """`batchLen` and `resultLen` are both `int` on the wire (qaic spells
+    `sequence<octet>` as a pointer plus a signed length), and only `resultLen`
+    was checked. A negative `batchLen` cast to uint32_t becomes an enormous
+    length, which PASSES hexlib_dispatch_batch's `len < sizeof(struct
+    hexlib_batch_hdr)` test -- so the dispatcher memcpy()s the full 40-byte
+    header out of `batch` before `hdr.total_size != len` can reject anything.
+    That is an out-of-bounds read of a buffer the host may have made much
+    shorter, and this entry point is the last place the sign is still visible:
+    after the cast the information is gone.
+
+    Both guards must be inside hexlib_iface_invoke's own body and must
+    precede the cast, so this checks position as well as presence -- a check
+    added after the call to hexlib_dispatch_batch would protect nothing."""
+    body = _function_body(s, "hexlib_iface_invoke")
+    dispatch_pos = body.index("hexlib_dispatch_batch")
+    for name in ("batchLen", "resultLen"):
+        m = re.search(rf"\b{name}\s*<\s*0\b", body)
+        assert m, (
+            f"hexlib_iface_invoke does not reject a negative {name} -- cast to "
+            f"uint32_t it becomes a huge length that passes every subsequent "
+            f"size test"
+        )
+        assert m.start() < dispatch_pos, (
+            f"the negative-{name} guard must run BEFORE hexlib_dispatch_batch "
+            f"is called with the cast value, not after"
+        )
+    # And the refusal must be reported, not merely detected: the batch-length
+    # path has a valid response buffer (resultLen was already checked above
+    # it), so it must write a real status the host can read off the wire.
+    m = re.search(r"if\s*\(\s*batchLen\s*<\s*0\s*\)\s*\{", body)
+    assert m, "the negative-batchLen guard must be its own `if` block"
+    guard = _block_from(body, m.end() - 1)
+    assert re.search(r"hexlib_write_rsp_hdr\s*\([^;]*HEXLIB_DSP_ERR_", guard), (
+        "a negative batchLen must be reported in the response header, not "
+        "merely logged and dropped"
+    )
+    assert "hexlib_dispatch_batch" not in guard, (
+        "a negative batchLen must not reach the dispatcher at all"
+    )
 
 
 def test_hwinfo_reports_the_acquired_vtcm_size(s):

@@ -20,7 +20,27 @@ struct hexlib_ctx {
     size_t   vtcm_size;
     uint32_t vtcm_rctx;
     int      vtcm_valid;
-    int      vtcm_needs_release;
+
+    /* VOLATILE BECAUSE IT IS WRITTEN BY A DIFFERENT THREAD. `release_callback`
+     * in skel_vtcm.c sets this to 1 from HAP_compute_res's own QuRT thread,
+     * and hexlib_dispatch_batch's per-op loop reads it. It was a plain `int`.
+     * That worked only by accident: the opaque `k->fn(&a)` call in the loop
+     * body is a call through a function pointer the compiler cannot see into,
+     * so it must assume the callee may have written any escaped object and
+     * reloads this from memory each iteration. An inlined or
+     * constant-propagated kernel removes that barrier, and the compiler is
+     * then entitled to hoist the load out of the loop entirely -- at which
+     * point a reclaim request arriving mid-batch is never noticed, the
+     * competing session waits on VTCM this one will not give back, and
+     * nothing about the source looks different.
+     *
+     * `volatile`, not an atomic: this is a one-way 0 -> 1 flag with a single
+     * writer and a single reader, and the only requirement is that the reader
+     * actually re-reads memory. There is no read-modify-write to make atomic
+     * and no other object whose ordering relative to this one matters -- the
+     * release itself happens on the dispatch thread, after the flag is
+     * observed (skel_dispatch.c), never in the callback. */
+    volatile int vtcm_needs_release;
 
     uint32_t sess_id;
     uint32_t n_hvx;

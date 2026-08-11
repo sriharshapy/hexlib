@@ -113,6 +113,27 @@ AEEResult hexlib_iface_invoke(remote_handle64 handle, const unsigned char *batch
         return AEE_EFAILED;
     }
 
+    /* BOTH LENGTHS ARE SIGNED ON THE WIRE (qaic spells `sequence<octet>` as a
+     * pointer plus an `int`), so both need this and only `resultLen` had it.
+     * A negative `batchLen` cast to uint32_t becomes an enormous length, and
+     * hexlib_dispatch_batch's first size test is `len < sizeof(struct
+     * hexlib_batch_hdr)` -- which a huge value PASSES. It then memcpy()s the
+     * full 40-byte header out of `batch` (skel_dispatch.c) BEFORE
+     * `hdr.total_size != len` can reject anything: an out-of-bounds read of a
+     * buffer the host may have made much shorter than that. Rejecting it here,
+     * before the cast, is the only place the sign is still visible.
+     *
+     * Written into the response and returned AEE_SUCCESS, not returned as an
+     * RPC error: the result buffer was just proven big enough for a header
+     * (above), so the host can be told exactly what was wrong instead of
+     * having a marshalled response discarded. Same reasoning as the
+     * invoke-before-start refusal below. */
+    if (batchLen < 0) {
+        FARF(ERROR, "hexlib: invoke batch length is negative (%d)", batchLen);
+        hexlib_write_rsp_hdr(result, HEXLIB_DSP_ERR_INVAL_PARAMS, 0, 0);
+        return AEE_SUCCESS;
+    }
+
     if (!ctx->started) {
         /* No op runs -- not even the truncation path inside
          * hexlib_dispatch_batch. The response gets the REAL status

@@ -25,9 +25,52 @@ alternative -- leaving the requirement out because today's binary cannot
 satisfy it -- is exactly the kind of silent gap this project's own history
 (the false-pass job) says not to leave.
 """
+import re
+
 from utils import sh, write_qdc_log
 
 DEV = "/data/local/tmp/hexlib"
+
+# `hexlib_run` prints `hexlib: <mode>: cycles_total=%llu` (main.c's
+# run_self_test and run_coherency_check). Built as a regex, not a substring,
+# because the SUBSTRING IS SATISFIED BY `cycles_total=0` -- a run in which the
+# DSP's PCYCLE counter never advanced at all. That is not a pedantic edge
+# case: the skel reads the counter inside a user-mode unsigned PD, where
+# SYSCFG.PCYCLEEN cannot be set (skel_dispatch.c's hexlib_read_pcycle, and
+# include/hexlib/hexlib_harness.h, which sets that bit explicitly for the
+# standalone-ELF runtime because the register reads 0 without it). Zero is
+# precisely what this job would print if the counter is dead on this silicon,
+# and it is the single most important thing this job can report.
+_CYCLES_RE = re.compile(r"cycles_total=(\d+)")
+
+
+def assert_cycles_total_is_a_real_measurement(out, what):
+    """Assert `out` carries at least one `cycles_total=` line whose value is a
+    decimal integer greater than zero, and return that value.
+
+    PRESENT AND POSITIVE, as two separate failures with two separate
+    messages -- "absent" and "zero" are different findings and must not be
+    reported as each other. Absence means `hexlib_run` stopped printing it (or
+    never got a response); zero means it printed a measurement of nothing,
+    which on this platform points straight at PCYCLEEN in the unsigned PD."""
+    values = [int(m) for m in _CYCLES_RE.findall(out)]
+    assert values, (
+        f"{what}: no `cycles_total=` line at all. hexlib_run prints one after "
+        f"the PASS line (main.c's run_self_test) -- its ABSENCE is a failure, "
+        f"never a success:\n{out}"
+    )
+    best = max(values)
+    assert best > 0, (
+        f"{what}: cycles_total={best} -- the DSP measured NOTHING. The kernel "
+        f"call is bracketed by PCYCLE on the DSP (skel_dispatch.c), so a real "
+        f"call cannot take zero cycles; a zero here means the counter did not "
+        f"advance, which is what happens when SYSCFG.PCYCLEEN is clear -- and "
+        f"a user-mode unsigned PD cannot set it. THIS IS THE MOST IMPORTANT "
+        f"THING THIS JOB CAN REPORT: every cycle figure in stage 1 was "
+        f"measured the same way, and if the counter is dead here then none of "
+        f"them transfer to silicon:\n{out}"
+    )
+    return best
 
 
 def test_binaries_are_present_and_executable():
@@ -46,9 +89,28 @@ def test_capabilities_report_a_v75_cdsp_with_unsigned_pd():
     and shaped `domain              = CDSP (3)`, `unsigned_pd_support = 1`,
     `arch_ver            = 35957 (0x8c75)`. CDSP is domain 3, measured; ADSP
     (domain 0) is a v73 part with `UNSIGNED_PD_SUPPORT = 0` and must never be
-    the thing this printed."""
-    out = sh(f"cd {DEV} && ADSP_LIBRARY_PATH={DEV} ./hexlib_run --caps")
+    the thing this printed.
+
+    THE EXIT CODE IS NOW CHECKED, AND UNTIL 2026-08-11 IT WAS NOT. This was
+    the ONLY test in this file that ran `hexlib_run` without the `; echo RC=$?`
+    convention, which made this file's own stated discipline -- "the binary's
+    OWN exit code is checked" (module docstring) -- inapplicable to the one
+    mode most likely to fail first on unfamiliar silicon. It was
+    unenforceable, not merely unenforced: `print_caps()` returned `void` and
+    `main()` returned `HEXLIB_EXIT_OK` unconditionally, so on a device whose
+    image has no `libcdsprpc.so` for this ABI, `--caps` printed "could not
+    load the FastRPC driver" and exited 0. `print_caps()` now returns
+    HEXLIB_EXIT_SESSION_FAILED (2) on either failure branch, and this asserts
+    RC=0 -- so a driver that will not load fails HERE, loudly, instead of
+    being read as a pass by this test and by every `set -e` wrapper around
+    it."""
+    out = sh(f"cd {DEV} && ADSP_LIBRARY_PATH={DEV} ./hexlib_run --caps; echo RC=$?")
     write_qdc_log("hexlib_caps.log", out)
+    assert "RC=0" in out, (
+        f"hexlib_run --caps exited nonzero -- the FastRPC driver did not load "
+        f"or the capability query failed (both are exit 2, "
+        f"HEXLIB_EXIT_SESSION_FAILED):\n{out}"
+    )
     assert "CDSP (3)" in out, f"expected domain CDSP (3), got:\n{out}"
     assert "arch_ver" in out, f"no arch_ver line at all:\n{out}"
     assert "35957" in out and "0x8c75" in out, f"unexpected arch, expected 35957 (0x8c75):\n{out}"
@@ -64,12 +126,22 @@ def test_scale_fp16_runs_on_the_dsp_and_is_correct():
     brief's earlier draft invented all three. Checked directly against the
     source before writing this assertion.
 
-    KNOWN GAP: `run_self_test()` computes `hexlib_batch_rsp_hdr.cycles_total`
-    (it is right there in the response it already validated) but never
-    prints it, so this file cannot read a silicon cycle count off
-    `hexlib_run`'s own stdout today. Recorded in the task-12 report as the
-    smallest of the three main.c gaps found while writing this file: one
-    `printf` after the PASS line."""
+    GAP CLOSED 2026-08-11 -- AND THE STALE DOCSTRING IS WHY THE ASSERTION WAS
+    MISSING. This said: "KNOWN GAP: `run_self_test()` computes
+    `hexlib_batch_rsp_hdr.cycles_total` ... but never prints it, so this file
+    cannot read a silicon cycle count off `hexlib_run`'s own stdout today."
+    That was superseded by an earlier commit -- `main.c`'s `run_self_test`
+    prints `hexlib: --self-test: cycles_total=%llu` right after the PASS line
+    -- but the docstring stayed, and because it said the line could not be
+    read, nothing here read it. The consequence was concrete: NOTHING ON
+    DEVICE asserted the `cycles_total=` line at all, so deleting those two
+    `printf` lines from main.c would have kept all five of this file's tests
+    green while flipping `hexlib/cli.py`'s post-job check to exit 1 -- the
+    device job passing and the gate above it failing, off the same run.
+
+    The assertion below is now the load-bearing one for stage 3's most
+    important open question: whether PCYCLE advances at all in a user-mode
+    unsigned PD. See `assert_cycles_total_is_a_real_measurement`."""
     out = sh(f"cd {DEV} && ADSP_LIBRARY_PATH={DEV} ./hexlib_run --self-test; echo RC=$?")
     write_qdc_log("hexlib_selftest.log", out)
     assert "RC=0" in out, f"hexlib_run --self-test exited nonzero:\n{out}"
@@ -77,6 +149,7 @@ def test_scale_fp16_runs_on_the_dsp_and_is_correct():
         f"the PASS line must be PRESENT -- absence is failure, not success:\n{out}"
     )
     assert "bit-exact)" in out, f"PASS line present but not the bit-exact qualifier:\n{out}"
+    assert_cycles_total_is_a_real_measurement(out, "hexlib_run --self-test")
     # A weaker, supplementary check ONLY -- the two asserts above already
     # require the specific success line to be present; this just also rules
     # out a run that printed both the PASS line AND a mismatch report, which
@@ -173,17 +246,63 @@ def test_cache_coherency_is_independent_of_marshalling_and_of_any_kernel():
     is rejected -- which is the honest state of this discriminator today: not
     yet expressible, not silently skipped.
 
-    CRUCIAL CORRECTION (design doc 6.1, 2026-08-11): THE SENTINEL ALONE DOES
+    FIRST CORRECTION (design doc 6.1, 2026-08-11): THE SENTINEL ALONE DOES
     NOT DISCRIMINATE. If dispatch silently no-ops and still returns
-    HEXLIB_DSP_OK -- a MARSHALLING bug -- the observable is identical to a
-    coherency miss: status OK, sentinel intact. What separates them is
-    `cycles_total` from the response header, which a no-op cannot fake:
+    HEXLIB_DSP_OK, the observable is identical to a coherency miss: status OK,
+    sentinel intact.
+
+    SECOND CORRECTION (design doc 6.1, same day) -- AND THE FIRST
+    CORRECTION'S OWN FIX WAS ALSO WRONG. It said `cycles_total` separates the
+    two, and printed this table, WHICH IS NOW RETRACTED:
       cycles 0,  sentinel intact      -> kernel never ran: a dispatch bug
       cycles >0, sentinel intact      -> ran, write never reached host: COHERENCY
       cycles >0, sentinel overwritten -> healthy, for this direction
+    It does not separate them, for three reasons:
+      1. ROW 1 IS UNREACHABLE. main.c reads the sentinel only after BOTH the
+         batch status and the op's own result->status are HEXLIB_DSP_OK, which
+         in skel_dispatch.c happens only if `k->fn(&a)` was called and
+         returned OK. PCYCLE brackets exactly that call, so cycles > 0 for any
+         real call. Dispatch REFUSING the batch is distinguishable -- by exit
+         4 and by NO COHERENCY line at all -- but not by a cycle count.
+      2. THE NAMED DEFECT IS INVISIBLE TO IT. "Dispatch no-ops and returns OK"
+         means a generated entry or kernel that returns OK WITHOUT WRITING
+         `y`. PCYCLE still brackets a real returning call, so cycles > 0 and
+         the sentinel is intact -- row 2 fires and prints
+         `sentinel_unchanged`, misattributing a dispatch bug to coherency.
+      3. IF PCYCLE READS 0 IN THE UNSIGNED PD, EVERY ROW INVERTS: a genuine
+         coherency miss would read cycles 0 + sentinel intact, which row 1
+         called a dispatch bug.
+
+    WHAT THE OUTPUT ACTUALLY MEANS (the honest table; see design 6.1 and
+    run_coherency_check()'s own header comment in main.c):
+      no COHERENCY line, exit 4          -> dispatch refused the batch. The
+                                            one genuinely diagnostic outcome.
+      cycles_total=0, any COHERENCY line -> THE COUNTER IS DEAD, not "the
+                                            kernel never ran" (see 1). Settle
+                                            this before reading anything else.
+      cycles >0, sentinel_overwritten    -> the DSP's write reached the host,
+                                            for scale_fp16's write pattern and
+                                            this buffer size only.
+      cycles >0, sentinel_unchanged      -> NOT DISCRIMINATED: a coherency
+                                            miss, OR a kernel/entry that
+                                            returned OK without writing `y`,
+                                            OR an fd mapped elsewhere. Rule
+                                            the no-op out with the ordinary
+                                            --self-test (factor 0.125, whose
+                                            bit-exact values a no-op cannot
+                                            produce) BEFORE spending a job on
+                                            cache flags.
+      cycles >0, buffer_garbled          -> partial or misdirected write. Its
+                                            own outcome, never folded above.
+
+    WHAT WOULD DISCRIMINATE, deliberately not built: a skel-side echo or
+    memset op with its own kind id, so the write is performed by the skel and
+    not by any generated kernel. Deferred in 6.1; reason 2 above is what that
+    deferral costs.
+
     Two limits stated rather than implied: riding on `scale_fp16` is NOT
-    kernel-independent (needs a skel-side echo op, deferred), and this covers
-    only DSP-write -> host-read. The host-write -> DSP-read direction, which
+    kernel-independent (needs that skel-side echo op), and this covers only
+    DSP-write -> host-read. The host-write -> DSP-read direction, which
     every input buffer and the batch blob depend on, is UNTESTED.
 
     """
@@ -197,4 +316,11 @@ def test_cache_coherency_is_independent_of_marshalling_and_of_any_kernel():
         "the CPU must observe the DSP's own write, not a stale sentinel -- "
         f"a coherency miss looks exactly like a marshalling bug, and this line's "
         f"absence is that miss:\n{out}"
+    )
+    # NECESSARY, NOT SUFFICIENT -- see the second correction above. A positive
+    # cycles_total does NOT prove this was a coherency verdict rather than a
+    # dispatch one; it rules out exactly one thing, that the DSP measured
+    # nothing at all, which would make every other line here unreadable.
+    assert_cycles_total_is_a_real_measurement(
+        out, "hexlib_run --self-test --coherency-check"
     )

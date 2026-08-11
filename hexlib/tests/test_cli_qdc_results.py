@@ -333,3 +333,136 @@ def test_parse_refuses_an_unrecognized_root_tag(tmp_path):
     p.write_text('<report tests="4" failures="0" errors="0"></report>')
     with pytest.raises(cli._QdcResultsError, match="testsuite"):
         cli._qdc_parse_results_xml(str(p))
+
+
+# ==============================================================================
+# `cycles_total=0` -- A MEASUREMENT THAT MEASURED NOTHING.
+#
+# The measurement-lines check was `_CYCLES_TOTAL_MARKER not in combined`, a
+# pure substring test. `cycles_total=0` contains `cycles_total=`, so it
+# passed: a run in which the DSP's PCYCLE counter never advanced at all
+# printed "measurement lines present" and exited 0. That was reproduced
+# against fabricated local logs before this fix -- a log carrying
+# `hexlib: --self-test: cycles_total=0` and a clean
+# `<testsuite tests="5" failures="0" errors="0">` produced
+# "job 1: 5 test(s), 0 failures, 0 errors, measurement lines present" and
+# return code 0.
+#
+# It is not a hypothetical shape. The skel reads PCYCLE inside a user-mode
+# unsigned PD, where SYSCFG.PCYCLEEN cannot be set (skel_dispatch.c's
+# hexlib_read_pcycle, and include/hexlib/hexlib_harness.h, which sets that bit
+# explicitly for the standalone runtime because the register reads 0 without
+# it). So zero is exactly what the FIRST silicon job would print if the
+# counter is dead there -- the single most important thing that job can
+# report, and the one thing this check used to swallow.
+# ==============================================================================
+
+ZERO_CYCLES_LINE = "hexlib: --self-test: cycles_total=0"
+
+
+def test_a_zero_cycle_count_is_a_failure_never_a_pass(monkeypatch, tmp_path, capsys):
+    """THE DEFECT ITSELF. The PASS line is present, results.xml is clean, and
+    `cycles_total=` is literally in the logs -- and this must still fail,
+    because the value is 0 and a run that measured nothing did not measure
+    anything."""
+    _stub_build_submit_and_wait(monkeypatch)
+    paths = _fake_fetch(
+        tmp_path,
+        results_xml='<testsuite tests="5" failures="0" errors="0"></testsuite>',
+        extra_logs={"hexlib_selftest.log": f"{PASS_LINE}\n{ZERO_CYCLES_LINE}\n"},
+    )
+    monkeypatch.setattr(job, "fetch", lambda job_id, dest: paths)
+    rc = cli._qdc_submit(_args(tmp_path))
+    assert rc != 0, (
+        "cycles_total=0 satisfied the old substring check and exited 0 -- a "
+        "success value with a literal zero measurement inside it"
+    )
+    err = capsys.readouterr().err.lower()
+    assert "cycles_total" in err
+    assert "0" in err
+
+
+def test_a_malformed_cycle_count_is_a_failure(monkeypatch, tmp_path, capsys):
+    """A `cycles_total=` whose value is not a decimal integer at all -- a
+    truncated log, interleaved output, or a format change nobody updated this
+    for. Must fail, and must say it is malformed rather than reporting it as
+    absent (it is not absent) or as zero (it is not zero)."""
+    _stub_build_submit_and_wait(monkeypatch)
+    paths = _fake_fetch(
+        tmp_path,
+        results_xml='<testsuite tests="5" failures="0" errors="0"></testsuite>',
+        extra_logs={
+            "hexlib_selftest.log": f"{PASS_LINE}\nhexlib: cycles_total=<gar\n"
+        },
+    )
+    monkeypatch.setattr(job, "fetch", lambda job_id, dest: paths)
+    rc = cli._qdc_submit(_args(tmp_path))
+    assert rc != 0
+    err = capsys.readouterr().err.lower()
+    assert "cycles_total" in err
+    assert "integer" in err or "malform" in err
+
+
+def test_a_positive_cycle_count_alongside_a_zero_one_still_passes(monkeypatch, tmp_path):
+    """One job's logs carry SEVERAL `cycles_total=` lines -- `--self-test`
+    prints one and `--coherency-check` prints another -- and there is no
+    requirement that every mode a job ran produced a nonzero count. At least
+    one genuine measurement is the bar. If PCYCLE were dead in the unsigned
+    PD, every line would read 0 and this leniency could not hide it, which is
+    what the test above pins."""
+    _stub_build_submit_and_wait(monkeypatch)
+    paths = _fake_fetch(
+        tmp_path,
+        results_xml='<testsuite tests="5" failures="0" errors="0"></testsuite>',
+        extra_logs={
+            "hexlib_selftest.log": f"{PASS_LINE}\n{ZERO_CYCLES_LINE}\n{CYCLES_LINE}\n"
+        },
+    )
+    monkeypatch.setattr(job, "fetch", lambda job_id, dest: paths)
+    assert cli._qdc_submit(_args(tmp_path)) == 0
+
+
+# Direct unit tests of the verdict function, so each of its four states is
+# pinned without going through the whole submit path.
+
+
+def test_cycles_verdict_absent():
+    ok, detail = cli._qdc_cycles_total_verdict("nothing measured here at all\n")
+    assert ok is False
+    assert "anywhere" in detail
+
+
+def test_cycles_verdict_zero():
+    ok, detail = cli._qdc_cycles_total_verdict("hexlib: cycles_total=0\n")
+    assert ok is False
+    assert "0" in detail
+
+
+def test_cycles_verdict_negative_is_malformed_not_a_measurement():
+    """`cycles_total` is printed with `%llu` (main.c), so a minus sign cannot
+    come from a healthy run. It must not parse as an integer that then fails
+    the `> 0` test for the WRONG stated reason, and it must certainly not be
+    accepted."""
+    ok, detail = cli._qdc_cycles_total_verdict("hexlib: cycles_total=-5\n")
+    assert ok is False
+    assert "integer" in detail
+
+
+def test_cycles_verdict_malformed():
+    ok, detail = cli._qdc_cycles_total_verdict("hexlib: cycles_total=abc\n")
+    assert ok is False
+    assert "integer" in detail
+
+
+def test_cycles_verdict_positive():
+    ok, detail = cli._qdc_cycles_total_verdict("hexlib: cycles_total=1287\n")
+    assert ok is True
+    assert "1287" in detail
+
+
+def test_cycles_verdict_takes_the_largest_positive_value():
+    ok, detail = cli._qdc_cycles_total_verdict(
+        "cycles_total=0\ncycles_total=42\ncycles_total=1287\n"
+    )
+    assert ok is True
+    assert "1287" in detail

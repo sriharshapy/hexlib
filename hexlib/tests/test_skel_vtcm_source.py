@@ -22,12 +22,44 @@ from hexlib.tests.csource import code_only as _code_only
 from hexlib.tests.csource import function_body as _function_body
 
 SRC = pathlib.Path("hexlib/runtime/skel/skel_vtcm.c")
+INTERNAL = pathlib.Path("hexlib/runtime/skel/skel_internal.h")
 
 
 @pytest.fixture(scope="module")
 def src():
     """Comment-blanked. Length-preserving, so csource's offsets stay valid."""
     return _code_only(SRC.read_text())
+
+
+@pytest.fixture(scope="module")
+def internal():
+    """skel_internal.h, comment-blanked -- the reclaim flag's DECLARATION is
+    part of the reclaim mechanism this file is about, and the one property that
+    cannot be checked from skel_vtcm.c alone."""
+    return _code_only(INTERNAL.read_text())
+
+
+def test_the_reclaim_flag_is_declared_volatile(internal):
+    """CROSS-THREAD, AND IT WAS A PLAIN `int`. `release_callback` (skel_vtcm.c)
+    sets `ctx->vtcm_needs_release` from HAP_compute_res's own QuRT thread;
+    hexlib_dispatch_batch's per-op loop reads it. Nothing in the source made
+    the reader re-read memory -- it worked only because the loop body calls
+    `k->fn(&a)` through a function pointer the compiler cannot see into, which
+    forces a reload of anything that has escaped. An inlined or
+    constant-propagated kernel removes that accidental barrier and the load
+    can be hoisted out of the loop, at which point a mid-batch reclaim request
+    is never observed, the competing session waits on VTCM this one will not
+    return, and no source line looks any different.
+
+    Checked against the comment-blanked header, so the word "volatile"
+    appearing in the explanatory comment beside it cannot satisfy this."""
+    m = re.search(r"^\s*(.*?)\bvtcm_needs_release\s*;", internal, re.MULTILINE)
+    assert m, "skel_internal.h no longer declares vtcm_needs_release"
+    assert "volatile" in m.group(1), (
+        f"vtcm_needs_release is written from release_callback's QuRT thread "
+        f"and read in the dispatch loop, so its declaration must be volatile; "
+        f"found `{m.group(0).strip()}`"
+    )
 
 
 def test_size_comes_from_the_runtime_never_a_constant(src):

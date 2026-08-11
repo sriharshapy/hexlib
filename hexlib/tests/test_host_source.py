@@ -344,6 +344,42 @@ def test_buffers_use_rpcmem_and_fastrpc_mmap(buffers):
     assert i_alloc < i_fd < i_mmap
 
 
+def test_a_size_that_would_truncate_on_the_way_down_is_refused(buffers):
+    """`size` is a `size_t` and is narrowed TWICE: `(int) size` for
+    rpcmem_alloc and `(uint32_t) size` for hexlib_iface_mmap (qaic's own
+    generated signature from the IDL). Neither cast can report a loss, and they
+    can disagree with each other -- 2 GiB or more would register a mapping of
+    one length for a buffer allocated at another, and `(int) size` can go
+    negative outright.
+
+    Unreachable today (every call site passes a plan-computed tensor size) and
+    it fails closed on the DSP side if it ever were not (skel_bufs.c's
+    `b->size > m->size` check), so the fix is deliberately a guard rather than
+    a widening of the wire. What this pins is that the guard runs BEFORE the
+    first cast: a check placed after rpcmem_alloc protects nothing, because the
+    truncation has already happened by then."""
+    body = _function_body(buffers, "hexlib_alloc")
+    # `[^{]*` rather than `[^)]*`: the bound is written with a cast in it
+    # (`(size_t) INT_MAX`), so the condition legitimately contains parens.
+    m = re.search(r"if\s*\([^{]*\bsize\s*>[^{]*\)\s*\{", body)
+    assert m, (
+        "hexlib_alloc must refuse a size too large for the int/uint32 casts "
+        "below it -- neither cast can report the truncation"
+    )
+    assert m.start() < body.index("hexlib_rpcmem_alloc("), (
+        "the size guard must run before the first narrowing cast, not after it"
+    )
+    guard = _block_from(body, m.end() - 1)
+    assert "return -1;" in guard, (
+        "an out-of-range size must be refused, not merely logged"
+    )
+    assert "INT_MAX" in body, (
+        "the bound must be the narrower of the two casts (rpcmem_alloc's int), "
+        "not uint32's -- a value that fits uint32 can still be negative as an "
+        "int"
+    )
+
+
 def test_the_host_never_puts_an_address_on_the_wire(buffers):
     """hexlib_buf_to_desc -- the one place a hexlib_buf_desc is filled in from
     this side -- must zero `base` itself, first (right after the memset, not
@@ -651,6 +687,109 @@ def test_coherency_check_verifies_the_surviving_bytes_are_really_the_sentinel(ma
     assert "HEXLIB_EXIT_COHERENCY_GARBLED" in main
     assert "exit_code = HEXLIB_EXIT_COHERENCY_GARBLED;" in body
     assert '"COHERENCY buffer_garbled\\n"' in body
+
+
+def test_caps_reports_a_driver_failure_through_its_exit_code(main):
+    """`--caps` EXITED 0 WHEN THE DRIVER FAILED TO LOAD. `print_caps()`
+    returned `void`, both failure branches printed to stderr and returned, and
+    `main()` returned HEXLIB_EXIT_OK regardless -- so on a device whose image
+    has no `libcdsprpc.so` for this ABI, `./hexlib_run --caps; echo RC=$?`
+    printed "could not load the FastRPC driver" and `RC=0`, which any `set -e`
+    wrapper or CI step reads as a pass. It is also the first mode run on
+    unfamiliar silicon and the one most likely to fail there.
+
+    Three things are checked, because the defect needed all three to be wrong:
+    the function returns int, EVERY early return in it carries a nonzero exit
+    constant, and main() actually propagates the value instead of discarding
+    it."""
+    m = re.search(r"\bstatic\s+int\s+print_caps\s*\(\s*void\s*\)", main)
+    assert m, (
+        "print_caps must return an exit code, not void -- a void return is "
+        "why a driver-load failure exited 0"
+    )
+    body = _function_body(main, "print_caps")
+    returns = re.findall(r"return\s+([^;]+);", body)
+    assert returns, "print_caps must return something"
+    assert all(r.strip().startswith("HEXLIB_EXIT_") for r in returns), (
+        f"every return in print_caps must be a named exit code, got {returns!r}"
+    )
+    # The two failure branches must NOT return OK; the last (success) one must.
+    assert returns[-1].strip() == "HEXLIB_EXIT_OK", (
+        f"print_caps's final, success return must be OK, got {returns[-1]!r}"
+    )
+    for r in returns[:-1]:
+        assert r.strip() != "HEXLIB_EXIT_OK", (
+            "a print_caps failure branch returns HEXLIB_EXIT_OK -- that is the "
+            "original defect, moved rather than fixed"
+        )
+
+    main_body = _function_body(main, "main")
+    caps_pos = main_body.index('"--caps"')
+    caps_block = _block_from(main_body, caps_pos)
+    assert re.search(r"return\s+print_caps\s*\(\s*\)\s*;", caps_block), (
+        "main() must RETURN print_caps()'s value -- calling it and then "
+        "returning HEXLIB_EXIT_OK is exactly the bug"
+    )
+    assert "HEXLIB_EXIT_OK" not in caps_block, (
+        "main()'s --caps branch must not name a constant exit code at all; "
+        "the code comes from print_caps()"
+    )
+
+
+# The three places §6.1's coherency table is written down. A doc claiming a
+# guarantee the code does not deliver is, on this project, a defect at the same
+# weight as a code bug -- so the correction has to land in all three or the
+# stale one becomes the one someone reads on the first device job.
+_COHERENCY_TABLE_SITES = (
+    pathlib.Path("hexlib/runtime/host/main.c"),
+    pathlib.Path("docs/superpowers/specs/2026-08-10-silicon-path-runtime-design.md"),
+    pathlib.Path("hexlib/device/qdc/test_on_device.py"),
+)
+
+# Each element of the correction, and why it must be present in every copy:
+#   "unreachable"      -- row 1 (`cycles 0` + sentinel intact -> "a dispatch
+#                         bug") cannot happen: reaching the read-back at all
+#                         requires both statuses OK, which requires k->fn to
+#                         have been called and returned OK, and PCYCLE brackets
+#                         exactly that call.
+#   "not discriminated" -- the `sentinel_unchanged` row is consistent with a
+#                         coherency miss AND with a kernel/entry that returned
+#                         OK without writing `y`. Calling it "COHERENCY" is the
+#                         misattribution §6.1 exists to prevent.
+#   "PCYCLEEN"         -- if the counter does not advance in the unsigned PD,
+#                         every row inverts; that is why a zero is asserted
+#                         against rather than assumed impossible.
+#   "buffer_garbled"   -- the third outcome a previous fix added must appear in
+#                         the table too, or the table is still incomplete.
+_CORRECTION_ELEMENTS = ("unreachable", "not discriminated", "pcycleen", "buffer_garbled")
+
+
+# IDS ARE HAND-WRITTEN, NOT DERIVED FROM THE FILENAME. `ids=lambda p: p.name`
+# put the literal text `test_on_device.py` into a node id, and
+# test_qdc_on_device_is_excluded.py asserts that exact string never appears in
+# `pytest --collect-only` output (its way of proving the on-device file is not
+# collected) -- so a parametrize id here made THAT test fail, on a file that
+# was correctly excluded. Reproduced before this comment existed.
+@pytest.mark.parametrize(
+    "path", _COHERENCY_TABLE_SITES, ids=("host_main", "design_spec", "device_test")
+)
+def test_the_coherency_table_correction_landed_everywhere_it_is_written_down(path):
+    """READ WITH COMMENTS ON, DELIBERATELY -- unlike every other check in this
+    file. The subject IS the prose: §6.1's table is a claim made to a human
+    about what the first device job's output will mean, and it was asserting a
+    separation the code does not achieve. Two of the three copies are comments
+    (main.c's `run_coherency_check` header, test_on_device.py's docstring) and
+    the third is a design doc, so blanking comments would make this assert
+    nothing.
+
+    Deleting the correction from ANY ONE of the three fails this."""
+    text = path.read_text(encoding="utf-8").lower()
+    missing = [e for e in _CORRECTION_ELEMENTS if e not in text]
+    assert not missing, (
+        f"{path} is missing part of §6.1's corrected coherency table: "
+        f"{missing!r}. All three copies must say the same thing -- a stale one "
+        f"is the copy someone reads while triaging job 1."
+    )
 
 
 def test_coherency_check_documents_its_own_scope_limits(main_comments):
