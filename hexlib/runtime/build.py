@@ -756,40 +756,30 @@ def build_device_binary(out_dir: str, sdk_root: str | None = None) -> str:
         os.path.join(root, "ipc", "fastrpc", "rpcmem", "inc"),
     ]
 
-    # THE QAIC STUB ITSELF NEEDS libcdsprpc.so AT LINK TIME -- NOT MERELY AT
-    # RUNTIME. <remote.h>'s remote_handle64_open/_invoke/_close are declared as
-    # ordinary strong externs (confirmed by reading incs/remote.h: no `weak`
-    # attribute, __QAIC_REMOTE(ff) defaults to identity), and
-    # hexlib_iface_stub.c (qaic-generated, never hand-edited) calls them
-    # directly -- linking without this fails with "undefined symbol:
-    # remote_handle64_open/_invoke/_close" (confirmed: this was the first
-    # thing this build hit). The SDK ships a real aarch64 import stub for
-    # exactly this at ipc/fastrpc/remote/ship/android_aarch64/libcdsprpc.so
-    # (confirmed ELF64 EM_AARCH64) -- the same file every SDK Android FastRPC
-    # example links against directly, never vendored into this repo.
-    #
-    # A NOTED TENSION WITH host/driver.c, NOT PAPERED OVER: driver.c's own
-    # header comment says linking libcdsprpc.so directly is deliberately
-    # avoided so a missing driver becomes "a readable message, not a loader
-    # failure" -- and dlsym's remote_handle64_open/_invoke/_close itself
-    # (required=1) as if that goal covered them too. It cannot: those three
-    # symbols are called directly by the qaic-generated stub, not through
-    # driver.c's own function-pointer indirection, so THIS link-time
-    # dependency is unavoidable for the marshalled RPC path to exist at all.
-    # In practice this means a device lacking libcdsprpc.so will fail to
-    # start hexlib_run at process load (a dynamic-linker error), not print
-    # the graceful message driver.c's design intends -- see the task report.
-    cdsprpc_dir = os.path.join(root, "ipc", "fastrpc", "remote", "ship", "android_aarch64")
-    cdsprpc_so = os.path.join(cdsprpc_dir, "libcdsprpc.so")
-    if not os.path.isfile(cdsprpc_so):
-        raise RuntimeBuildError(f"libcdsprpc.so import stub not found: {cdsprpc_so}")
-
+    # NO libcdsprpc.so IMPORT LIBRARY HERE -- DELIBERATELY. The qaic-generated
+    # stub (hexlib_iface_stub.c, never hand-edited) calls
+    # remote_handle64_open/_invoke/_close directly, as ordinary strong
+    # `extern` functions declared in <remote.h> (confirmed: no `weak`
+    # attribute there, __QAIC_REMOTE(ff) defaults to identity). The first
+    # version of this function linked against the SDK's own aarch64 import
+    # stub (ipc/fastrpc/remote/ship/android_aarch64/libcdsprpc.so) to satisfy
+    # that -- it linked, but it reintroduced the exact failure mode
+    # driver.c's own "WHY DLOPEN AND NOT A LINK-TIME DEPENDENCY" comment
+    # exists to avoid: a device missing libcdsprpc.so would fail to even
+    # start hexlib_run (a dynamic-linker load error, before main() runs),
+    # never reaching hexlib_drv_init()'s readable message at all. Fixed at
+    # the source instead: driver.c now DEFINES remote_handle64_open/_invoke/
+    # _close itself, as thin forwarders to the hexlib_remote_handle64_*
+    # function pointers it already dlsym's -- see driver.c's own comment on
+    # them. That satisfies the stub's link-time reference without ever
+    # linking libcdsprpc.so at build time, so the driver stays exclusively
+    # dlopen'd, exactly as designed.
     exe = os.path.join(out_dir, "hexlib_run")
     cmd = [clang, "-O2"]
     for d in includes:
         cmd.append(f"-I{d}")
     cmd += sources
-    cmd += ["-o", exe, f"-L{cdsprpc_dir}", "-lcdsprpc", "-ldl", "-llog"]
+    cmd += ["-o", exe, "-ldl", "-llog"]
 
     rc, out, err, to = tc.run(cmd, os.environ.copy(), timeout=tc.SIM_TIMEOUT_S)
     if to or rc != 0 or not os.path.isfile(exe):

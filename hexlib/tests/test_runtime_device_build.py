@@ -71,8 +71,121 @@ def test_device_skel_link_flags_are_the_dll_recipe_not_the_sim_one():
 
 
 @sdk
+def test_device_skel_so_actually_carries_the_symbolic_dynamic_flag(tmp_path):
+    """FIX 2 (coordinator review): the test above only inspects the
+    `DEVICE_SKEL_LINK_FLAGS` constant and would still pass if
+    `_build_device_skel_so` stopped splicing it into the real link command
+    (e.g. if it started building the flags list itself instead of using this
+    one). This closes that gap by reading `-Wl,-Bsymbolic`'s effect back OUT
+    OF THE ARTIFACT: a linker that honoured `-Bsymbolic` records a `DT_SYMBOLIC`
+    (0x10) tag in the `.so`'s own `PT_DYNAMIC` segment -- confirmed against a
+    real build with the Hexagon toolchain's own `hexagon-readelf -d` before
+    writing this parser.
+
+    `--wrap=malloc/calloc/free/realloc/memalign` is DELIBERATELY NOT CHECKED
+    THIS WAY. Checked with `hexagon-nm -u` against a real build: none of
+    skel.c/skel_bufs.c/skel_vtcm.c/skel_dispatch.c or the generated entries
+    reference malloc/calloc/free/realloc/memalign at all (Hexagon's `--wrap`
+    only rewrites a call site that actually exists), so there is NO ARTIFACT
+    EVIDENCE the flags could leave in THIS SPECIFIC BUILD even when they are
+    genuinely present on the link line and doing exactly what they are meant
+    to. Asserting anything artifact-shaped here would be inventing a proxy,
+    which the review this test responds to explicitly said not to do.
+    """
+    rb.build_device_binary(str(tmp_path))
+    so = os.path.join(str(tmp_path), "libhexlib_skel.so")
+    with open(so, "rb") as f:
+        data = f.read()
+    DT_SYMBOLIC = 0x10
+    assert DT_SYMBOLIC in _elf32_dynamic_tags(data), (
+        "libhexlib_skel.so has no DT_SYMBOLIC dynamic tag -- -Wl,-Bsymbolic "
+        "from DEVICE_SKEL_LINK_FLAGS did not actually reach the link"
+    )
+
+
+def _elf32_dynamic_tags(data):
+    """Every DT_* tag present in an ELF32 file's PT_DYNAMIC segment (Hexagon
+    is ELFCLASS32 -- confirmed by reading ei_class, byte 4, == 1 -- so this
+    uses Elf32_Phdr/Elf32_Dyn layouts, not the 64-bit ones the aarch64 helper
+    below needs)."""
+    assert data[:4] == b"\x7fELF"
+    assert data[4] == 1, "expected ELFCLASS32 for a Hexagon ELF"
+    e_phoff = struct.unpack_from("<I", data, 0x1C)[0]
+    e_phentsize = struct.unpack_from("<H", data, 0x2A)[0]
+    e_phnum = struct.unpack_from("<H", data, 0x2C)[0]
+    PT_DYNAMIC = 2
+    tags = set()
+    for i in range(e_phnum):
+        off = e_phoff + i * e_phentsize
+        p_type, p_offset, _, _, p_filesz, _, _, _ = struct.unpack_from("<IIIIIIII", data, off)
+        if p_type != PT_DYNAMIC:
+            continue
+        pos, end = p_offset, p_offset + p_filesz
+        while pos + 8 <= end:
+            d_tag, _ = struct.unpack_from("<iI", data, pos)
+            pos += 8
+            if d_tag == 0:  # DT_NULL
+                break
+            tags.add(d_tag)
+    return tags
+
+
+def _elf64_note_android_api(data):
+    """The NDK API level actually baked into an aarch64 ELF's
+    `.note.android.ident` PT_NOTE segment (every NDK-clang-built Android ELF
+    carries one; verified against the real hexlib_run with the NDK's own
+    llvm-readelf before writing this parser). Returns None if no such note is
+    present -- callers must not treat that as API 0."""
+    assert data[:4] == b"\x7fELF"
+    assert data[4] == 2, "expected ELFCLASS64 for an aarch64 ELF"
+    e_phoff = struct.unpack_from("<Q", data, 0x20)[0]
+    e_phentsize = struct.unpack_from("<H", data, 0x36)[0]
+    e_phnum = struct.unpack_from("<H", data, 0x38)[0]
+    PT_NOTE = 4
+    for i in range(e_phnum):
+        off = e_phoff + i * e_phentsize
+        p_type, _ = struct.unpack_from("<II", data, off)
+        if p_type != PT_NOTE:
+            continue
+        p_offset, _, _, p_filesz = struct.unpack_from("<QQQQ", data, off + 8)
+        pos, end = p_offset, p_offset + p_filesz
+        while pos < end:
+            namesz, descsz, ntype = struct.unpack_from("<III", data, pos)
+            pos += 12
+            name = data[pos:pos + namesz]
+            pos += (namesz + 3) & ~3
+            desc = data[pos:pos + descsz]
+            pos += (descsz + 3) & ~3
+            if name.rstrip(b"\x00") == b"Android" and ntype == 1:  # NT_ANDROID_TYPE_IDENT
+                return struct.unpack_from("<I", desc, 0)[0]
+    return None
+
+
+@sdk
 def test_ndk_clang_exists():
     assert os.path.isfile(rb.ndk_clang(tc.default_sdk_root()))
+
+
+@sdk
+def test_the_built_binary_actually_embeds_the_pinned_api_level(tmp_path):
+    """FIX 2 (coordinator review): `test_ndk_clang_name_is_api_specific_not_a_
+    generic_alias` and `test_android_api_is_pinned` only check constants and a
+    path string in isolation -- both would still pass if `build_device_binary`
+    quietly called a DIFFERENT clang (any other API level, or a generic
+    `aarch64-linux-android-clang` some NDKs also ship) as long as ndk_clang()
+    itself still returned the pinned name. This closes that gap by reading it
+    back OUT OF THE ARTIFACT: every NDK-clang-built Android ELF embeds its
+    target API level as the first 4 bytes of `.note.android.ident`'s
+    NT_ANDROID_TYPE_IDENT description (confirmed against a real build with the
+    NDK's own llvm-readelf before this test was written) -- so this is real
+    evidence the pinned-API clang was the one that actually ran, not a second
+    assertion of the same constant."""
+    exe = rb.build_device_binary(str(tmp_path))
+    with open(exe, "rb") as f:
+        data = f.read()
+    api = _elf64_note_android_api(data)
+    assert api is not None, "hexlib_run has no .note.android.ident -- not an NDK-clang build?"
+    assert api == tc.ANDROID_API, f"binary embeds API {api}, expected {tc.ANDROID_API}"
 
 
 @sdk

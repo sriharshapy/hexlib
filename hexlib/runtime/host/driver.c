@@ -108,3 +108,72 @@ int hexlib_drv_init(void) {
     g_initialized   = 1;
     return 0;
 }
+
+/* ==========================================================================
+ * remote_handle64_open/_invoke/_close -- STRONG, GLOBALLY-NAMED FORWARDERS.
+ *
+ * WHY THESE EXIST AT ALL. The qaic-generated stub (hexlib_iface_stub.c,
+ * never hand-edited -- see main.c's own header comment) calls
+ * `remote_handle64_open`/`_invoke`/`_close` directly, as ordinary strong
+ * `extern` functions declared in <remote.h> (confirmed by reading it: no
+ * `weak` attribute, `__QAIC_REMOTE(ff)` defaults to identity, so the
+ * generated stub really does call these three names literally). Without a
+ * definition for them somewhere in this binary, `hexlib_run` cannot link at
+ * all -- confirmed the hard way (task 10): the first build attempt failed
+ * with "undefined symbol: remote_handle64_open/_invoke/_close".
+ *
+ * THE WRONG FIX, TRIED FIRST AND REVERTED: link directly against the SDK's
+ * `libcdsprpc.so` import stub. That satisfies the linker, but it reintroduces
+ * exactly the failure mode this file's own "WHY DLOPEN AND NOT A LINK-TIME
+ * DEPENDENCY" comment above exists to avoid -- a device missing
+ * `libcdsprpc.so` would fail to even start `hexlib_run` (a dynamic-linker
+ * load error, before `main` runs), never reaching the readable message the
+ * init routine above prints at all.
+ *
+ * THE ACTUAL FIX, matching llama.cpp ggml-hexagon's own `htp-drv.cpp`
+ * (`remote_handle64_open`/`_invoke`/`_close`, right next to the dlopen logic
+ * these are adapted from): define these three names ourselves, as thin
+ * one-line forwarders to the `hexlib_remote_handle64_*` function pointers
+ * the init routine above already dlsym's. This satisfies the stub's
+ * link-time reference WITHOUT linking `libcdsprpc.so` at build time --
+ * `libcdsprpc.so` stays exclusively `dlopen`'d, so a device that lacks it
+ * still gets that routine's own readable stderr message, never a
+ * process-load failure.
+ *
+ * ONLY THESE THREE. `remote_handle_control`/`remote_session_control` are
+ * called only through `hexlib_remote_handle_control`/
+ * `hexlib_remote_session_control` indirection inside session.c -- never as
+ * bare `extern` references from generated code -- so a forwarder for either
+ * would be dead code with no caller.
+ *
+ * NO NULL CHECK HERE, AND NONE IS NEEDED: THIS IS NOT AN OVERSIGHT.
+ * `hexlib_open` in session.c always calls the init routine above first and
+ * returns its error before ever reaching the qaic-generated `_open` call --
+ * the only path that can call into the stub, and therefore into these
+ * forwarders. So by the time any of the three below runs,
+ * `hexlib_remote_handle64_open`/`_invoke`/`_close` are already non-NULL, or
+ * this code is unreachable. A defensive check here would be dead code
+ * guarding against a state the caller has already made impossible.
+ *
+ * PLACED AFTER THE INIT ROUTINE ABOVE, DELIBERATELY, NOT MERELY FOR
+ * READING ORDER: hexlib/tests/test_host_source.py locates that routine's
+ * body by regex, scanning for its own name followed by a `{` with no `;`/`{`
+ * in between -- which would also match INTO one of these forwarders' bodies
+ * if this comment block (mentioning that routine's name several times,
+ * parenthesised, in prose) sat between its signature and one of these three
+ * function definitions. Keeping this block textually AFTER that routine's
+ * closing brace means the test's leftmost search always finds the real
+ * definition first, so it does not matter what prose reappears afterward.
+ * ========================================================================*/
+
+int remote_handle64_open(const char *name, remote_handle64 *ph) {
+    return hexlib_remote_handle64_open(name, ph);
+}
+
+int remote_handle64_invoke(remote_handle64 h, uint32_t dwScalars, remote_arg *pra) {
+    return hexlib_remote_handle64_invoke(h, dwScalars, pra);
+}
+
+int remote_handle64_close(remote_handle64 h) {
+    return hexlib_remote_handle64_close(h);
+}
