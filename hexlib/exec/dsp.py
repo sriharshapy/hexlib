@@ -646,3 +646,70 @@ class DspSimBackend:
         `start()`."""
         self._write_call(wire.pack_batch([], [], []), b"")
         return run_sim(self.work_dir, sdk_root=self.sdk_root)
+
+
+# ---------------------------------------------------------------------------
+# Wiring the DSP into the plan executor
+# ---------------------------------------------------------------------------
+
+
+def interpreter_backends(sim: "DspSimBackend", kinds=None) -> dict:
+    """One `hexlib.exec.interpreter` Backend per op kind that has a kernel.
+
+    This is what makes a WHOLE-ENCODER run on the DSP possible rather than a
+    per-op demonstration. `interpreter.run(model, feeds, backends=...)` takes a
+    mapping from op kind to a callable and falls back to the op registry's numpy
+    reference for anything absent — so the encoder runs end to end from the first
+    kernel onwards, and each new kernel replaces exactly one entry. A kind with
+    no entry is a reference computation, never a silently skipped step.
+
+    ONE SIMULATOR LAUNCH PER OP. `hexagon-sim` is started, run and torn down for
+    every call, so a 259-step encoder is 259 launches. That is minutes at a tiny
+    config and hours at 256x256; it is a correctness path, not a benchmark, and
+    the plan-walking driver that would fix it (one ELF, one invoke, the whole
+    batch) is separate work.
+
+    THE VARIANT IS RESOLVED PER CALL, from the op's own attrs, which is why this
+    cannot be a dict of pre-bound kernels: `transpose` is two kernels and which
+    one an op needs is in its `perm`. `select` refuses an op no variant accepts,
+    so a perm nothing implements is an error here rather than a wrong answer.
+
+    RAW INPUTS ARE QUANTIZED ON THE WAY IN. The interpreter works in
+    `COMPUTE_DTYPE` and the op registry maps q4_0 to float32 (see
+    `graph/eager.py`), so a `matmul_epilogue` weight arrives here as a dense fp32
+    array while the spec declares `q4_0`. It is quantized with
+    `hexlib.exec.quant` and handed over as a `RawTensor`.
+
+    WHAT THAT MEANS FOR ANY ACCURACY CLAIM, and it is not a detail: the DSP then
+    computes with a 4-BIT weight while the reference has the fp32 one, and 4-bit
+    quantization error is ~1/16 of each block's range — orders of magnitude
+    larger than any kernel bug worth hunting. A comparison against the fp32
+    reference measures the FORMAT, not the kernel. To measure the kernel, build
+    the reference from `quant.dequantize_q4_0` of the same bytes; then the only
+    remaining difference is arithmetic. `quant.dequantize_q4_0` exists for that.
+    """
+    from hexlib.exec.runner import SPECS, WIRE_RAW, RawTensor, select
+
+    available = sorted({spec.kind for spec in SPECS.values()})
+    wanted = available if kinds is None else [k for k in kinds if k in available]
+
+    def make(kind: str):
+        def backend(arrays, attrs):
+            from hexlib.exec.quant import quantize_q4_0
+
+            _, spec = select(kind, dict(attrs))
+            prepared = []
+            for a, dt in zip(arrays, spec.inputs):
+                if dt in WIRE_RAW:
+                    arr = np.asarray(a)
+                    prepared.append(
+                        RawTensor(dt, tuple(arr.shape), quantize_q4_0(arr))
+                    )
+                else:
+                    prepared.append(a)
+            out, _ = sim.run(kind, prepared, dict(attrs))
+            return (out,)
+
+        return backend
+
+    return {kind: make(kind) for kind in wanted}
