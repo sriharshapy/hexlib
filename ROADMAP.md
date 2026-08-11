@@ -22,9 +22,14 @@ be attempted, not by difficulty.
 
 **`rmsnorm_fp16` (done).** The first kernel through all five simulation-path gates.
 Bake-off in `kernels/rmsnorm_fp16/BAKEOFF.md`: an adapted v6 `rmsnorm_gain_fp16` won
-at 2021 kernel cycles (34.36x over a 69443-cycle scalar baseline), beating an adapted
-v6 `fp16_rmsnorm` (10498 cycles) by 5.19x. ggml-hexagon's `hvx-norm.h` was not
-evaluated against it — see below.
+at **2231** kernel cycles (**31.13x** over a 69443-cycle scalar baseline), beating an
+adapted v6 `fp16_rmsnorm` (10498 cycles) by **4.71x**. ggml-hexagon's `hvx-norm.h` was
+not evaluated against it — see below.
+
+*(Corrected 2026-08-11: this paragraph read 2021 cycles / 34.36x / 5.19x, which are the
+pre-fix numbers. `BAKEOFF.md`'s "Fix round 2" moved the winner 2021 → 2231 when an
+out-of-bounds read was fixed, and `kernels/rmsnorm_fp16/RESULT.md` — the tool-generated
+record — has said 2231 since. README.md carried the same stale figures.)*
 
 **`rmsnorm_f32` (next).** The first direct head-to-head against production
 ggml-hexagon code. `hvx_fast_rms_norm_mul_f32` (`include/hexlib/hvx/hvx-norm.h`) is
@@ -69,26 +74,40 @@ one moving the most DDR traffic and therefore the one most likely to be memory-b
 in practice. Kinds tied at zero bytes moved (their inputs are already VTCM-resident;
 they cost compute cycles, not DMA) are broken by step count, descending.
 
+**Status column updated 2026-08-11.** `OpDef.kernel` is still `None` for every kind —
+wiring the registry to the kernel directories is a separate change, tracked in
+`docs/STATE.md`'s open items, because it moves figures several tests pin. So
+`Plan.unimplemented` still lists all eleven. The column below reports what actually
+*exists and runs*, which is the more useful fact:
+
 | op kind | steps | predicted bytes moved | status | related backlog kernel |
 |---|---|---|---|---|
-| `matmul_epilogue` | 75 | 55,999,488 | `kernel: None` | fused matmul+bias, closest to `matmul_i8_hmx` |
-| `patchify` | 1 | 1,572,864 | `kernel: None` | runs once, at the input -- now includes the image's own DMA-in |
-| `add` | 25 | 786,432 | `kernel: None` | residual add, elementwise |
-| `layernorm` | 25 | 153,600 | `kernel: None` | reduction, adjacent to `rmsnorm_fp16`/`rmsnorm_f32` |
-| `rope_2d` | 24 | 131,072 | `kernel: None` | 2D variant of `rope_fp16` |
-| `transpose` | 60 | 0 | `kernel: None` | layout op, no DDR traffic once resident |
-| `reshape` | 49 | 0 | `kernel: None` | layout op, no DDR traffic once resident |
-| `matmul` | 24 | 0 | `kernel: None` | unfused QK^T / attn·V, compute-bound not DMA-bound |
-| `scale` | 12 | 0 | `kernel: None` | elementwise |
-| `softmax` | 12 | 0 | `kernel: None` | same subsystem checkpoint as `softmax_fp16` |
-| `cast` | 1 | 0 | `kernel: None` | runs once, at the input |
+| `matmul_epilogue` | 75 | 55,999,488 | **no kernel** — next, and highest value | fused matmul+bias+activation; needs HMX and q4_0 |
+| `patchify` | 1 | 1,572,864 | **no kernel** | runs once, at the input. Must emit merge-block order, not raster |
+| `add` | 25 | 786,432 | ✅ `add_fp16`, gated, dispatchable | residual add, elementwise |
+| `layernorm` | 25 | 153,600 | ⚠️ `layernorm_fp16` gated but **not dispatchable** (no `RunnerSpec`) | reduction, adjacent to `rmsnorm_fp16`/`rmsnorm_f32` |
+| `rope_2d` | 24 | 131,072 | **no kernel** | 2D variant of `rope_fp16` |
+| `transpose` | 60 | 0 | ⚠️ `transpose_th_fp16` covers perm (1,0,2) — 48 of 60 steps. perm (0,2,1) has no kernel | layout op, no DDR traffic once resident |
+| `reshape` | 49 | 0 | ✅ needs no kernel | pure metadata once resident |
+| `matmul` | 24 | 0 | **no kernel** | unfused QK^T / attn·V, compute-bound not DMA-bound. Needs HMX |
+| `scale` | 12 | 0 | ✅ `scale_fp16`, gated, dispatchable | elementwise |
+| `softmax` | 12 | 0 | **no kernel** | must use the fp32 exp path — see `docs/hvx/upstream-findings.md` |
+| `cast` | 1 | 0 | ✅ `cast_f32_f16`, gated, dispatchable | runs once, at the input |
+
+**86 of the 259 ops that need a kernel are covered and dispatchable today**; 49 of the
+308 steps are reshapes needing none. `matmul_epilogue` and `matmul` together are 99 of
+the remaining 173, and are the only two requiring HMX — which this codebase has not yet
+used at all.
 
 Total across all eleven kinds: `predicted_bytes_moved = 58,643,456` at 256x256, against
 the measured `vtcm_high_water = 5,355,648` of an 8,388,608-byte budget (63.8%). Both
 figures now include the image's DMA-in and the encoder output's DMA-out (previously
 missing entirely -- see the whole-branch fix report), and `vtcm_high_water` now
 includes the const/weight-streaming region (previously computed and budget-checked,
-but never folded into `plan.vtcm` or the reported high-water number). See
-`.superpowers/sdd/2026-08-09-vlm-encoder-m1-pass-pipeline/task-9-report.md` for the
-original plan and `final-fix-report.md` for the cross-cutting fixes that produced the
-numbers above.
+but never folded into `plan.vtcm` or the reported high-water number).
+
+Reproduce both numbers yourself with `hexlib plan qwen35 --print`, which needs no SDK.
+The reasoning behind each fix is in the commit that made it — `git log --grep=vtcm` and
+`git log --grep=traffic` — and the durable summary is in `docs/STATE.md`. (Earlier
+revisions of this section cited report files under `.superpowers/`, which is a
+git-ignored agent scratch directory and therefore not something a reader can open.)

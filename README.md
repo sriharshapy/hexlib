@@ -1,111 +1,233 @@
 # hexlib
 
-A kernel library and programming model for Qualcomm Hexagon NPUs. hexlib gives
-developers callable, verified, cycle-measured kernels, and gives kernel authors a
-documented way to write and run their own, targeting a single NSP (v75) first.
+**A compiler and kernel library for Qualcomm Hexagon NPUs.**
 
-**The Hexagon SDK is required to use hexlib at all** — not just to contribute to it.
-Every command below that touches a kernel (`hexlib test`, and anything that compiles
-or simulates) needs `hexagon-clang` and `hexagon-sim` from the SDK, discovered through
-`HEXAGON_SDK_ROOT`. hexlib never vendors, bundles, or fetches the SDK; it is
-license-restricted and you obtain it yourself. If you don't have it, you can still
-read the docs, write scalar reference implementations, and design `spec.json` files
-(see `CONTRIBUTING.md`), but you cannot build or run a kernel.
+hexlib takes a neural network, compiles it to an explicit VTCM and DMA plan, and
+executes that plan against hand-written HVX/HMX kernels on a Hexagon NSP — targeting
+v75 (Snapdragon 8 Gen 3 / SM8650) first. Every kernel arrives with a correctness
+verdict against a scalar reference, a cycle count, ELF-level proof that the vector or
+matrix unit was genuinely used, and near-miss variants that must still fail.
 
-## What v1 covers
+Two things make it unusual. **The scheduling layer is pure host Python** — the graph,
+the passes, the allocator and the plan need no SDK, no simulator and no device, which
+is where most of the contribution surface lives. And **the verification is adversarial
+by construction**: a kernel does not pass because it produced plausible numbers, it
+passes because a deliberately-broken variant of it demonstrably fails.
 
-This is the **simulation path**. Kernels compile with `hexagon-clang` and run on
-`hexagon-sim`; correctness, cycle counts, and HVX/HMX use (proven from the compiled
-ELF, not from source text or a self-reported flag) all come from the simulator.
-**Device backends (`--device local`, `--device qdc`) and silicon validation (gate 6)
-are not implemented in this plan** — they arrive with the silicon-path plan. Nothing
-here should be read as a working device pipeline; `hexlib test --device local` and
-`--device qdc` currently just print that the backend isn't implemented yet.
+---
 
-## The model path
+## Status
 
-`hexlib plan qwen35 --print` compiles the Qwen3.5-0.8B vision encoder to a VTCM
-and DMA plan and prints it: the high-water mark, the predicted DDR traffic, and
-the op kinds that still have no kernel. It needs no SDK, no simulator and no
-device — the whole graph and scheduling layer is pure host Python, which is
-where most of the contribution surface is. See
-[`docs/superpowers/specs/2026-08-09-vlm-encoder-design.md`](docs/superpowers/specs/2026-08-09-vlm-encoder-design.md).
+Honest state, because this project's own worst recurring bug is a claim that outruns
+its evidence.
+
+| | what works | where |
+|---|---|---|
+| **Kernel pipeline** | ✅ shipped | write a `.c`, run `hexlib test`, get a gate verdict + cycles + ELF proof |
+| **Graph → plan compiler** | ✅ shipped | `hexlib plan qwen35 --print`, no SDK needed |
+| **Plan executor** | ✅ shipped | whole encoder runs end to end, validated against PyTorch |
+| **6 kernels** | ✅ gated | 4 dispatchable from the executor |
+| **Silicon-path runtime** | 🚧 on a branch | FastRPC + DSP skel; simulator green, **never run on hardware** |
+| **On-device execution** | ❌ not yet | cross-compiles and stages; no job has been run |
+
+**Nothing here has executed on real silicon.** All cycle counts come from
+`hexagon-sim` under a pinned bus model. The simulator is cycle-*approximate* — see
+[`docs/hardware/simulator-accuracy.md`](docs/hardware/simulator-accuracy.md) for where
+it is most likely to drift.
+
+### The Hexagon SDK is required to build or run a kernel
+
+Not just to contribute — to use hexlib on a kernel at all. `hexagon-clang` and
+`hexagon-sim` are discovered through `HEXAGON_SDK_ROOT`. **hexlib never vendors,
+bundles, or fetches the SDK**; it is licence-restricted and you obtain it yourself.
+
+Without it you can still do a great deal, and it is the most useful work available:
+the entire graph and scheduling layer, the op registry, the numpy reference executor,
+scalar baselines, `spec.json` contracts and test vectors are all pure Python. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the tier system.
+
+---
 
 ## Quickstart
 
 ```bash
 pip install -e .
-hexlib new-kernel my_kernel        # scaffolds kernels/my_kernel
-hexlib test kernels/my_kernel       # builds it, simulates it, prints a gate table
+
+# No SDK required — compile a model to a VTCM/DMA plan and inspect it
+hexlib plan qwen35 --print
+
+# SDK required — scaffold, then gate, a kernel
+hexlib new-kernel my_kernel
+hexlib test my_kernel
 ```
 
-`hexlib new-kernel` writes a conforming, empty kernel directory (`kernel_api.h`,
-`baseline.c`, `harness.c`, a `nearmiss_*.c` stub, `spec.json`, `README.md`). Fill in
-the contract and the scalar reference, then write the kernel. `hexlib test` builds it
-against the SDK, runs it on the simulator, disassembles the ELF to prove HVX/HMX use,
-confirms the near-miss variant is still rejected, and writes a result table you attach
-to your PR. See `CONTRIBUTING.md` for the full gate sequence.
+`hexlib new-kernel` writes a conforming directory: `kernel.c`, `kernel_api.h`,
+`baseline.c` (your scalar reference), `harness.c` (which builds its own inputs and so
+cannot be handed a passing answer), a `nearmiss_*.c` stub, and `spec.json`.
 
-## Worked example: rmsnorm_fp16
+`hexlib test` compiles it, runs it on the simulator, disassembles the ELF to prove HVX
+or HMX was used, confirms every near-miss variant is still rejected, and writes a
+`RESULT.md` you attach to a PR.
 
-The one kernel shipped so far. RMSNorm with a per-column gain, row-wise, fp16;
-shape `R=8, C=128, eps=1e-5`. Full record in
-[`kernels/rmsnorm_fp16/BAKEOFF.md`](kernels/rmsnorm_fp16/BAKEOFF.md) and
-[`kernels/rmsnorm_fp16/RESULT.md`](kernels/rmsnorm_fp16/RESULT.md).
+---
 
-| gate | result |
-|---|---|
-| correct | PASS |
-| kernel_cycles | 2021 |
-| accel (ELF-proven) | hvx, hvx-compute |
-| near-miss `nearmiss_mean_not_rms.c` | correctly rejected |
-| near-miss `nearmiss_no_eps.c` | correctly rejected |
-| **gate** | **PASS** |
+## How it works
 
-target `v75` · toolchain `19.0.04`
+```
+  model (PyTorch/HF config)
+        │
+        ▼
+  graph IR ── op registry (13 kinds, each with a numpy reference)
+        │
+        ├── shapes → fuse → order → liveness → VTCM alloc → DMA
+        │                                                    │
+        ▼                                                    ▼
+     Plan  ─────────────────────────────────────────►  serialized, diffable
+        │
+        ▼
+   executor ── replays the plan through a real VTCM byte image
+        │
+        ├──► numpy reference        (any op without a kernel)
+        ├──► standalone ELF path    (one simulator launch per op)
+        └──► DSP skel batch path    (one FastRPC invoke per batch)  ◄── the silicon path
+```
 
-The winning candidate (an adapted v6 `rmsnorm_gain_fp16`) measured **2021 kernel
-cycles** against a **69443**-cycle scalar baseline — **34.36x** — and beat the other
-HVX candidate measured for this kernel (an adapted v6 `fp16_rmsnorm`, 10498 cycles) by
-5.19x. These are numbers from `hexagon-sim` under a pinned bus model
-(`--timing --buspenalty 75 --busratio 2`), not silicon measurements — see
-[`docs/hardware/simulator-accuracy.md`](docs/hardware/simulator-accuracy.md) for what
-the simulator does and does not guarantee. `kernel_cycles` is the DSP-side cycle count
-for the kernel call alone; never compare whole-program `cycles`, which includes
-155k-190k cycles of roughly constant harness/CRT overhead.
+Every pass is a pure function, so ~80% of the system is testable with no SDK and no
+device. The plan is the contract between the two halves: the compiler decides *where
+every byte lives and when it moves*, and the executor is deliberately dumb.
+
+**Layout is an enumerated value, not `ne`/`nb` strides.** This makes "the kernel got
+un-repacked weights" a plan-time error rather than silent numerical corruption, and
+strides cannot express a VTCM-resident tile of a DDR tensor — which is the central
+object the compiler manipulates.
+
+Design docs: [encoder](docs/superpowers/specs/2026-08-09-vlm-encoder-design.md) ·
+[silicon path](docs/superpowers/specs/2026-08-10-silicon-path-runtime-design.md) ·
+[architecture overview](docs/architecture.md)
+
+---
+
+## Kernels
+
+Six kernels through the gates. Cycles are `kernel_cycles` — the DSP-side count for the
+kernel call alone, never whole-program `cycles`, which carries 155k–190k of roughly
+constant harness and CRT overhead.
+
+| kernel | cycles | accuracy vs numpy | notes |
+|---|---|---|---|
+| `scale_fp16` | **886** | exact (normal range) | factor 0.125 is a power of two, so no mantissa bit is lost |
+| `transpose_th_fp16` | **706** | exact | perm (1,0,2), both directions |
+| `add_fp16` | **1139** | 1 ULP | the hardware's fp16 narrowing is not IEEE round-to-nearest-even |
+| `cast_f32_f16` | **1176** | bit-exact | needs a lane deal — the widening conversion interleaves |
+| `rmsnorm_fp16` | **2231** | — | **31.13×** over a 69443-cycle scalar baseline |
+| `layernorm_fp16` | 111088 | — | **a first rung, not a result** — reductions still scalar |
+
+`layernorm_fp16`'s number is deliberately unoptimised: the affine epilogue is
+vectorised, both reductions are not. It was left scalar so the reduction has a
+*recorded* baseline to beat rather than an assumed one. A rotate-and-add butterfly
+already exists in `kernels/rmsnorm_fp16/`.
+
+Full bake-off records, including the candidates that **lost**, live in each kernel's
+`BAKEOFF.md`.
+
+### Target model
+
+The Qwen3.5-0.8B vision encoder, at 256×256:
+
+```
+VTCM high water   5,355,648 of 8,388,608 bytes (63.8%)
+DDR ↔ VTCM        58,643,456 bytes
+Plan steps        308   (396 ops before fusion)
+```
+
+The encoder reproduces upstream `transformers` to **4.47e-08** on committed golden
+vectors, with no torch at test time. Through the plan executor: 4.470e-08 in fp32,
+6.747e-05 in fp16 — which is what fp16 storage costs, measured rather than assumed.
+
+`matmul_epilogue` alone accounts for 55.9 of those 58.6 MB, which is why it is next.
+
+---
+
+## How correctness is established
+
+The gates exist because of specific ways this project has been wrong before, each
+recorded in [`CONTRIBUTING.md`](CONTRIBUTING.md):
+
+- **The harness builds its own inputs** and never reads a file, so it cannot be handed
+  a passing answer. The runner that *does* read files is a separate binary that prints
+  no verdict. Both facts are asserted by a test.
+- **Acceleration is proven from the compiled ELF**, by disassembly — not from source
+  text, and not from a self-reported flag.
+- **Near-misses must fail.** A dropped tail, a mean instead of an RMS, a forgotten lane
+  deal: each is committed as a variant that the harness has to reject. One of them
+  found a real bug in hexlib's own simulator wrapper.
+- **A tolerance wide enough for the widest shape can be wider than the bug it is meant
+  to catch.** `layernorm`'s unbiased-variance near-miss is a 0.065% error at C=768,
+  where fp16's own precision is ~0.05% — indistinguishable. It was *wrongly accepted*
+  on the first run. The fix was a shape where the bug is bigger (C=64, 0.79%), not a
+  tolerance argued down.
+- **Absence is never success.** Status codes start at 1, so a zero-filled response
+  buffer that was never written cannot read as OK.
+
+---
 
 ## Repository layout
 
 ```
-hexlib/            the CLI and verification pipeline (new-kernel, validate, test)
-include/hexlib/    DSP-side headers a kernel #includes, including vendored HVX math
-kernels/           one self-contained directory per promoted kernel
+hexlib/graph/      IR, op registry, and the pass pipeline (pure Python, no SDK)
+hexlib/exec/       the plan executor and its three dispatch backends
+hexlib/runtime/    the silicon path: wire format, IDL, DSP skel, host, build recipes
+hexlib/device/     device backends (QDC job plumbing)
+hexlib/tests/      the offline suite — runs without an SDK, except where marked
+include/hexlib/    DSP-side headers a kernel includes, incl. vendored HVX math
+kernels/           one self-contained directory per gated kernel
+docs/hvx/          learning HVX: a function-by-function tour of the vendored headers
 docs/hardware/     measured hardware notes (HMX int8, simulator accuracy)
+docs/research/     audit records — what was read directly vs. inferred
 ```
 
 ## Documentation
 
-- [`CONTRIBUTING.md`](CONTRIBUTING.md) — the three tiers, the six gates, the
-  bake-off, and what CI does and does not check.
-- [`ROADMAP.md`](ROADMAP.md) — the op backlog, with status and tier, so tier-0 work
-  (no SDK needed) is always visible.
-- [`ATTRIBUTION.md`](ATTRIBUTION.md) — every vendored source, its license, and the
-  commit it came from.
-- [`docs/hvx/`](docs/hvx/README.md) — **learning HVX.** A guided, function-by-function
-  tour of the vendored headers: the vector types and predicates, alignment handling,
-  horizontal reductions, transcendentals built from polynomial approximation, division by
-  Newton–Raphson, and the reduce-then-broadcast pattern that every transformer kernel is a
-  variation on. Start here if you have never written HVX.
-- [`docs/hardware/hmx-int8.md`](docs/hardware/hmx-int8.md) — the measured HMX int8
-  MAC sequence.
+**Start here**
+- [`docs/architecture.md`](docs/architecture.md) — how the pieces fit together
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — the tiers, the six gates, what CI does and does not check
+- [`ROADMAP.md`](ROADMAP.md) — the op backlog, so tier-0 work is always visible
+
+**Learning HVX**
+- [`docs/hvx/`](docs/hvx/README.md) — a guided tour of all 22 vendored headers: vector
+  types and predicates, alignment, horizontal reductions, transcendentals from
+  polynomial approximation, division by Newton–Raphson, and the reduce-then-broadcast
+  pattern nearly every transformer kernel is a variation on. **Each document ends with
+  what it could not explain** — about 15 open questions, listed deliberately.
+- [`docs/hvx/upstream-findings.md`](docs/hvx/upstream-findings.md) — three real defects
+  found in upstream llama.cpp while writing that tour, with evidence. hexlib calls none
+  of them; the worst is a coefficient off by 234,118× inside an fp16 exponential.
+
+**Hardware reality**
 - [`docs/hardware/simulator-accuracy.md`](docs/hardware/simulator-accuracy.md) — what
-  "cycle-approximate" means and where the simulator is most likely to drift from
-  silicon.
+  "cycle-approximate" means and where it drifts
+- [`docs/hardware/hmx-int8.md`](docs/hardware/hmx-int8.md) — the measured HMX int8 MAC sequence
 - [`docs/research/oracle-provenance.md`](docs/research/oracle-provenance.md) — what the
-  committed vision-encoder golden vectors prove, and what they do not.
+  committed golden vectors prove, and what they do not
+
+**Project state**
+- [`docs/STATE.md`](docs/STATE.md) — the working handoff record: what is decided, what
+  is proven, what is merely claimed, and every open question
+
+## Contributing
+
+Tier-0 work needs no SDK and no hardware: scalar baselines, `spec.json` contracts, test
+vectors, near-miss variants, documentation, and anything in the graph or pass pipeline.
+[`ROADMAP.md`](ROADMAP.md) keeps that work visible. Read
+[`CONTRIBUTING.md`](CONTRIBUTING.md) first — the gates are non-negotiable, and the
+reason each one exists is written down.
 
 ## License
 
-[MIT](LICENSE). hexlib also vendors MIT-licensed code from llama.cpp's ggml-hexagon
-backend, which carries its own attribution requirement — see
+[MIT](LICENSE).
+
+hexlib **vendors** MIT-licensed HVX math headers from llama.cpp's `ggml-hexagon`
+backend (byte-identical, never edited in place) and **adapts** its FastRPC runtime
+(rewritten in hexlib's own tree). Both carry attribution requirements, and every source
+— with its licence and the upstream commit it came from — is recorded in
 [`ATTRIBUTION.md`](ATTRIBUTION.md).

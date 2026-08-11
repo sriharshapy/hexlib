@@ -1,5 +1,11 @@
 # ---- hexlib build and verification output ----
 # `hexlib test` writes ELFs, objects, disassembly, and result tables here.
+#
+# NOTE: these two patterns match the transient `<name>.result.md` /
+# `<name>.result.json` a run drops in the working directory. They do NOT match
+# `kernels/*/RESULT.md`, which is the promoted, reviewed record for a gated
+# kernel and IS tracked on purpose. Do not "unify" these into `RESULT.md` or
+# `*result*` -- that would untrack every kernel's evidence.
 _work/
 *.result.json
 *.result.md
@@ -114,7 +120,19 @@ qdc_credentials*
 # ---- Agent workspace ----
 # Plan-scoped scratch: ledgers, briefs, reports, review packages. Git history
 # is the durable record.
+#
+# Because this directory is never published, NO tracked document may cite a
+# path inside it as evidence a reader can check. Where an older doc does, the
+# durable record is the commit message and docs/STATE.md, not the report.
 .superpowers/
+.claude/
+
+# ---- Patch and merge debris ----
+*.orig
+*.rej
+*.bak
+*.patch.tmp
+*.log
 
 # ---- Editors ----
 .vscode/
