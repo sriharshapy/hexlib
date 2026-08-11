@@ -43,6 +43,14 @@ hexlib/runtime/gen/
 kernels/*/_build/
 _work/runtime/
 
+# Task 10's cross-compiled Android arm64 client (hexlib/runtime/build.py's
+# build_device_binary). It is a stripped ELF executable with NO extension --
+# the target is Android/aarch64, not the build host, so `tc.exe()` is never
+# applied to it and none of the extension-based rules above (*.elf, *.o, ...)
+# match it. Named exactly, the same way osam.cfg/q6ss.cfg are, rather than a
+# blanket rule that could also swallow an unrelated file named "hexlib_run".
+hexlib_run
+
 # The Hexagon SDK is license-restricted and is NEVER vendored, bundled, or
 # fetched. It is discovered through HEXAGON_SDK_ROOT. These guard against an
 # accidental copy landing in the repository.

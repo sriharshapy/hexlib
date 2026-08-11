@@ -25,6 +25,27 @@ _WIN_SDK_DEFAULT = r"C:\Hexagon_SDK\6.4.0.2"
 DSP_ARCH = "v75"
 TOOLCHAIN_VERSION = "19.0.04"
 
+# The Android NDK the Hexagon SDK ships alongside its own toolchain, used
+# ONLY for Task 10's aarch64 cross-compile (hexlib_run). VERIFIED against the
+# actual installed SDK, not assumed: `android-ndk-r25c/toolchains/llvm/
+# prebuilt/windows-x86_64/bin` genuinely contains
+# `aarch64-linux-android21-clang` through `...34-clang`/`...35-clang`, so 33
+# exists and is used as pinned below -- this was checked, not carried over
+# from a draft that guessed it. Task 9's host code itself has no NDK-version
+# dependency (it is plain C against <dlfcn.h>/<remote.h>/<rpcmem.h>), so this
+# pin is a policy choice (a stable, well-supported API level), not something
+# forced by the source.
+NDK_VERSION = "r25c"
+ANDROID_API = 33
+
+
+def ndk_root(sdk_root: str) -> str:
+    """The NDK bundled with the Hexagon SDK. Discovered, never vendored --
+    the SDK is license-restricted and this path is inside it; nothing here
+    is fetched or copied out."""
+    return os.path.join(sdk_root, "tools", f"android-ndk-{NDK_VERSION}")
+
+
 # Engages the cycle-approximate microarchitectural model (caches + bus latency).
 # With it off the simulator idealizes memory, which is misleading for
 # bandwidth-bound kernels.

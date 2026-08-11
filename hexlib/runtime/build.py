@@ -492,3 +492,306 @@ def sim_qurt_command(out_dir: str, so_path: str, sdk_root: str | None = None,
     ]
     cmd += list(extra_args)
     return cmd
+
+
+# ============================================================================
+# STAGE 2 GATE — the aarch64 CPU side and the device skel .so. Built, never
+# run: no phone is available, so this proves only "it builds and is the right
+# machine type" (aarch64 for hexlib_run, Hexagon for libhexlib_skel.so).
+# Stage 3 is the first thing that ever executes either artifact.
+#
+# THE STUB/SKEL SPLIT INVERTS FROM THE SIMULATOR, AND THIS IS THE CRUX OF THIS
+# TASK. build_sim_so (above) deliberately never links hexlib_iface_stub.c,
+# because it defines the exact same symbol names as skel.c and both would
+# have to live in one process/module. On a device they are two SEPARATE
+# binaries, so the arrangement inverts:
+#   - hexlib_run (aarch64) links the qaic-generated STUB
+#     (hexlib_iface_stub.c) plus hexlib/runtime/host/*.c, against -ldl -llog.
+#     Calling hexlib_iface_invoke() from it marshals arguments into a
+#     remote_arg[] and calls remote_handle64_invoke() for real (see
+#     host/main.c's own header comment).
+#   - libhexlib_skel.so (Hexagon, -shared -fPIC) contains the qaic SKEL
+#     (hexlib_iface_skel.c) plus skel.c/skel_bufs.c/skel_vtcm.c/
+#     skel_dispatch.c, the generated per-kernel entry points, and the
+#     kernels themselves -- loaded by the FastRPC framework on the DSP,
+#     which calls INTO it, never the reverse.
+# Get this backwards (stub in the skel .so, or skel code in the aarch64
+# binary) and the result is either a duplicate-symbol link error or a binary
+# that can never marshal at all. THE DEVICE PATH IS THE ONLY PATH IN THIS
+# PROJECT THAT WILL EVER EXERCISE QAIC'S REAL MARSHALLING — every simulator
+# run before this task (build_sim_so, above) calls skel.c as plain C
+# functions in one address space; see host/main.c's own file header for the
+# same point made from the other side of the wire.
+# ============================================================================
+
+
+def ndk_bin_dir(sdk_root: str) -> str:
+    """The NDK's prebuilt toolchain `bin` directory for the CURRENT host OS.
+    VERIFIED against the actual installed SDK (not assumed): only a
+    `windows-x86_64` prebuilt tree exists there, so that is the only
+    non-Windows-host branch this repo could ever actually exercise, but the
+    `linux-x86_64` name is the NDK's own documented convention, kept for a
+    contributor on a different host."""
+    host_tag = "windows-x86_64" if os.name == "nt" else "linux-x86_64"
+    return os.path.join(tc.ndk_root(sdk_root), "toolchains", "llvm", "prebuilt",
+                        host_tag, "bin")
+
+
+def ndk_clang(sdk_root: str | None = None) -> str:
+    """Path to the NDK's aarch64 Android clang driver, pinned to tc.ANDROID_API.
+
+    ON WINDOWS THIS MUST BE THE `.cmd` FORM, NOT THE BARE NAME — VERIFIED, NOT
+    GUESSED. The bare `aarch64-linux-android<API>-clang` next to it is a Bourne
+    shell script (confirmed with `file`), which a plain `subprocess.run([...])`
+    call (no shell) cannot execute on Windows at all; `subprocess.run` against
+    the `.cmd` wrapper was confirmed to actually run and print a real clang
+    version banner. `tc.run` (toolchain.py) never sets `shell=True`, so the
+    bare name would fail with "cannot execute" on every Windows caller.
+    """
+    root = sdk_root or tc.default_sdk_root()
+    bin_dir = ndk_bin_dir(root)
+    name = f"aarch64-linux-android{tc.ANDROID_API}-clang"
+    if os.name == "nt":
+        name += ".cmd"
+    return os.path.join(bin_dir, name)
+
+
+# Recovered from the SDK's OWN shared-library link recipe for this exact
+# toolchain version -- $SDK/build/make.d.ext/hexagon/defines_hexagon_1_9.min's
+# `DLL_LD_FLAGS` (1_9 is the "hexagon_toolv19" family TOOLCHAIN_VERSION 19.0.04
+# belongs to) -- NOT SIM_SO_LINK_FLAGS above, which is a DIFFERENT recipe for a
+# different situation. SIM_SO_LINK_FLAGS builds a .so meant to be dlopen'd into
+# an ALREADY-RUNNING QuRT host process (run_main_on_hexagon_sim) that already
+# has its own allocator; DLL_LD_FLAGS is the SDK's general-purpose "this is a
+# Hexagon shared library" recipe, and it carries five `--wrap=` flags
+# SIM_SO_LINK_FLAGS does not: `malloc`/`calloc`/`free`/`realloc`/`memalign`,
+# the PD heap-interposition every real Hexagon DLL gets so its allocations are
+# routed through the loading process's own signed/unsigned-PD heap manager
+# rather than a bare libc allocator. A real FastRPC-loaded skel needs that;
+# the sim .so does not (it never leaves the one host process it was dlopen'd
+# into). `-Wl,--no-undefined`/`-z defs` is deliberately absent, exactly as in
+# the SDK's own recipe: symbols like HAP_mmap2 and the HAP_compute_res_*
+# family are resolved dynamically, at dlopen time, against the framework
+# already running in the DSP process the skel loads into -- never statically
+# linked here, on device OR on the simulator (see sim_shims.c's own header for
+# the simulator side of that same fact).
+DEVICE_SKEL_LINK_FLAGS = [
+    "-G0",
+    "-Wl,--defsym=ISDB_TRUSTED_FLAG=2",
+    "-Wl,--defsym=ISDB_SECURE_FLAG=2",
+    "-Wl,--no-threads",
+    "-fpic",
+    "-shared",
+    "-Wl,-Bsymbolic",
+    "-Wl,--wrap=malloc",
+    "-Wl,--wrap=calloc",
+    "-Wl,--wrap=free",
+    "-Wl,--wrap=realloc",
+    "-Wl,--wrap=memalign",
+    "-lc",
+]
+
+
+def _build_device_skel_so(out_dir: str, root: str, gen: str, qa: QaicOutput) -> str:
+    """Compile the skel + kernels + generated entries into a real Hexagon
+    SHARED OBJECT (`libhexlib_skel.so`), the device counterpart of
+    `build_skel_lib`'s `.a` above. Deliberately NOT a thin wrapper around
+    `build_skel_lib` -- the object sets genuinely differ (see below), and
+    `build_skel_lib`'s own `-fpic` insertion is asserted, by literal source
+    text, by `test_runtime_sim_build.py::
+    test_build_skel_lib_compiles_position_independent_code`; reshaping that
+    function to share code with this one is out of scope for this task and
+    risks that assertion for no benefit, since the compiled objects are not
+    even byte-identical between the two paths (see next paragraph).
+
+    `sim_shims.c` IS DELIBERATELY NOT COMPILED IN HERE. It exists only to
+    backfill `HAP_mmap2`/`HAP_munmap2` on top of `test_util.a`'s
+    simulator-only, int-length `HAP_mmap` (see `simhost/sim_shims.c`'s own
+    header) -- this build never links `test_util.a` at all, and a real
+    device's FastRPC framework resolves `HAP_mmap2` for real, dynamically,
+    inside the signed/unsigned PD process this .so is loaded into.
+    """
+    from hexlib.build import compile_command
+    from hexlib.exec.runner import SPECS
+    from hexlib.runtime import genentry
+
+    bin_dir = tc.find_toolchain_bin(root)
+    version = tc.toolchain_version(bin_dir)
+    if version != tc.TOOLCHAIN_VERSION:
+        raise RuntimeBuildError(
+            f"toolchain is {version}, expected {tc.TOOLCHAIN_VERSION} — cycle "
+            "numbers are not comparable across toolchain versions"
+        )
+    env = tc.toolchain_env(bin_dir)
+    compiler = os.path.join(bin_dir, tc.exe(tc.COMPILER))
+
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    entries = genentry.generate(repo, gen)
+
+    used_kernels = sorted({
+        os.path.basename(spec.kernel_dir)
+        for spec in SPECS.values()
+        if os.path.isdir(os.path.join(repo, spec.kernel_dir))
+    })
+
+    skel_dir = os.path.join(repo, "hexlib", "runtime", "skel")
+    # "dev_"-prefixed object basenames: this compiles into the SAME out_dir
+    # build_skel_lib/build_sim_so may also use for a sim artifact, and their
+    # object names (skel.o, skel_bufs.o, ...) would otherwise collide on disk
+    # with these PIC-but-differently-sourced objects (no sim_shims.o here at
+    # all -- seeded from a genuinely different source-file set, not just a
+    # different flag).
+    base = [
+        (qa.skel, "dev_hexlib_iface_skel.o", []),
+        (os.path.join(skel_dir, "skel.c"), "dev_skel.o", []),
+        (os.path.join(skel_dir, "skel_bufs.c"), "dev_skel_bufs.o", []),
+        (os.path.join(skel_dir, "skel_vtcm.c"), "dev_skel_vtcm.o", []),
+        (os.path.join(skel_dir, "skel_dispatch.c"), "dev_skel_dispatch.o", []),
+    ]
+    for e in entries:
+        stem = os.path.basename(e)[:-len(".c")]
+        if stem.endswith("_entry"):
+            k = stem[: -len("_entry")]
+            base.append((e, f"dev_{stem}.o", [os.path.join(repo, "kernels", k)]))
+        else:
+            base.append((e, f"dev_{stem}.o", []))  # hexlib_kernel_table.c
+    for k in used_kernels:
+        kdir = os.path.join(repo, "kernels", k)
+        base.append((os.path.join(kdir, "kernel.c"), f"dev_{k}_kernel.o", [kdir]))
+        hand = os.path.join(kdir, "dsp_entry.c")
+        if os.path.isfile(hand):
+            base.append((hand, f"dev_{k}_dsp_entry.o", [kdir]))
+
+    common_includes = runtime_include_dirs(root, gen)
+
+    objs = []
+    for s, obj_name, extra in base:
+        o = os.path.join(out_dir, obj_name)
+        cmd = compile_command(
+            compiler, [s], o, ["hvx"], common_includes + extra, compile_only=True
+        )
+        cmd.insert(1, "-fpic")  # required for a -shared link, same as build_skel_lib.
+        rc, out, err, to = tc.run(cmd, env, timeout=tc.SIM_TIMEOUT_S)
+        if to or rc != 0:
+            raise RuntimeBuildError(f"device skel compile failed: {s}", (out + err).strip())
+        objs.append(o)
+
+    # LIB_HEXAGON, from the SAME defines_hexagon_1_9.min recipe DEVICE_SKEL_LINK_FLAGS
+    # is recovered from: "$(HEXAGON_LIB_DIR)/$(V_ARCH)/G0/libhexagon.a", and its
+    # own comment notes the linker only pulls symbols from it if something else
+    # in the link needs them -- so including it unconditionally is what the
+    # SDK's own recipe does, not an addition of convenience.
+    tools_root = os.path.dirname(os.path.dirname(bin_dir))
+    lib_hexagon = os.path.join(tools_root, "Tools", "target", "hexagon", "lib",
+                               tc.DSP_ARCH, "G0", "libhexagon.a")
+    if not os.path.isfile(lib_hexagon):
+        raise RuntimeBuildError(f"libhexagon.a not found: {lib_hexagon}")
+
+    so = os.path.join(out_dir, "libhexlib_skel.so")
+    cmd = [compiler] + tc.cflags_for_caps(["hvx"]) + DEVICE_SKEL_LINK_FLAGS
+    cmd += [
+        "-Wl,-Map=" + so + ".map",
+        "-Wl,-soname=" + os.path.basename(so),
+        "-o", so,
+        "-Wl,--start-group",
+    ] + objs + [lib_hexagon, "-Wl,--end-group"]
+
+    rc, out, err, to = tc.run(cmd, env, timeout=tc.SIM_TIMEOUT_S)
+    if to or rc != 0 or not os.path.isfile(so):
+        raise RuntimeBuildError("linking libhexlib_skel.so failed", (out + err).strip())
+    return so
+
+
+def build_device_binary(out_dir: str, sdk_root: str | None = None) -> str:
+    """Cross-compile `hexlib_run` for Android aarch64, and (as a side effect)
+    `libhexlib_skel.so` for the Hexagon device, both into `out_dir`. Returns
+    the path to `hexlib_run`.
+
+    NEITHER ARTIFACT IS EVER RUN HERE — no device is available (see the
+    module-level "STAGE 2 GATE" comment above). This function's entire job is
+    "it builds, and it is the right machine type"; stage 3 is the first thing
+    that ever executes either one.
+    """
+    root = sdk_root or tc.default_sdk_root()
+    os.makedirs(out_dir, exist_ok=True)
+    gen = os.path.join(out_dir, "gen")
+    os.makedirs(gen, exist_ok=True)
+
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    idl = os.path.join(repo, "hexlib", "runtime", "idl", "hexlib_iface.idl")
+    qa = run_qaic(idl, gen, root)
+
+    # The Hexagon side, built first: a failure here (e.g. a bad SDK path)
+    # surfaces before any aarch64 work is wasted.
+    _build_device_skel_so(out_dir, root, gen, qa)
+
+    # The aarch64 side: the qaic STUB (never the skel) plus every host/*.c
+    # file (Task 9). See the module-level comment for why this is the
+    # opposite arrangement from the Hexagon side.
+    clang = ndk_clang(root)
+    if not os.path.isfile(clang):
+        raise RuntimeBuildError(f"NDK clang not found: {clang}")
+
+    host_dir = os.path.join(repo, "hexlib", "runtime", "host")
+    skel_dir = os.path.join(repo, "hexlib", "runtime", "skel")
+    sources = [
+        qa.stub,
+        os.path.join(host_dir, "driver.c"),
+        os.path.join(host_dir, "session.c"),
+        os.path.join(host_dir, "buffers.c"),
+        os.path.join(host_dir, "main.c"),
+    ]
+    # `$SDK/incs` (remote.h, AEEStdDef.h -- needed by the qaic-generated
+    # header and stub), `$SDK/incs/stddef`, `$SDK/ipc/fastrpc/rpcmem/inc`
+    # (rpcmem.h, buffers.c), `gen` (hexlib_iface.h), `host_dir`
+    # (hexlib_host.h), and `skel_dir` (hexlib_dsp.h -- session.c/buffers.c
+    # both include it for the wire structs, purely as a header; no skel .c
+    # file is compiled into this binary).
+    includes = [
+        gen,
+        host_dir,
+        skel_dir,
+        os.path.join(root, "incs"),
+        os.path.join(root, "incs", "stddef"),
+        os.path.join(root, "ipc", "fastrpc", "rpcmem", "inc"),
+    ]
+
+    # THE QAIC STUB ITSELF NEEDS libcdsprpc.so AT LINK TIME -- NOT MERELY AT
+    # RUNTIME. <remote.h>'s remote_handle64_open/_invoke/_close are declared as
+    # ordinary strong externs (confirmed by reading incs/remote.h: no `weak`
+    # attribute, __QAIC_REMOTE(ff) defaults to identity), and
+    # hexlib_iface_stub.c (qaic-generated, never hand-edited) calls them
+    # directly -- linking without this fails with "undefined symbol:
+    # remote_handle64_open/_invoke/_close" (confirmed: this was the first
+    # thing this build hit). The SDK ships a real aarch64 import stub for
+    # exactly this at ipc/fastrpc/remote/ship/android_aarch64/libcdsprpc.so
+    # (confirmed ELF64 EM_AARCH64) -- the same file every SDK Android FastRPC
+    # example links against directly, never vendored into this repo.
+    #
+    # A NOTED TENSION WITH host/driver.c, NOT PAPERED OVER: driver.c's own
+    # header comment says linking libcdsprpc.so directly is deliberately
+    # avoided so a missing driver becomes "a readable message, not a loader
+    # failure" -- and dlsym's remote_handle64_open/_invoke/_close itself
+    # (required=1) as if that goal covered them too. It cannot: those three
+    # symbols are called directly by the qaic-generated stub, not through
+    # driver.c's own function-pointer indirection, so THIS link-time
+    # dependency is unavoidable for the marshalled RPC path to exist at all.
+    # In practice this means a device lacking libcdsprpc.so will fail to
+    # start hexlib_run at process load (a dynamic-linker error), not print
+    # the graceful message driver.c's design intends -- see the task report.
+    cdsprpc_dir = os.path.join(root, "ipc", "fastrpc", "remote", "ship", "android_aarch64")
+    cdsprpc_so = os.path.join(cdsprpc_dir, "libcdsprpc.so")
+    if not os.path.isfile(cdsprpc_so):
+        raise RuntimeBuildError(f"libcdsprpc.so import stub not found: {cdsprpc_so}")
+
+    exe = os.path.join(out_dir, "hexlib_run")
+    cmd = [clang, "-O2"]
+    for d in includes:
+        cmd.append(f"-I{d}")
+    cmd += sources
+    cmd += ["-o", exe, f"-L{cdsprpc_dir}", "-lcdsprpc", "-ldl", "-llog"]
+
+    rc, out, err, to = tc.run(cmd, os.environ.copy(), timeout=tc.SIM_TIMEOUT_S)
+    if to or rc != 0 or not os.path.isfile(exe):
+        raise RuntimeBuildError("linking hexlib_run failed", (out + err).strip())
+    return exe
