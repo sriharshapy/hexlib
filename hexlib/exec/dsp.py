@@ -231,7 +231,23 @@ def _out_shape(spec: RunnerSpec, arrays: tuple[np.ndarray, ...],
                attrs: Mapping[str, Any]) -> tuple[int, ...]:
     """Mirrors `hexlib.exec.hexagon._out_shape` (that module is off limits to
     modify or import a private helper from). Elementwise ops keep the first
-    input's shape; a permutation reorders it; an explicit `shape` attr wins."""
+    input's shape; a permutation reorders it; an explicit `shape` attr wins.
+
+    AND FOR EVERYTHING ELSE, THE OP REGISTRY'S OWN `infer` IS ASKED. The three
+    rules above are the whole of what this used to do, and they cover every
+    elementwise op, `transpose` and `reshape` -- but `patchify` turns
+    fp32 (3,2,256,256) into (256,1536) by a function of `patch`, `merge`,
+    `grid_h` and `grid_w`, which none of them can express. The fallthrough
+    returned the INPUT shape, so the output buffer was sized 3*2*256*256 instead
+    of 256*1536 and the batch was built with a tensor of the wrong length.
+
+    `infer` is asked rather than a fourth rule being written here because it is
+    already the authority -- it is what the graph builder used to declare the
+    tensor this op writes into, so re-deriving it in the backend is exactly the
+    two-copies-of-one-rule problem that a shape mismatch makes silent. If it
+    raises, the raise is the answer: an op whose output shape the registry
+    refuses to compute is not one this backend should be guessing for.
+    """
     shape = tuple(arrays[0].shape)
     perm = attrs.get("perm")
     if perm is not None:
@@ -239,7 +255,32 @@ def _out_shape(spec: RunnerSpec, arrays: tuple[np.ndarray, ...],
     declared = attrs.get("shape")
     if declared is not None:
         return tuple(declared)
-    return shape
+
+    import hexlib.graph.opdefs  # noqa: F401  -- registers the op definitions
+    from hexlib.graph.ir import Tensor
+    from hexlib.graph.ops import REGISTRY
+
+    try:
+        opdef = REGISTRY.get(spec.kind)
+    except (KeyError, ValueError):
+        return shape
+    tensors = [
+        # `infer` reads `.shape`, `.dtype` and `.name` only. The names are
+        # positional because this backend has no graph to take them from, and
+        # they appear only in the registry's own error messages.
+        Tensor(name=f"in{i}", dtype=dt, shape=tuple(a.shape))
+        for i, (a, dt) in enumerate(zip(arrays, spec.inputs))
+    ]
+    inferred = opdef.infer(tensors, dict(attrs))
+    if not inferred:
+        return shape
+    first = inferred[0]
+    # `infer` returns ((shape, dtype), ...) per its OpDef docstring, but some
+    # defs return Tensor objects. Accept either rather than depending on which,
+    # since getting it wrong here is a wrong buffer size and not an exception.
+    if isinstance(first, Tensor):
+        return tuple(first.shape)
+    return tuple(first[0])
 
 
 def _encode_params(spec: RunnerSpec, arrays: tuple[np.ndarray, ...],

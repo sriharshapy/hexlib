@@ -347,3 +347,233 @@ def test_an_enormous_n_bufs_is_refused_by_the_dsp_not_by_a_host_crash(backend):
         f"expected the skel to refuse the buffer count, got "
         f"{dspmod.wire.STATUS_NAME.get(res.status, res.status)}"
     )
+
+
+# ===========================================================================
+# THE FOUR KERNELS ADDED FOR THE ENCODER, EACH CHECKED AGAINST THE OP REGISTRY
+# ===========================================================================
+#
+# WHY THE REGISTRY IS THE ORACLE HERE rather than a reference written in this
+# file. Every one of these ops has a numpy `reference` in
+# `hexlib/graph/opdefs/`, and that reference IS the specification -- it is what
+# the eager executor runs, what the plan executor was validated against, and
+# what the kernel author was told to implement. A second reference written here
+# would be a second chance to get the same convention wrong, and for three of
+# these four the convention is precisely the dangerous part:
+#
+#   patchify      `merge` reorders the output ROWS into 2x2 spatial-merge-block
+#                 order; ignoring it gives the right shape and byte count.
+#   rope_2d       split-half pairing (i, i+D/2), not adjacent pairs. Same shape
+#                 either way.
+#   transpose_hd  perm(0,2,1) vs perm(1,0,2) -- and with two equal dims, even a
+#                 stride confusion returns the right answer.
+#
+# So these tests compare the C kernel, reached through the real batch wire, with
+# the numpy oracle the graph itself uses. Disagreement means one of them is
+# wrong, which is the finding either way.
+#
+# AND WHAT THEY PROVE THAT THE KERNEL GATE DOES NOT. The gate compiles a kernel
+# against its own harness and never touches the batch path. `layernorm_fp16`
+# gated green for a day while `KIND_ID["layernorm"]` answered ERR_NO_KERNEL on
+# the wire, because a kernel is dispatchable only once it has a RunnerSpec. Each
+# test below drives the op through `pack_batch` -> the skel -> the generated
+# entry -> the kernel, so it fails if the spec's scalars, dtypes, layouts or
+# buffer order are wrong even when the kernel itself is perfect.
+
+
+def _oracle(kind, arrays, attrs):
+    """The op registry's own numpy reference for `kind`."""
+    import hexlib.graph.opdefs  # noqa: F401  -- registers the op definitions
+    from hexlib.graph.ops import REGISTRY
+
+    return REGISTRY.get(kind).reference(tuple(arrays), dict(attrs))[0]
+
+
+def _frac_bit_exact(got, want):
+    return float((np.asarray(got) == np.asarray(want)).sum()) / np.asarray(got).size
+
+
+@sdk
+def test_transpose_hd_dispatches_and_matches_the_registry(backend):
+    """perm(0,2,1), the variant `select()` has to route away from its sibling.
+
+    B, T and D are three DIFFERENT numbers, because with T == D a kernel that
+    confuses the two strides still returns the right answer -- and the sibling
+    kernel keeps a near-miss that is exactly that confusion. Exact comparison:
+    this op does no arithmetic, so any difference at all is a bug.
+
+    The routing is the other half of what this checks. `transpose` and
+    `transpose_hd` are two kernels behind one op kind and the wire carries no
+    perm, so the host resolves the variant and names it with its own KIND_ID.
+    Send the wrong id and this returns a correctly-shaped transposed-the-other-
+    way answer.
+    """
+    B, T, D = 3, 8, 5
+    rng = np.random.default_rng(11)
+    x = rng.standard_normal((B, T, D)).astype(np.float16)
+
+    y, _ = backend.run("transpose", [x], {"perm": (0, 2, 1)})
+
+    assert y.shape == (B, D, T)
+    want = _oracle("transpose", [x], {"perm": (0, 2, 1)})
+    assert np.array_equal(y, want.astype(np.float16)), (
+        "the perm(0,2,1) op did not match the registry -- either the kernel is "
+        "wrong or it was dispatched to the perm(1,0,2) kernel"
+    )
+    # And it must NOT equal the other permutation, which is the failure that
+    # would otherwise look like success on a square input.
+    if B == D:
+        other = np.transpose(x, (1, 0, 2))
+        assert not np.array_equal(y, other)
+
+
+@sdk
+def test_softmax_dispatches_and_matches_the_registry(backend):
+    """Row softmax over the last axis, through the wire.
+
+    NON-SQUARE ON PURPOSE. The encoder's real shape is (12,256,256), whose last
+    two dims are equal -- so a softmax along the wrong axis has the SAME shape
+    and the same byte count and nothing downstream could notice. (2,3,64) makes
+    the wrong axis a different shape, so `_out_shape` and the byte-count check
+    would catch it even before the values were compared.
+
+    Also the first exercise of the `rows:` scalar source on this transport: R is
+    the product of the two leading axes (2*3 = 6), which no single `dim:` can
+    express, and the DSP computes it from `ne` rather than trusting a number the
+    host asserted. A wrong `rows:` gives a kernel that softmaxes over the wrong
+    number of rows, which on a 3-D input is a plausible wrong answer.
+    """
+    rng = np.random.default_rng(12)
+    x = (rng.standard_normal((2, 3, 64)) * 3.0).astype(np.float16)
+
+    y, _ = backend.run("softmax", [x], {"axis": -1})
+
+    assert y.shape == (2, 3, 64)
+    assert y.dtype == np.float16
+    want = _oracle("softmax", [x], {"axis": -1}).astype(np.float16)
+
+    # A tolerance is used here rather than bit-exactness, and the reason is
+    # written down: the kernel narrows through Q6_Vhf_equals_Wqf32, whose
+    # rounding is NOT IEEE round-to-nearest-even, so a 1-ULP disagreement with
+    # numpy is expected and is not a defect. 1 ULP at these magnitudes is ~1e-3
+    # relative; the bound below is well inside what a real bug would exceed --
+    # kernels/softmax_fp16/harness.c measures its own fp16-accumulation
+    # near-miss at 7.7% relative, about 80x this bound.
+    err = np.abs(y.astype(np.float32) - want.astype(np.float32))
+    assert err.max() < 1e-3, f"max abs error {err.max()}"
+
+    # THE PROPERTY, INDEPENDENT OF THE ORACLE: every row sums to 1. This is what
+    # catches a normalisation that divides by the count, or by a stale sum, in a
+    # way that comparing against a reference computed the same way would not.
+    sums = y.astype(np.float32).sum(axis=-1)
+    assert np.allclose(sums, 1.0, atol=2e-3), f"row sums {sums}"
+
+
+@sdk
+def test_rope_2d_dispatches_and_matches_the_registry(backend):
+    """The split-half rotation, with three inputs and mixed dtypes.
+
+    T, H and D are all DIFFERENT, so a token/head index swap cannot pass by
+    coincidence -- and note the cos/sin tables have NO head axis, so indexing
+    them by head instead of by token is a plausible stride slip that the
+    kernel's own harness keeps as a near-miss.
+
+    D must be even for the split-half pairing to exist at all, and the kernel
+    only vectorises D=64; other D take a correct scalar path. D=64 is used here
+    because it is the encoder's own head_dim and the path that actually ships.
+    """
+    T, H, D = 5, 3, 64
+    rng = np.random.default_rng(13)
+    x = rng.standard_normal((T, H, D)).astype(np.float16)
+    # REAL ROTATION TABLES, AND "REAL" MEANS DUPLICATED ACROSS THE TWO HALVES.
+    # A split-half rotation pairs element i with i + D/2 and applies cos[i],
+    # sin[i] to both, so the pair is a genuine 2-D rotation only when
+    # cos[i + D/2] == cos[i] and sin[i + D/2] == sin[i] -- which is exactly how
+    # RoPE tables are built, each frequency written into both halves.
+    #
+    # This is worth the comment because the first version of this test varied
+    # the angle across all D=64 positions. The kernel still MATCHED THE ORACLE
+    # (max error 3.9e-3, inside the bound), and the norm assertion below failed
+    # anyway -- because with cos[i + 32] != cos[i] the operation being applied
+    # is not a rotation and has no reason to preserve anything. The test was
+    # wrong, not the kernel. A property assertion is only as good as the inputs
+    # that make the property true.
+    half = D // 2
+    ang_half = (np.arange(T)[:, None] * 0.1 + np.arange(half)[None, :] * 0.02)
+    ang = np.concatenate([ang_half, ang_half], axis=1)
+    cos = np.cos(ang).astype(np.float32)
+    sin = np.sin(ang).astype(np.float32)
+
+    y, _ = backend.run("rope_2d", [x, cos, sin], {})
+
+    assert y.shape == (T, H, D)
+    assert y.dtype == np.float16
+    want = _oracle("rope_2d", [x, cos, sin], {}).astype(np.float16)
+    err = np.abs(y.astype(np.float32) - want.astype(np.float32))
+    assert err.max() < 4e-3, f"max abs error {err.max()}"
+
+    # THE PROPERTY: a rotation preserves the norm of each (i, i+D/2) pair. This
+    # holds for the split-half convention and FAILS for adjacent pairing, so it
+    # is an oracle-independent check on the one thing most likely to be wrong.
+    def pair_norms(arr):
+        a = arr.astype(np.float32)
+        return a[..., :half] ** 2 + a[..., half:] ** 2
+
+    assert np.allclose(pair_norms(y), pair_norms(x), rtol=5e-2, atol=5e-3), (
+        "the split-half pair norms changed, so this is not a rotation of the "
+        "(i, i+D/2) pairs -- the likely cause is adjacent pairing"
+    )
+
+
+@sdk
+def test_patchify_dispatches_and_matches_the_registry(backend):
+    """The encoder's first op: rank-4 fp32 in, fp32 out, eight scalars.
+
+    THE ONLY TEST HERE THAT REACHES `dim:0:3`, and the only one with four attr
+    params. `patch`, `merge`, `grid_h` and `grid_w` cannot be recovered from the
+    shapes, so all four cross the wire -- and `merge` CHANGES THE ANSWER rather
+    than describing it, reordering the output rows into 2x2 spatial-merge-block
+    order. A dropped `merge` param gives raster order: right shape, right bytes,
+    wrong rows.
+
+    A small shape, because patchify at the encoder's own (3,2,256,256) costs
+    about 2.0M cycles and this is a dispatch test, not a benchmark.
+
+    THE SHAPE HAD TO BE CHOSEN CAREFULLY AND THE FIRST CHOICE WAS DEGENERATE.
+    With grid_h=4, grid_w=2, merge=2 the merge-block order is IDENTICAL to
+    raster order: Bw = grid_w/merge = 1, so bw is always 0 and
+    `((bh*Bw + bw)*merge + mh)*merge + mw` collapses to the raster index. The
+    kernel was correct and the reordering assertion below could not see it
+    either way. grid_h=6, grid_w=4 gives Bh=3, Bw=2 -- both greater than one, so
+    the two orders genuinely differ -- and they stay DIFFERENT from each other so
+    a grid transpose cannot pass either. merge=2 divides both, which the registry
+    requires.
+    """
+    C, T, patch, merge = 3, 2, 3, 2
+    grid_h, grid_w = 6, 4
+    H, W = grid_h * patch, grid_w * patch
+    attrs = {"patch": patch, "merge": merge, "grid_h": grid_h, "grid_w": grid_w,
+             "temporal_patch": T}
+    rng = np.random.default_rng(14)
+    img = rng.standard_normal((C, T, H, W)).astype(np.float32)
+
+    y, _ = backend.run("patchify", [img], attrs)
+
+    assert y.shape == (grid_h * grid_w, C * T * patch * patch)
+    assert y.dtype == np.float32
+    want = _oracle("patchify", [img], attrs).astype(np.float32)
+    # fp32 throughout and no arithmetic at all, so this must be BIT-EXACT.
+    assert np.array_equal(y, want), (
+        f"patchify disagreed with the registry on "
+        f"{(y != want).sum()} of {y.size} elements. Pure data movement in fp32 "
+        f"has no rounding to blame."
+    )
+
+    # AND THE MERGE REORDERING SPECIFICALLY. Raster order is what a kernel that
+    # ignores `merge` produces; it is the same shape, so only the values differ.
+    x = img.reshape(C, T, grid_h, patch, grid_w, patch)
+    raster = x.transpose(2, 4, 0, 1, 3, 5).reshape(grid_h * grid_w, -1)
+    assert not np.array_equal(y, raster), (
+        "the output is in raster order, so `merge` was ignored -- the "
+        "downstream merger is a pure reshape and needs 2x2 blocks"
+    )
