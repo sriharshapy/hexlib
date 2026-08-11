@@ -433,6 +433,44 @@ SPECS: dict[str, RunnerSpec] = {
             "verifies by refusing ambiguity."
         ),
     ),
+    "patchify": RunnerSpec(
+        kind="patchify",
+        kernel_dir="kernels/patchify_fp32",
+        inputs=("fp32",),
+        out_dtype="fp32",
+        scalars=(
+            Scalar("dim:0:0", "int"),        # C = 3 channels
+            Scalar("dim:0:1", "int"),        # T = 2 temporal_patch
+            Scalar("dim:0:2", "int"),        # H = 256
+            Scalar("dim:0:3", "int"),        # W = 256
+            Scalar("attr:patch", "int"),     # 16
+            Scalar("attr:merge", "int"),     # 2
+            Scalar("attr:grid_h", "int"),    # 16
+            Scalar("attr:grid_w", "int"),    # 16
+        ),
+        notes=(
+            "1 op, and the encoder's FIRST -- fp32 (3,2,256,256) -> (256,1536). The "
+            "only rank-4 input in the graph, so the first spec to use `dim:0:3`, "
+            "and the only op still in fp32 on both sides (the `cast` right after it "
+            "is where fp16 begins).\n"
+            "MOST SCALARS OF ANY KERNEL HERE: eight, four from the input's own "
+            "extents and four from attrs. `patch`, `merge`, `grid_h` and `grid_w` "
+            "cannot be derived from the shapes -- (256,1536) is consistent with "
+            "several (patch, grid) factorisations -- so they cross as params.\n"
+            "`merge` CHANGES THE ANSWER and is not metadata. The registry "
+            "(opdefs/structural.py:200-206) reshapes the patch grid into merge "
+            "blocks and transposes (2,5,3,6,0,1,4,7), so token order is "
+            "(bh, bw, mh, mw): consecutive runs of merge*merge = 4 rows must "
+            "already BE the 2x2 spatial block the downstream merger folds "
+            "together, because that merger is a pure reshape. Per-patch FEATURE "
+            "order (c, t, ph, pw) is untouched by merge. Ignoring the reordering "
+            "gives a correctly-shaped wrong answer that every shape check accepts, "
+            "which is one of the three near-misses the harness rejects.\n"
+            "2018331 cycles -- by far the most expensive op in the encoder per "
+            "invocation, though it runs once. It moves 1.5 MB with no arithmetic, "
+            "and only the innermost W run is contiguous on both sides."
+        ),
+    ),
     "softmax": RunnerSpec(
         kind="softmax",
         kernel_dir="kernels/softmax_fp16",
