@@ -16,6 +16,9 @@ import re
 
 import pytest
 
+from hexlib.tests.csource import block_from as _block_from
+from hexlib.tests.csource import function_body as _function_body
+
 H = pathlib.Path("hexlib/runtime/host")
 
 
@@ -37,45 +40,6 @@ def buffers():
 @pytest.fixture(scope="module")
 def main():
     return (H / "main.c").read_text()
-
-
-def _function_body(src, name):
-    """Slice the text of a C function from its signature to its matching
-    closing brace, by simple brace-depth counting. Good enough for this
-    project's straight-line C; not a general C parser.
-
-    Copied from `test_skel_bufs_source.py` (Task 4), per the coordinator's
-    note that a third variant of the same helper is not wanted."""
-    m = re.search(rf"\b{re.escape(name)}\s*\([^;{{]*\)\s*\{{", src)
-    assert m, f"could not find the definition of {name}() in the source"
-    start = m.end() - 1  # position of the opening brace
-    depth = 0
-    for i in range(start, len(src)):
-        if src[i] == "{":
-            depth += 1
-        elif src[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return src[start : i + 1]
-    raise AssertionError(f"unbalanced braces while slicing {name}()")
-
-
-def _block_from(text, pos):
-    """From `pos`, find the next '{' and return the brace-matched block it
-    opens (inclusive). Generalizes the closing half of `_function_body` to an
-    arbitrary starting offset, so one specific `if (...) { ... }` can be
-    isolated instead of just checking "somewhere in the next N characters" --
-    which a later, unrelated `return` statement could satisfy by accident."""
-    brace = text.index("{", pos)
-    depth = 0
-    for i in range(brace, len(text)):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return text[brace : i + 1]
-    raise AssertionError("unbalanced braces while slicing a block")
 
 
 def _macro_body(src, name):

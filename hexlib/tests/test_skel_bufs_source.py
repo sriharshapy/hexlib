@@ -12,30 +12,14 @@ import re
 
 import pytest
 
+from hexlib.tests.csource import function_body as _function_body
+
 SRC = pathlib.Path("hexlib/runtime/skel/skel_bufs.c")
 
 
 @pytest.fixture(scope="module")
 def src():
     return SRC.read_text()
-
-
-def _function_body(src, name):
-    """Slice the text of a C function from its signature to its matching
-    closing brace, by simple brace-depth counting. Good enough for this one
-    file's straight-line C; not a general C parser."""
-    m = re.search(rf"\b{re.escape(name)}\s*\([^;{{]*\)\s*\{{", src)
-    assert m, f"could not find the definition of {name}() in the source"
-    start = m.end() - 1  # position of the opening brace
-    depth = 0
-    for i in range(start, len(src)):
-        if src[i] == "{":
-            depth += 1
-        elif src[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return src[start:i + 1]
-    raise AssertionError(f"unbalanced braces while slicing {name}()")
 
 
 def _returns(src, constant):

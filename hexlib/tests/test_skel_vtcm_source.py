@@ -4,82 +4,15 @@ import re
 
 import pytest
 
+from hexlib.tests.csource import block_after_call as _block_after_call
+from hexlib.tests.csource import function_body as _function_body
+
 SRC = pathlib.Path("hexlib/runtime/skel/skel_vtcm.c")
 
 
 @pytest.fixture(scope="module")
 def src():
     return SRC.read_text()
-
-
-def _function_body(src, name):
-    """Slice the text of a C function from its signature to its matching
-    closing brace, by simple brace-depth counting. Good enough for this one
-    file's straight-line C; not a general C parser.
-
-    Copied from `test_skel_bufs_source.py` (Task 4) rather than reimplemented,
-    per the coordinator's note that a third variant of the same helper is not
-    wanted."""
-    m = re.search(rf"\b{re.escape(name)}\s*\([^;{{]*\)\s*\{{", src)
-    assert m, f"could not find the definition of {name}() in the source"
-    start = m.end() - 1  # position of the opening brace
-    depth = 0
-    for i in range(start, len(src)):
-        if src[i] == "{":
-            depth += 1
-        elif src[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return src[start:i + 1]
-    raise AssertionError(f"unbalanced braces while slicing {name}()")
-
-
-def _block_after_call(body, call_name):
-    """Within a function body, find a call to `call_name` and return the text
-    of the nearest brace-delimited block that checks its result -- either the
-    call sits inside an `if` condition (`if (call(...) != 0) { ... }`), or an
-    `if` immediately follows the call as a separate statement (`x =
-    call(...); if (!x) { ... }`). Both shapes occur in this file.
-
-    Asserts an `if (` appears between the call and the block, so a stray
-    block that has nothing to do with checking the call's result cannot be
-    picked up by accident."""
-    m = re.search(rf"\b{re.escape(call_name)}\s*\(", body)
-    assert m, f"no call to {call_name}() found in this function"
-    call_start = m.start()
-
-    # Walk the call's own parens to find where its argument list ends --
-    # none of this file's calls nest parens, but do it properly anyway.
-    depth = 0
-    call_end = None
-    for i in range(m.end() - 1, len(body)):
-        if body[i] == "(":
-            depth += 1
-        elif body[i] == ")":
-            depth -= 1
-            if depth == 0:
-                call_end = i + 1
-                break
-    assert call_end is not None, f"unbalanced parens in the call to {call_name}()"
-
-    brace_pos = body.find("{", call_end)
-    assert brace_pos != -1, f"no block follows the call to {call_name}()"
-
-    window = body[max(0, call_start - 80):brace_pos]
-    assert "if" in window and "(" in window, (
-        f"{call_name}()'s result does not appear to be checked by an `if` "
-        f"before the block that follows it"
-    )
-
-    depth = 0
-    for i in range(brace_pos, len(body)):
-        if body[i] == "{":
-            depth += 1
-        elif body[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return body[brace_pos:i + 1]
-    raise AssertionError(f"unbalanced braces in the block following {call_name}()")
 
 
 def test_size_comes_from_the_runtime_never_a_constant(src):
