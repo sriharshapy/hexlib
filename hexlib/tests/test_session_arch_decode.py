@@ -37,6 +37,7 @@ Adapted from llama.cpp's own htpdrv_get_arch (ggml-hexagon/htp-drv.cpp:
 """
 import ctypes
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -48,7 +49,34 @@ from hexlib.tests.csource import function_body as _function_body
 SESSION_C = pathlib.Path("hexlib/runtime/host/session.c")
 
 HOST_CC = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
-needs_cc = pytest.mark.skipif(HOST_CC is None, reason="no host C compiler on PATH")
+needs_cc = pytest.mark.skipif(
+    HOST_CC is None,
+    reason=(
+        "no host C compiler found (tried: gcc, cc, clang); the BEHAVIOURAL "
+        "arch-decode test is skipped and only the weaker source assertion "
+        "in test_host_source.py (test_arch_is_queried_from_the_driver_not_"
+        "assumed) covers this. Install a host C compiler to restore it."
+    ),
+)
+
+
+def test_the_decode_function_the_behavioural_test_depends_on_still_exists(
+    decode_fn_source,
+):
+    """COMPILER-INDEPENDENT -- runs even when needs_cc above would skip
+    every other test in this file, so a rename or removal of
+    hexlib_decode_bcd_arch() is never invisible on a machine with no host C
+    compiler on PATH. `decode_fn_source` itself already raises (failing this
+    test) if the function is gone; this test additionally pins that its body
+    still contains real BCD-decode arithmetic, not merely SOME function by
+    that name that could compile into anything. Pairs the exact NAME the
+    behavioural tests below extract with what session.c actually contains,
+    so the pair cannot silently drift apart -- see this module's docstring's
+    "decisive property" and the module docstring's WHY for the full
+    rationale."""
+    assert re.search(r">>\s*4", decode_fn_source), "must extract the high BCD nibble"
+    assert re.search(r"\*\s*10", decode_fn_source), "must weight the high nibble by 10"
+    assert re.search(r"&\s*0x0f\b", decode_fn_source), "must extract the low BCD nibble"
 
 
 @pytest.fixture(scope="module")

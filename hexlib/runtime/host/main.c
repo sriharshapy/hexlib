@@ -37,9 +37,10 @@
 #include <remote.h>
 #include <rpcmem.h>         /* RPCMEM_HEAP_ID_SYSTEM / RPCMEM_DEFAULT_FLAGS,
                              * for the same reason as above. */
-#include <math.h>           /* fabsf -- --coherency-check must treat -0.0 as
-                             * zero; see run_coherency_check()'s own header. */
-#include <stdint.h>
+#include <stdint.h>         /* uint16_t -- --coherency-check classifies fp16
+                             * lanes by raw bit pattern, not by __fp16
+                             * arithmetic; see hexlib_classify_coherency_lane()
+                             * below and run_coherency_check()'s own header. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,8 +66,9 @@
                                      * confused with it. See
                                      * run_coherency_check()'s own header on
                                      * why "zero" must be checked by
-                                     * magnitude (fabsf), not bit-exact
-                                     * equality against +0.0. */
+                                     * magnitude (masking off the sign bit,
+                                     * 0x7FFF), not bit-exact equality
+                                     * against +0.0. */
 #define COHERENCY_FACTOR   0.0f     /* x * 0.0 is zero in fp16 for any finite,
                                      * non-NaN x -- no numerically ambiguous
                                      * case, so a wrong result here cannot be
@@ -536,7 +538,10 @@ static int run_self_test(int unmapped) {
  * "SENTINEL INTACT" IS NOT A BIT-COMPARE AGAINST +0.0, AND IT IS A REAL
  * CHECK OF THE SENTINEL'S BYTES, NOT JUST "NOT EXACTLY ZERO". Two defects
  * were found here and both are fixed the same way: by classifying every
- * lane of `y` on read-back, rather than testing a single condition.
+ * lane of `y` on read-back, rather than testing a single condition. The
+ * classification itself lives in hexlib_classify_coherency_lane() below,
+ * a small pure function kept SEPARATE from this one on purpose -- see its
+ * own header comment for why.
  *
  *   1. "The expected result is zero" was checked as `memcmp` against
  *      `(__fp16) 0.0f`. But COHERENCY_FACTOR is 0.0f and the self-test's own
@@ -545,19 +550,32 @@ static int run_self_test(int unmapped) {
  *      negative -- there is no -ffast-math here (toolchain.py) to paper over
  *      that. A bit-exact compare against +0.0 therefore read HEALTHY
  *      hardware as "sentinel unchanged" and reported a coherency miss that
- *      never happened. Fixed by comparing MAGNITUDE (`fabsf`), which is
- *      true of -0.0 and +0.0 alike and is the only thing "the write reached
- *      the host and reads as zero" actually claims.
+ *      never happened. Fixed by comparing MAGNITUDE (masking off the sign
+ *      bit, 0x7FFF), which is true of -0.0 and +0.0 alike and is the only
+ *      thing "the write reached the host and reads as zero" actually claims.
  *   2. The code never verified the surviving bytes were genuinely the
  *      SENTINEL before calling them "unchanged" -- a garbled or
  *      partially-written buffer (neither the expected zero nor the intact
  *      sentinel) would fall through to the same "sentinel_unchanged" /
  *      COHERENCY_MISS verdict as a real miss, misattributing a THIRD, worse
  *      failure mode to this one specific diagnosis. Fixed by requiring an
- *      exact bit-compare against COHERENCY_SENTINEL before calling anything
- *      "unchanged"; a buffer that is neither all-zero-magnitude nor all-
- *      sentinel prints its own distinct verdict (`buffer_garbled`,
+ *      exact bit-compare against the sentinel's own bits before calling
+ *      anything "unchanged"; a buffer that is neither all-zero-magnitude nor
+ *      all-sentinel prints its own distinct verdict (`buffer_garbled`,
  *      HEXLIB_EXIT_COHERENCY_GARBLED) instead of being folded into either.
+ *
+ * BOTH DEFECTS WERE FIXED ONCE BEFORE BY SOURCE ALONE -- THIS TIME THE FIX
+ * IS PROVEN BEHAVIOURALLY. A source assertion (test_host_source.py) can only
+ * confirm that a magnitude check and a sentinel check EXIST; it cannot
+ * confirm they classify -0.0 (0x8000) as zero rather than as an unchanged
+ * sentinel, which is the exact case that produced the original false
+ * coherency-miss report. hexlib_classify_coherency_lane() is compiled and
+ * RUN against real bit patterns -- including 0x8000 -- by
+ * hexlib/tests/test_coherency_lane_classification.py, which is to this fix
+ * what test_session_arch_decode.py is to the arch-decode fix above it in
+ * this project's own history: the same defect class (a comparison whose
+ * OPERANDS were wrong, not merely a comparison whose existence a source
+ * assertion could confirm), closed the same way.
  *
  * WHAT THIS DOES NOT PROVE -- DO NOT READ MORE INTO A PASS THAN THIS.
  * This exercises only the DSP-write -> host-read direction (the DSP writes
@@ -568,6 +586,46 @@ static int run_self_test(int unmapped) {
  * scale_fp16's one write pattern and this one buffer size, not about every
  * kernel or every buffer size hexlib might ever dispatch.
  * ========================================================================*/
+
+/* One fp16 lane's read-back classification: ZERO (the expected result, by
+ * MAGNITUDE), SENTINEL (bit-exact the value written before invoke, i.e.
+ * genuinely unchanged), or OTHER (neither -- a garbled or partially-written
+ * lane, a third outcome that must never be folded into either of the first
+ * two; see run_coherency_check()'s own header comment above).
+ *
+ * TAKES RAW uint16_t BITS, NOT __fp16 VALUES -- ON PURPOSE, NOT MERELY FOR
+ * CONVENIENCE. Every question this function answers is a question about
+ * which BITS are set, never about floating-point arithmetic: fp16's only
+ * two zero bit patterns are 0x0000 (+0.0) and 0x8000 (-0.0), so masking off
+ * the sign bit (bit 15) and comparing the rest to zero is bit-for-bit
+ * equivalent to `fabsf((float) v) == 0.0f` for every fp16 value, with no
+ * float-to-int rounding step in between to second-guess. Expressing the
+ * check this way -- rather than through __fp16/fabsf() -- means this exact
+ * function can be extracted and compiled on ANY host C compiler, including
+ * one with no __fp16 support at all, which is precisely the machine
+ * hexlib/tests/test_coherency_lane_classification.py's behavioural test
+ * runs on (see that file's own module docstring). Kept as its own pure
+ * function (no I/O, no globals, no side effects) for the same reason
+ * hexlib_decode_bcd_arch() is (session.c) -- so it can be extracted and
+ * unit-tested directly against the one value that broke this check for
+ * real (0x8000) rather than only asserted by source pattern. */
+enum hexlib_coherency_lane {
+    HEXLIB_LANE_ZERO     = 0,  /* magnitude zero: +0.0 (0x0000) or -0.0 (0x8000) */
+    HEXLIB_LANE_SENTINEL = 1,  /* bit-exact the sentinel written before invoke */
+    HEXLIB_LANE_OTHER    = 2,  /* neither -- garbled or partially written */
+};
+
+static enum hexlib_coherency_lane
+hexlib_classify_coherency_lane(uint16_t bits, uint16_t sentinel_bits) {
+    if ((uint16_t) (bits & 0x7FFFu) == 0) {
+        return HEXLIB_LANE_ZERO;
+    }
+    if (bits == sentinel_bits) {
+        return HEXLIB_LANE_SENTINEL;
+    }
+    return HEXLIB_LANE_OTHER;
+}
+
 static int run_coherency_check(void) {
     hexlib_ctx *ctx = NULL;
     if (hexlib_open(&ctx, CDSP_DOMAIN_ID) != 0) {
@@ -643,25 +701,29 @@ static int run_coherency_check(void) {
             struct hexlib_batch_rsp_hdr full_hdr;
             memcpy(&full_hdr, rsp, sizeof(full_hdr));
 
-            /* Classify every lane, not just "equal to +0.0" -- see this
-             * function's own header comment for why both halves of this
-             * matter. `all_zero` is a MAGNITUDE check (fabsf), so -0.0
-             * (bit pattern 0x8000, which `x * 0.0f` genuinely produces for
-             * negative `x`) counts as the expected zero result, not as
-             * "sentinel survived". `all_sentinel` is a real, exact
-             * bit-compare against COHERENCY_SENTINEL -- a buffer that is
-             * NEITHER all-zero-magnitude NOR bit-exact-sentinel is a third,
-             * distinct outcome (garbled or partially written) and must not
-             * be reported as either a clean pass or a coherency miss. */
+            /* Classify every lane through hexlib_classify_coherency_lane()
+             * -- see that function's own header comment for why both halves
+             * of this matter and why it operates on raw bits. `all_zero` and
+             * `all_sentinel` are true only if EVERY lane classified the same
+             * way; a lane that is neither (HEXLIB_LANE_OTHER) clears both,
+             * so a garbled or partially-written buffer falls through to its
+             * own distinct verdict below rather than being reported as
+             * either a clean pass or a coherency miss. */
             const __fp16 *yr = (const __fp16 *) by->ptr;
             __fp16 sentinel = (__fp16) COHERENCY_SENTINEL;
+            uint16_t sentinel_bits;
+            memcpy(&sentinel_bits, &sentinel, sizeof(sentinel_bits));
             int all_zero = 1;
             int all_sentinel = 1;
             for (int i = 0; i < SELF_TEST_N; i++) {
-                if (fabsf((float) yr[i]) != 0.0f) {
+                uint16_t bits;
+                memcpy(&bits, &yr[i], sizeof(bits));
+                enum hexlib_coherency_lane lane =
+                    hexlib_classify_coherency_lane(bits, sentinel_bits);
+                if (lane != HEXLIB_LANE_ZERO) {
                     all_zero = 0;
                 }
-                if (memcmp(&yr[i], &sentinel, sizeof(__fp16)) != 0) {
+                if (lane != HEXLIB_LANE_SENTINEL) {
                     all_sentinel = 0;
                 }
             }

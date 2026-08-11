@@ -126,13 +126,28 @@ class _QdcResultsError(Exception):
 
 def _qdc_parse_results_xml(path: str) -> tuple[int, int, int]:
     """Parse a JUnit-style results.xml and return `(tests, failures,
-    errors)` summed across every `<testsuite>` element -- the root may be a
-    single `<testsuite>` (as pytest emits by default) or a `<testsuites>`
-    wrapping several. Raises `_QdcResultsError` on anything that is not a
-    genuinely parseable report with real counts on it -- a truncated or
-    non-XML file, or a `<testsuites>`/`<testsuite>` tree with no testsuite
-    elements at all -- so the caller never has to guess whether "zero"
-    means "ran zero tests" or "could not even find the count".
+    errors)` summed across every `<testsuite>` element. Raises
+    `_QdcResultsError` on anything that is not a genuinely parseable report
+    with real counts on it -- a truncated or non-XML file, a
+    `<testsuites>`/`<testsuite>` tree with no testsuite elements at all, or
+    a shape this function does not recognize -- so the caller never has to
+    guess whether "zero" means "ran zero tests" or "could not even find the
+    count".
+
+    ONLY ONE SHAPE IS ACCEPTED, PINNED TO WHAT THIS PROJECT ACTUALLY
+    PRODUCES, NOT GUESSED AT AS A GENERAL JUNIT PARSER. The on-device job's
+    own pytest.ini (device/qdc/artifact.py's `_PYTEST_INI`) sets
+    `--junitxml=TestLogs/results.xml`, and pytest's `--junitxml` always
+    emits exactly one `<testsuite>`, either as the document root or as the
+    sole immediate child of a `<testsuites>` wrapper -- it never nests one
+    `<testsuite>` inside another. An earlier version of this function
+    accepted ANY shape by summing `root.findall(".//testsuite")` -- every
+    `<testsuite>` at any depth -- which would silently DOUBLE-COUNT a report
+    whose parent `<testsuite>` totals already include a nested child's
+    counts. Rather than guess how such a report should be summed, this
+    refuses it outright: a parse failure here blocks a false pass (the
+    caller reports it as a failure, never a pass -- see
+    `_qdc_check_results`), which is the safe direction to fail in.
     """
     try:
         root = ET.parse(path).getroot()
@@ -141,13 +156,31 @@ def _qdc_parse_results_xml(path: str) -> tuple[int, int, int]:
 
     if root.tag == "testsuite":
         suites = [root]
+    elif root.tag == "testsuites":
+        suites = root.findall("testsuite")   # DIRECT children only.
     else:
-        suites = root.findall(".//testsuite")
+        raise _QdcResultsError(
+            f"{path} root is <{root.tag}>, not <testsuite> or <testsuites> "
+            "-- not a JUnit report shape this project recognizes"
+        )
     if not suites:
         raise _QdcResultsError(
             f"{path} contains no <testsuite> element -- not a JUnit report "
             "this project recognizes"
         )
+
+    # Refuse a <testsuite> nested inside another <testsuite> ANYWHERE in the
+    # tree, rather than silently summing it -- pytest's own --junitxml never
+    # produces this shape (see the docstring above), and summing it would
+    # double-count a parent's already-rolled-up totals.
+    for suite in suites:
+        if suite.findall(".//testsuite"):
+            raise _QdcResultsError(
+                f"{path} has a <testsuite> nested inside another <testsuite> "
+                "-- not the flat shape pytest's --junitxml produces, and "
+                "summing nested totals would double-count them; refusing "
+                "rather than guessing how to sum it"
+            )
 
     tests = failures = errors = 0
     for suite in suites:

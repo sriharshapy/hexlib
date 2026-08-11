@@ -458,9 +458,9 @@ def test_coherency_check_reads_the_sentinel_only_after_both_statuses_are_ok(main
     else_pos = body.index("else", op_ok_check.end())
     success_block = _block_from(body, else_pos)
 
-    assert "memcmp(&yr[i]" in success_block, (
-        "the sentinel must only be read back once both statuses are "
-        "confirmed OK"
+    assert "hexlib_classify_coherency_lane(" in success_block, (
+        "the sentinel must only be read back (and classified) once both "
+        "statuses are confirmed OK"
     )
     cycles_idx = success_block.index("cycles_total=%llu")
     overwritten_idx = success_block.index('"COHERENCY sentinel_overwritten\\n"')
@@ -490,16 +490,31 @@ def test_coherency_check_treats_negative_zero_as_the_expected_zero_result(main):
     (toolchain.py) to make that not so. A bit-exact compare of the read-back
     buffer against `(__fp16) 0.0f` would misclassify that HEALTHY result as
     "sentinel unchanged" and report a coherency miss that never happened.
-    The classification must use a magnitude comparison (fabsf) instead."""
-    body = _function_body(main, "run_coherency_check")
-    assert "fabsf(" in body, (
-        "the expected-zero classification must compare MAGNITUDE (fabsf), "
-        "not bit-exact equality against +0.0 -- see this function's own "
-        "header comment on why -0.0 must count as zero"
+
+    THIS IS A SOURCE ASSERTION ONLY -- it can confirm the sign-bit mask
+    exists in hexlib_classify_coherency_lane(), never that it actually
+    classifies 0x8000 as zero. See
+    hexlib/tests/test_coherency_lane_classification.py for the genuine,
+    compiled-and-run behavioural test of that exact function against that
+    exact bit pattern -- the same defect class as the arch-decode fix (see
+    test_session_arch_decode.py), closed the same way."""
+    classify_body = _function_body(main, "hexlib_classify_coherency_lane")
+    assert re.search(r"&\s*0x7[Ff]{3}[Uu]?\b", classify_body), (
+        "the expected-zero classification must mask off the sign bit "
+        "(0x7FFF), not compare bit-exact equality to +0.0 alone -- see this "
+        "function's own header comment on why -0.0 must count as zero"
     )
-    assert not re.search(r"memcmp\(&yr\[i\],\s*&zero\b", body), (
+    assert not re.search(r"memcmp\(&yr\[i\],\s*&zero\b", main), (
         "must not have regressed to a bit-exact memcmp against a literal "
         "zero for the expected-result check"
+    )
+
+    body = _function_body(main, "run_coherency_check")
+    assert re.search(r"hexlib_classify_coherency_lane\s*\(", body), (
+        "run_coherency_check must classify each lane through "
+        "hexlib_classify_coherency_lane(), not reimplement the check inline "
+        "-- see test_coherency_lane_classification.py for why that function "
+        "must stay the one thing exercised behaviourally"
     )
 
 
@@ -509,12 +524,18 @@ def test_coherency_check_verifies_the_surviving_bytes_are_really_the_sentinel(ma
     'sentinel_unchanged' / coherency-miss verdict just because it failed the
     zero check -- it is a third, distinct outcome and must be its own
     branch with its own exit code."""
-    body = _function_body(main, "run_coherency_check")
-    assert re.search(r"memcmp\(&yr\[i\],\s*&sentinel\b", body), (
-        "the surviving bytes must be compared, bit-exact, against the real "
-        "COHERENCY_SENTINEL value -- not merely assumed to be the sentinel "
+    classify_body = _function_body(main, "hexlib_classify_coherency_lane")
+    assert re.search(r"bits\s*==\s*sentinel_bits", classify_body), (
+        "the surviving bits must be compared, bit-exact, against the real "
+        "sentinel's own bits -- not merely assumed to be the sentinel "
         "because they were not zero"
     )
+    assert "HEXLIB_LANE_OTHER" in classify_body, (
+        "a lane that is neither zero nor the sentinel must be its own, "
+        "third classification -- not folded into either of the other two"
+    )
+
+    body = _function_body(main, "run_coherency_check")
     assert "HEXLIB_EXIT_COHERENCY_GARBLED" in main
     assert "exit_code = HEXLIB_EXIT_COHERENCY_GARBLED;" in body
     assert '"COHERENCY buffer_garbled\\n"' in body

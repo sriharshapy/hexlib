@@ -218,6 +218,36 @@ def test_a_clean_result_missing_only_cycles_total_is_still_a_failure(
     assert rc != 0
 
 
+def test_a_testsuite_nested_inside_another_testsuite_is_refused_not_summed(
+    monkeypatch, tmp_path, capsys
+):
+    """Critical 3's own aftermath: `.findall(".//testsuite")` sums every
+    `<testsuite>` at ANY depth, so a report with one `<testsuite>` nested
+    inside another -- whose parent's own `tests`/`failures`/`errors`
+    attributes already include the child's counts -- would be double-counted
+    if summed naively. pytest's own `--junitxml` (device/qdc/artifact.py's
+    pytest.ini) never produces this shape, so this must be REFUSED as an
+    unparseable report (never silently summed into a false pass or a
+    misleading count) -- a parse failure here blocks a false pass, which is
+    the safe direction to fail in."""
+    _stub_build_submit_and_wait(monkeypatch)
+    xml = (
+        "<testsuites>"
+        '<testsuite tests="5" failures="0" errors="0">'
+        '<testsuite tests="2" failures="0" errors="0"></testsuite>'
+        "</testsuite>"
+        "</testsuites>"
+    )
+    paths = _fake_fetch(
+        tmp_path, results_xml=xml, extra_logs={"hexlib_selftest.log": GOOD_LOG}
+    )
+    monkeypatch.setattr(job, "fetch", lambda job_id, dest: paths)
+    rc = cli._qdc_submit(_args(tmp_path))
+    assert rc != 0
+    err = capsys.readouterr().err.lower()
+    assert "nested" in err or "pars" in err
+
+
 def test_testsuites_wrapper_with_multiple_suites_is_summed(monkeypatch, tmp_path):
     """pytest's junit-xml can emit a <testsuites> root wrapping one or more
     <testsuite> children -- the counts must be summed across all of them,
@@ -235,3 +265,71 @@ def test_testsuites_wrapper_with_multiple_suites_is_summed(monkeypatch, tmp_path
     monkeypatch.setattr(job, "fetch", lambda job_id, dest: paths)
     rc = cli._qdc_submit(_args(tmp_path))
     assert rc == 0
+
+
+# ==============================================================================
+# Direct unit tests of `_qdc_parse_results_xml` itself -- pinning the exact
+# shape it accepts (a single <testsuite>, or a <testsuites> wrapping
+# <testsuite> children directly, matching pytest's own --junitxml output;
+# see device/qdc/artifact.py's pytest.ini) and confirming it REFUSES anything
+# else -- most importantly a genuinely nested
+# <testsuites><testsuite><testsuite> document, which an earlier
+# `.findall(".//testsuite")` would have summed and silently double-counted.
+# ==============================================================================
+
+
+def test_parse_bare_testsuite_root(tmp_path):
+    p = tmp_path / "results.xml"
+    p.write_text('<testsuite tests="4" failures="1" errors="0"></testsuite>')
+    assert cli._qdc_parse_results_xml(str(p)) == (4, 1, 0)
+
+
+def test_parse_testsuites_wrapper_sums_direct_children_only(tmp_path):
+    p = tmp_path / "results.xml"
+    p.write_text(
+        "<testsuites>"
+        '<testsuite tests="2" failures="0" errors="1"></testsuite>'
+        '<testsuite tests="3" failures="1" errors="0"></testsuite>'
+        "</testsuites>"
+    )
+    assert cli._qdc_parse_results_xml(str(p)) == (5, 1, 1)
+
+
+def test_parse_refuses_a_testsuite_nested_inside_a_testsuite(tmp_path):
+    """THE DOUBLE-COUNT GUARD, tested directly against the parser (see the
+    end-to-end version above via `_qdc_submit`). A parent <testsuite>'s own
+    tests="5" already includes whatever its nested child's tests="2"
+    contributed -- summing both, as `.findall(".//testsuite")` would, reports
+    7 when only 5 tests genuinely ran. This must be refused outright rather
+    than guessed at."""
+    p = tmp_path / "results.xml"
+    p.write_text(
+        "<testsuites>"
+        '<testsuite tests="5" failures="0" errors="0">'
+        '<testsuite tests="2" failures="0" errors="0"></testsuite>'
+        "</testsuite>"
+        "</testsuites>"
+    )
+    with pytest.raises(cli._QdcResultsError, match="nested"):
+        cli._qdc_parse_results_xml(str(p))
+
+
+def test_parse_refuses_a_testsuite_nested_directly_under_bare_testsuite_root(tmp_path):
+    """The same nested shape, but with the outer element as the document
+    root itself (no <testsuites> wrapper) -- must be refused the same way,
+    not accepted just because the root tag matched the simple case."""
+    p = tmp_path / "results.xml"
+    p.write_text(
+        '<testsuite tests="5" failures="0" errors="0">'
+        '<testsuite tests="2" failures="0" errors="0"></testsuite>'
+        "</testsuite>"
+    )
+    with pytest.raises(cli._QdcResultsError, match="nested"):
+        cli._qdc_parse_results_xml(str(p))
+
+
+def test_parse_refuses_an_unrecognized_root_tag(tmp_path):
+    p = tmp_path / "results.xml"
+    p.write_text('<report tests="4" failures="0" errors="0"></report>')
+    with pytest.raises(cli._QdcResultsError, match="testsuite"):
+        cli._qdc_parse_results_xml(str(p))
