@@ -31,10 +31,26 @@ static int release_callback(unsigned int rctx, void *state) {
 }
 
 int hexlib_vtcm_alloc(struct hexlib_ctx *ctx) {
-    unsigned int vtcm_size = 0;
-    if (HAP_compute_res_query_VTCM(0, &vtcm_size, 0, 0, 0) != 0 || vtcm_size == 0) {
+    /* BOTH SIZES, AND THE SECOND ONE IS THE POINT. The signature is
+     * (application_id, total_block_size, total_block_layout, avail_block_size,
+     * avail_block_layout) -- HAP_compute_res.h:1087-1106. `total` is the whole
+     * partition assigned to this application type (8388608 on v75); `avail` is
+     * the SDK's own words "largest contiguous memory chunk available". An
+     * earlier version of this function passed 0 for avail and asked for total
+     * as an absolute requirement, which is the bug below. */
+    unsigned int vtcm_total = 0;
+    unsigned int vtcm_avail = 0;
+    if (HAP_compute_res_query_VTCM(0, &vtcm_total, 0, &vtcm_avail, 0) != 0 ||
+        vtcm_total == 0) {
         FARF(ERROR, "hexlib: HAP_compute_res_query_VTCM failed");
         return HEXLIB_DSP_ERR_INTERNAL;
+    }
+    /* Nothing at all is a real failure and a distinct one: the partition
+     * exists but every byte of it is held by someone else. */
+    if (vtcm_avail == 0) {
+        FARF(ERROR, "hexlib: VTCM fully contended -- total %u, available 0",
+             vtcm_total);
+        return HEXLIB_DSP_ERR_VTCM_TOO_SMALL;
     }
 
     compute_res_attr_t attr;
@@ -43,12 +59,36 @@ int hexlib_vtcm_alloc(struct hexlib_ctx *ctx) {
     HAP_compute_res_attr_set_cache_mode(&attr, 1);
     /* min_page_size = 0: best-fit page layout (fewest page mappings). The SDK
      * only accepts specific page-size values here (4 KB..16 MB); the queried
-     * vtcm_size is not guaranteed to be one of them, so passing vtcm_size
-     * itself (as an earlier draft of this file did) risks the manager
-     * rejecting a legitimate request.
-     * min_vtcm_size = 0: the queried size is an absolute requirement -- if it
-     * is not available we fail rather than silently accepting less. */
-    HAP_compute_res_attr_set_vtcm_param_v2(&attr, vtcm_size, 0, 0);
+     * size is not guaranteed to be one of them, so passing it as the page size
+     * (as an earlier draft of this file did) risks the manager rejecting a
+     * legitimate request.
+     *
+     * min_vtcm_size = vtcm_avail, AND THIS IS A BUG FIX, NOT A TUNING CHOICE.
+     * It was 0, and HAP_compute_res.h:544-546 defines 0 as "the size is an
+     * absolute requirement" -- so this asked for the part's ENTIRE VTCM and
+     * refused anything less. On a shared CDSP that means one other client
+     * holding a single 4 KB page makes HAP_compute_res_acquire below return 0
+     * after burning its full one-second timeout, hexlib_iface_start fails, and
+     * every mode exits at session open. The SIMULATOR CANNOT SHOW THIS,
+     * because nothing else there holds VTCM -- which is exactly why stage 1
+     * was green with this live.
+     *
+     * The floor is the SDK's own `avail`, not a constant, which keeps this
+     * file's governing rule intact (the size comes from the runtime, never a
+     * hardcoded byte count): ask for the whole partition, accept down to what
+     * the manager just said is actually free. Asking for `avail` directly
+     * instead would cap us at a value that can go stale between query and
+     * acquire, and would give up headroom that may have been freed in between.
+     *
+     * WHAT THIS DELIBERATELY DOES NOT DO: check the result against the plan's
+     * high water. The DSP does not know the plan's high water -- see §8 of the
+     * design doc, which used to claim this check existed. So a session can now
+     * start with less VTCM than a given plan needs, and the honest division of
+     * labour is that `hwinfo` reports the acquired size, the host records it,
+     * and M2 compares. The exposure today is nil in practice: `hexlib_args`
+     * carries vtcm/vtcm_size to every kernel, but no kernel on this branch
+     * uses either. Revisit the moment one does. */
+    HAP_compute_res_attr_set_vtcm_param_v2(&attr, vtcm_total, 0, vtcm_avail);
     HAP_compute_res_attr_set_release_callback(&attr, release_callback, (void *) ctx);
     /* CONDITIONAL ON THE SESSION ACTUALLY ASKING FOR HMX. `ctx->n_hmx` is set
      * by hexlib_iface_start() (skel.c) before this function ever runs; no
@@ -65,7 +105,10 @@ int hexlib_vtcm_alloc(struct hexlib_ctx *ctx) {
 
     uint32_t rctx = HAP_compute_res_acquire(&attr, 1000000);
     if (!rctx) {
-        FARF(ERROR, "hexlib: HAP_compute_res_acquire failed for %u bytes", vtcm_size);
+        /* Both numbers, so a device log distinguishes "the partition is busy"
+         * from "the manager refused a request it should have satisfied". */
+        FARF(ERROR, "hexlib: HAP_compute_res_acquire failed -- wanted %u, "
+                    "floor %u, total %u", vtcm_total, vtcm_avail, vtcm_total);
         return HEXLIB_DSP_ERR_VTCM_TOO_SMALL;
     }
 
@@ -83,7 +126,16 @@ int hexlib_vtcm_alloc(struct hexlib_ctx *ctx) {
     ctx->vtcm_valid         = 0;
     ctx->vtcm_needs_release = 0;
 
-    FARF(HIGH, "hexlib: VTCM %u bytes at %p", got, ptr);
+    /* THREE NUMBERS, ON PURPOSE. `got` alone cannot tell the operator whether a
+     * short session is contention or a manager quirk; got-vs-total-vs-floor
+     * can, and this is the only place any of it is observable on a device. */
+    FARF(HIGH, "hexlib: VTCM %u bytes at %p (total %u, available %u)",
+         got, ptr, vtcm_total, vtcm_avail);
+    if (got < vtcm_total) {
+        FARF(HIGH, "hexlib: VTCM is CONTENDED -- got %u of %u bytes. The session "
+                   "is usable; whether it is large enough for a given plan is "
+                   "not checked here (see design doc SS8)", got, vtcm_total);
+    }
     return HEXLIB_DSP_OK;
 }
 

@@ -16,6 +16,12 @@ struct hexlib_ctx {
     struct hexlib_mmap mmap[HEXLIB_MAX_MMAPS];
     uint64_t max_vmem;
 
+    /* The last hexlib_iface_start() status. Recorded because start()'s
+     * AEEResult may be normalised by the RPC layer, and because a later call
+     * that finds !started can then say WHY rather than only that it must not
+     * proceed. HEXLIB_DSP_OK once a session is up. */
+    int start_status;
+
     uint8_t *vtcm_base;
     size_t   vtcm_size;
     uint32_t vtcm_rctx;

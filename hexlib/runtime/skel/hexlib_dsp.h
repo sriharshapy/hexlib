@@ -48,6 +48,23 @@ enum hexlib_dsp_status {
     HEXLIB_DSP_ERR_NOT_STARTED = 14,
 };
 
+/* CARRY A STATUS OUT THROUGH AN AEEResult, for the one call that has no response
+ * buffer to put it in. `invoke` returns its status inside the response blob, but
+ * `start` fails before any blob exists, so a bare AEE_EFAILED there flattened
+ * every VTCM outcome into the single result the host already prints for a dozen
+ * unrelated causes -- leaving a device operator unable to tell VTCM contention
+ * from a signing failure, a URI error, or a missing skel.
+ *
+ * 0x8FA0xxxx sits in the AEE "reserved for OEM/vendor" high half, so it is
+ * nonzero (every `if (rc != AEE_SUCCESS)` still fails) and does not collide with
+ * AEE_EFAILED or the AEE_E* range. Decode with HEXLIB_AEE_STATUS; test with
+ * HEXLIB_AEE_IS_STATUS first, because a failure from qaic or the RPC layer
+ * itself will not carry this tag. */
+#define HEXLIB_AEE_STATUS_TAG 0x8FA00000u
+#define HEXLIB_AEE_FROM_STATUS(s) ((int) (HEXLIB_AEE_STATUS_TAG | ((unsigned) (s) & 0xFFu)))
+#define HEXLIB_AEE_IS_STATUS(r) (((unsigned) (r) & 0xFFFFFF00u) == HEXLIB_AEE_STATUS_TAG)
+#define HEXLIB_AEE_STATUS(r) ((int) ((unsigned) (r) & 0xFFu))
+
 struct hexlib_batch_hdr {
     uint32_t magic;
     uint32_t version;

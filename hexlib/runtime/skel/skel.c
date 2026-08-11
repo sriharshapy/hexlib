@@ -55,9 +55,26 @@ AEEResult hexlib_iface_start(remote_handle64 handle, uint32 sess_id, uint32 n_hv
 
     int rc = hexlib_vtcm_alloc(ctx);
     if (rc != HEXLIB_DSP_OK) {
+        /* CARRY THE SPECIFIC STATUS ACROSS THE RPC BOUNDARY. This returned a
+         * bare AEE_EFAILED, which flattened every VTCM failure into the one
+         * outcome the host already reports for a dozen unrelated causes, so on
+         * a device the operator could not tell VTCM contention from a signing
+         * failure, a URI error, or a missing skel -- the same undiagnosable
+         * session-open dead end as the arch-decode bug, from a different cause.
+         *
+         * The FARF above is not enough on its own: it lands in the DSP log,
+         * which an operator running a device-farm job may not be able to
+         * retrieve. The return value always comes back.
+         *
+         * HEXLIB_AEE_FROM_STATUS keeps this a nonzero failure for every caller
+         * that only tests success, while making the reason recoverable for one
+         * that looks. If FastRPC ever normalises the value we lose only the
+         * detail, never the failure. */
+        ctx->start_status = rc;
         FARF(ERROR, "hexlib: start failed, VTCM rc %d", rc);
-        return AEE_EFAILED;
+        return HEXLIB_AEE_FROM_STATUS(rc);
     }
+    ctx->start_status = HEXLIB_DSP_OK;
     ctx->started = 1;
     FARF(HIGH, "hexlib: session %u started, VTCM %u bytes",
          sess_id, (uint32_t) ctx->vtcm_size);
