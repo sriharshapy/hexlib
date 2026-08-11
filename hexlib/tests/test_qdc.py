@@ -7,6 +7,11 @@ Polling either means either hanging forever or declaring success early. A job
 that ran zero tests once reported passing on this account, which is the failure
 mode all of this exists to make impossible.
 """
+import ast
+import collections
+import math
+import pathlib
+import re
 import zipfile
 
 import pytest
@@ -189,9 +194,264 @@ def test_the_api_key_is_read_from_the_environment_not_committed(monkeypatch):
         job._api_key()
 
 
-def test_no_credential_appears_anywhere_in_the_source():
-    import pathlib
-    for p in pathlib.Path("hexlib/device").rglob("*.py"):
-        src = p.read_text()
-        assert "qdc_api_key" not in src.lower() or "environ" in src or "home()" in src
-        assert "Bearer " not in src
+# --- the credential scan -------------------------------------------------
+#
+# WHAT THIS REPLACED, AND WHY IT HAD TO GO. This was:
+#
+#     assert "qdc_api_key" not in src.lower() or "environ" in src or "home()" in src
+#     assert "Bearer " not in src
+#
+# job.py contains `os.environ`, so the first disjunction was UNCONDITIONALLY
+# TRUE for the only file that could ever carry a credential: adding
+# `_FALLBACK_KEY = "<a realistic-looking key>"` to job.py left this file
+# reporting 1 passed. Proven by mutation, not inferred. This is the only test
+# guarding "no credential lands in the repository", and it could not fail.
+#
+# THE `Bearer ` ASSERTION IS GONE ON PURPOSE, NOT OVERLOOKED. It was a vacuous
+# negative -- nothing under hexlib/device has ever spelled it, so it could
+# only ever pass -- and the property it gestured at is already checked
+# behaviourally, with a real binding, by
+# test_client_honors_a_base_url_override_without_the_sdk_default above: that
+# test asserts `seen["headers"]["Authorization"] == "irrelevant-for-this-test"`,
+# i.e. the raw key with NO prefix, which is QDC's actual header scheme (a bare
+# Authorization value plus X-QCOM-TokenType: apikey -- see job.py's docstring).
+# An `assert "Bearer " not in src` cannot distinguish "we correctly don't use
+# OAuth-style prefixes" from "this file happens not to contain that word", and
+# keeping a second, weaker, source-text version of an assertion that is already
+# made behaviourally is how a suite accumulates tests that only look like
+# coverage.
+#
+# CREDENTIALS IN THIS PROJECT ARE PERSONAL AND LOCAL: read from QDC_API_KEY or
+# ~/.qdc_api_key, never committed, never in CI. Nothing below reads either one.
+
+DEVICE_DIR = pathlib.Path("hexlib/device")
+
+# Identifier fragments that mean "this name holds a credential". Matched against
+# the whole lowercased name AND against its underscore-separated words, so
+# `_FALLBACK_KEY`, `apiKey`, `SECRET_TOKEN` and `qdc_api_key` all hit.
+_CRED_WORDS = frozenset({
+    "key", "keys", "secret", "secrets", "token", "tokens", "password",
+    "passwd", "pwd", "credential", "credentials", "cred", "auth", "bearer",
+    "signature", "sig",
+})
+_CRED_FRAGMENTS = (
+    "apikey", "api_key", "access_key", "accesskey", "private_key",
+    "privatekey", "secret", "password", "passwd", "credential", "authtoken",
+    "auth_token", "token",
+)
+
+# Prefixes real credentials from real providers actually carry. Checked against
+# every string in every file under hexlib/device REGARDLESS of what it is
+# assigned to, since a key pasted into an innocuously-named variable (or a
+# non-Python file) is the same leak. Kept to unmistakable markers so this
+# cannot fire on a legitimate constant.
+_SECRET_PREFIXES = (
+    "sk-", "sk_live_", "sk_test_", "rk_live_", "ghp_", "gho_", "ghs_",
+    "github_pat_", "xoxb-", "xoxp-", "xoxa-", "AKIA", "ASIA", "AIza",
+    "ya29.", "eyJhbGciO",          # a JWT's own base64 header
+    "-----BEGIN",                   # any PEM private key block
+)
+
+_ENV_VAR_NAME = re.compile(r"\A[A-Z][A-Z0-9_]*\Z")
+
+
+def _shannon_entropy_bits_per_char(s):
+    counts = collections.Counter(s)
+    n = len(s)
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+
+def _why_this_looks_like_a_secret(value):
+    """Return a reason string if `value` has the SHAPE of a credential, else
+    None. Every exclusion below exists to keep a legitimate constant in this
+    project from tripping it -- the point is a scan that can fail on a real
+    key, not one that fails on a URL and gets deleted six weeks later.
+
+    Deliberately shape-based and value-blind: nothing here has, or needs, any
+    knowledge of what a real QDC key looks like."""
+    if len(value) < 16:
+        return None                      # QDC_API_KEY, apikey, X-QCOM-* etc.
+    if "://" in value or value.startswith(("http", "www.", "/", ".", "-I", "--")):
+        return None                      # URLs, paths, flags
+    if " " in value or "\n" in value or "\t" in value:
+        return None                      # prose: error messages, shell lines
+    if "/" in value or "\\" in value:
+        return None                      # /data/local/tmp/... and friends
+    if value.isdigit():
+        return None                      # TARGET_ID 3625030, timeouts, sizes
+    if _ENV_VAR_NAME.match(value):
+        return None                      # the NAME of an env var, e.g. QDC_API_KEY
+    if re.fullmatch(r"[A-Za-z0-9_.]*\.[A-Za-z0-9]{1,6}", value):
+        return None                      # filenames: results.xml, pytest.ini
+
+    classes = sum((
+        bool(re.search(r"[a-z]", value)),
+        bool(re.search(r"[A-Z]", value)),
+        bool(re.search(r"[0-9]", value)),
+    ))
+    if classes < 2:
+        return None                      # all-lowercase words, SCREAMING_CASE
+
+    bits = _shannon_entropy_bits_per_char(value)
+    if bits < 3.0:
+        return None
+    return f"{len(value)} chars, {bits:.2f} bits/char, {classes} character classes"
+
+
+def _credential_shaped(name):
+    low = name.lower().lstrip("_")
+    if any(f in low for f in _CRED_FRAGMENTS):
+        return True
+    return bool(_CRED_WORDS & set(w for w in low.split("_") if w))
+
+
+def _named_string_constants(tree):
+    """Yield (name, value, lineno) for every string literal in `tree` that is
+    bound to a NAME: an assignment target (`X = "..."`, `self.x = "..."`,
+    annotated or not), a keyword argument (`f(api_key="...")`), or a dict entry
+    with a literal string key (`{"Authorization": "..."}`). Those are the
+    places a credential actually gets written; using `ast` rather than text
+    matching means a comment or a docstring cannot trip it, and equally cannot
+    hide one."""
+    def target_names(node):
+        if isinstance(node, ast.Name):
+            yield node.id
+        elif isinstance(node, ast.Attribute):
+            yield node.attr
+        elif isinstance(node, (ast.Tuple, ast.List)):
+            for e in node.elts:
+                yield from target_names(e)
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                for t in targets:
+                    for name in target_names(t):
+                        yield name, node.value.value, node.value.lineno
+        elif isinstance(node, ast.Call):
+            for kw in node.keywords:
+                if (kw.arg and isinstance(kw.value, ast.Constant)
+                        and isinstance(kw.value.value, str)):
+                    yield kw.arg, kw.value.value, kw.value.lineno
+        elif isinstance(node, ast.Dict):
+            for k, v in zip(node.keys, node.values):
+                if (isinstance(k, ast.Constant) and isinstance(k.value, str)
+                        and isinstance(v, ast.Constant) and isinstance(v.value, str)):
+                    yield k.value, v.value, v.lineno
+
+
+def _scan_python_source(path, src):
+    """Credential-shaped NAME bound to a secret-shaped VALUE."""
+    findings = []
+    for name, value, lineno in _named_string_constants(ast.parse(src)):
+        if not _credential_shaped(name):
+            continue
+        why = _why_this_looks_like_a_secret(value)
+        if why:
+            findings.append(f"{path}:{lineno}: {name} = a {why} string literal")
+    return findings
+
+
+def _scan_raw_text(path, src):
+    """A provider's own credential prefix, anywhere, under any name -- covers
+    the case the AST scan cannot: a key assigned to a name nobody would flag,
+    or sitting in a non-Python file."""
+    findings = []
+    for lineno, line in enumerate(src.split("\n"), start=1):
+        for prefix in _SECRET_PREFIXES:
+            idx = line.find(prefix)
+            if idx != -1 and _why_this_looks_like_a_secret(line[idx:].strip().strip("'\"")):
+                findings.append(f"{path}:{lineno}: a literal beginning {prefix!r}")
+    return findings
+
+
+def _scan_device_tree():
+    """Every text file under hexlib/device, not just *.py: a credential in a
+    shell script, an .ini or a .json staged into the artifact is the same leak.
+    Skips __pycache__ and anything that is not decodable as UTF-8."""
+    findings = []
+    for p in sorted(DEVICE_DIR.rglob("*")):
+        if not p.is_file() or "__pycache__" in p.parts:
+            continue
+        try:
+            src = p.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        posix = p.as_posix()
+        if p.suffix == ".py":
+            findings += _scan_python_source(posix, src)
+        findings += _scan_raw_text(posix, src)
+    return findings
+
+
+def test_no_credential_appears_anywhere_in_the_device_source():
+    """THE ONLY test guarding "no credential lands in the repository". It has
+    to be able to fail; the version this replaced could not (see the comment
+    block above). Its companion below proves it can, by planting one."""
+    findings = _scan_device_tree()
+    assert not findings, (
+        "credential-shaped literal(s) found under hexlib/device -- QDC keys are "
+        "personal and are read only from QDC_API_KEY or ~/.qdc_api_key, never "
+        "committed:\n  " + "\n  ".join(findings)
+    )
+
+
+def test_the_credential_scan_can_actually_fail(tmp_path, monkeypatch):
+    """MUTATION-VERIFY, kept as a test rather than done once by hand -- same
+    pattern as test_coherency_lane_classification.py's own mutation check.
+    Plants the exact shape of the leak that defeated the previous assertion
+    (`_FALLBACK_KEY = "<key>"` in a file that also uses `os.environ`, which was
+    what made the old disjunction unconditionally true) and confirms the scan
+    reports it.
+
+    THE PLANTED VALUE IS SYNTHETIC AND OBVIOUSLY SO: a 32-char hex string whose
+    nibbles simply count down and then up (0f1e2d3c...). It is not a QDC key,
+    not any provider's key, and no real credential is read, constructed or
+    stored anywhere in this file. It exists only to have the right SHAPE --
+    length and entropy -- for the detector to bite on."""
+    synthetic = "0f1e2d3c4b5a6978" + "8796a5b4c3d2e1f0"
+    planted = tmp_path / "qdc" / "leak.py"
+    planted.parent.mkdir(parents=True)
+    planted.write_text(
+        "import os\n"
+        "def _api_key():\n"
+        "    return os.environ.get('QDC_API_KEY') or _FALLBACK_KEY\n"
+        f'_FALLBACK_KEY = "{synthetic}"\n'
+    )
+    monkeypatch.setattr("hexlib.tests.test_qdc.DEVICE_DIR", tmp_path)
+
+    findings = _scan_device_tree()
+    assert findings, (
+        "the credential scan did not notice a planted, credential-shaped "
+        "literal -- so a green result from it means nothing. This is exactly "
+        "the state the assertion it replaced was in."
+    )
+    assert any("_FALLBACK_KEY" in f for f in findings)
+
+    # And the clean tree really is clean for the right reason: remove the
+    # planted file and the same scan over the same directory goes quiet, so the
+    # assertion above is detecting THAT literal and not merely anything at all.
+    planted.unlink()
+    assert not _scan_device_tree()
+
+
+def test_the_credential_scan_does_not_fire_on_this_projects_real_constants():
+    """The other half of "can fail": a scan that flags legitimate constants
+    gets deleted. Pins the specific shapes hexlib/device really contains --
+    the NAME of an env var, QDC's header names, the numeric target id, a device
+    path -- so a future tightening of the heuristic that breaks them fails here
+    instead of in someone's unrelated PR."""
+    for name, value in (
+        ("_API_KEY_ENV", "QDC_API_KEY"),        # an env var's NAME, not a key
+        ("_KEY_FILE_NAME", ".qdc_api_key"),     # a filename, not a key
+        ("X-QCOM-TokenType", "apikey"),         # the token TYPE, not a token
+        ("TARGET_ID_KEY", "3625030"),           # a measured, public target id
+        ("KEY_PATH", "/data/local/tmp/hexlib"),
+        ("api_key_header", "QDC_BASE_URL"),
+    ):
+        assert _credential_shaped(name), f"{name} should be treated as sensitive"
+        assert _why_this_looks_like_a_secret(value) is None, (
+            f"{name} = {value!r} is a legitimate constant in this project and "
+            "must not be reported as a credential"
+        )

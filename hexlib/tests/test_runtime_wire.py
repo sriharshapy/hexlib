@@ -7,11 +7,16 @@ would work perfectly and fail instantly on silicon. So the serializer writing
 zeros there is asserted, not assumed: it is the field-level half of the guarantee
 whose behavioural half is Task 8's unmapped-fd test.
 """
+import pathlib
+import re
 import struct
 
 import pytest
 
 from hexlib.runtime import wire
+from hexlib.tests import csource
+
+DSP_H = pathlib.Path("hexlib/runtime/skel/hexlib_dsp.h")
 
 
 def test_magic_is_HXLB_little_endian():
@@ -127,13 +132,57 @@ def test_tensor_running_past_its_buffer_is_refused():
 def test_c_header_agrees_with_python_on_every_constant():
     """One source of truth, checked. A silent disagreement here is a wrong answer
     on the DSP, not a compile error."""
-    import pathlib
-    src = pathlib.Path("hexlib/runtime/skel/hexlib_dsp.h").read_text()
+    src = csource.code_only(DSP_H.read_text())
     assert "0x424C5848u" in src
     assert "#define HEXLIB_MAX_BUFS 8" in src
     assert "#define HEXLIB_MAX_SRC 6" in src
     assert "#define HEXLIB_MAX_DST 4" in src
     assert "#define HEXLIB_MAX_PARAMS 16" in src
     assert "HEXLIB_DSP_OK = 1" in src
+
+
+def test_every_status_name_is_bound_to_its_own_value_in_the_c_header():
+    """NAME BOUND TO VALUE, not "the number appears somewhere". This assertion
+    used to be `assert f"= {val}" in src` for each value, which never bound a
+    value to a name: every integer 1..14 appears in the enum no matter how they
+    are permuted, so swapping ERR_UNMAPPED = 7 and ERR_NO_MMAP_SLOT = 8 in
+    hexlib_dsp.h left this file reporting 14 passed. Proven by mutation, twice
+    (that swap, and a four-way permutation).
+
+    WHY THAT PERMUTATION IS NOT COSMETIC. 7 is the load-bearing unmapped-fd
+    discriminator -- the whole point of the staged gate is that a host address
+    crossing the wire is refused with ERR_UNMAPPED rather than silently working
+    under a shared address space. With the swap live, hexlib/exec/dsp.py:361-362
+    reports every genuine INVAL_PARAMS as ERR_UNMAPPED, and
+    device/qdc/test_on_device.py's hardcoded `status 7` assertion passes on the
+    wrong condition. The only other tests that would notice
+    (test_dsp_sim.py:79, test_runtime_sim_build.py:352) are both @sdk-gated, so
+    CI never runs them: this assertion is the only unconditional guard there is.
+
+    Scoped to the enum's own braces via csource, and comment-blanked, so a
+    number left behind in a comment cannot satisfy it either."""
+    src = csource.code_only(DSP_H.read_text())
+    enum_block = csource.block_from(src, src.index("enum hexlib_dsp_status"))
+
     for name, val in wire.STATUS.items():
-        assert f"= {val}" in src, f"status {name} missing from the C header"
+        assert re.search(rf"\bHEXLIB_DSP_{name}\s*=\s*{val}\b", enum_block), (
+            f"the C header does not bind HEXLIB_DSP_{name} to {val} "
+            f"(wire.py's STATUS says {val}). A permutation here is a wrong "
+            f"status NAME on the DSP, not a compile error:\n{enum_block}"
+        )
+
+    # And the other direction: a status added to the C enum but never taught to
+    # wire.py would make unpack_response() refuse a response the DSP considers
+    # legitimate ("status N is not a known status"). The loop above cannot see
+    # that, because it only iterates over what Python already knows.
+    in_header = {
+        m.group(1): int(m.group(2))
+        for m in re.finditer(r"\bHEXLIB_DSP_(\w+)\s*=\s*(\d+)", enum_block)
+    }
+    assert in_header == wire.STATUS, (
+        "the C enum and wire.py's STATUS are not the same mapping:\n"
+        f"  only in the C header: {sorted(set(in_header) - set(wire.STATUS))}\n"
+        f"  only in wire.py:      {sorted(set(wire.STATUS) - set(in_header))}\n"
+        f"  disagreeing values:   "
+        f"{ {k: (in_header[k], wire.STATUS[k]) for k in set(in_header) & set(wire.STATUS) if in_header[k] != wire.STATUS[k]} }"
+    )
