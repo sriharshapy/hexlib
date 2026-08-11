@@ -140,7 +140,8 @@ DDR ↔ VTCM        58,643,456 bytes
 Plan steps        308   (396 ops before fusion)
 ```
 
-`matmul_epilogue` alone accounts for 55.9 of those 58.6 MB, which is why it is next.
+`matmul_epilogue` alone accounts for 56.0 of those 58.6 MB — 95.5% of all the traffic —
+which is why it is next.
 
 **Numerical validation is at a different scale, and the distinction matters.** The plan
 figures above are at 256×256. The accuracy figures below are **not**: they are measured
@@ -213,8 +214,10 @@ docs/research/     audit records — what was read directly vs. inferred
 - [`docs/hvx/`](docs/hvx/README.md) — a guided tour of all 22 vendored headers: vector
   types and predicates, alignment, horizontal reductions, transcendentals from
   polynomial approximation, division by Newton–Raphson, and the reduce-then-broadcast
-  pattern nearly every transformer kernel is a variation on. **Each document ends with
-  what it could not explain** — about 15 open questions, listed deliberately.
+  pattern nearly every transformer kernel is a variation on. **They record what they
+  could not explain** rather than smoothing it over — the open questions are written
+  down deliberately. (No count is given here on purpose: a number in a doc goes stale,
+  and this one had.)
 - [`docs/hvx/upstream-findings.md`](docs/hvx/upstream-findings.md) — three real defects
   found in upstream llama.cpp while writing that tour, with evidence. hexlib calls none
   of them; the worst is a coefficient off by 234,118× inside an fp16 exponential.

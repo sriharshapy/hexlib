@@ -48,6 +48,41 @@ enum hexlib_dsp_status {
     HEXLIB_DSP_ERR_NOT_STARTED = 14,
 };
 
+/* The status as text, for the one place a human reads it: the host's error
+ * output. `switch` rather than a string array indexed by the value, so the
+ * compiler warns on a status added to the enum and not to this, and so an
+ * out-of-range value cannot index past the end.
+ *
+ * WHY THIS EXISTS AT ALL. `HEXLIB_AEE_FROM_STATUS` below tags a real DSP status
+ * into an AEEResult so that a VTCM-contention failure can be told apart from a
+ * signing failure or a missing skel -- and for a while nothing on the host
+ * decoded it. `HEXLIB_AEE_IS_STATUS`/`HEXLIB_AEE_STATUS` appeared only in this
+ * header and in a test probe, so the detail crossed the wire and every cause
+ * printed the same bare negative number, which is exactly the operator
+ * confusion the tag was added to remove. `session.c` decodes it now.
+ *
+ * The names match `hexlib.runtime.wire.STATUS` string for string, minus the
+ * `HEXLIB_DSP_` prefix, and a compiled test binds the two tables. */
+static inline const char *hexlib_dsp_status_name(int s) {
+    switch (s) {
+    case HEXLIB_DSP_OK:                 return "OK";
+    case HEXLIB_DSP_ERR_INTERNAL:       return "ERR_INTERNAL";
+    case HEXLIB_DSP_ERR_BAD_MAGIC:      return "ERR_BAD_MAGIC";
+    case HEXLIB_DSP_ERR_BAD_VERSION:    return "ERR_BAD_VERSION";
+    case HEXLIB_DSP_ERR_TRUNCATED:      return "ERR_TRUNCATED";
+    case HEXLIB_DSP_ERR_INVAL_PARAMS:   return "ERR_INVAL_PARAMS";
+    case HEXLIB_DSP_ERR_UNMAPPED:       return "ERR_UNMAPPED";
+    case HEXLIB_DSP_ERR_NO_MMAP_SLOT:   return "ERR_NO_MMAP_SLOT";
+    case HEXLIB_DSP_ERR_MMAP_FAILED:    return "ERR_MMAP_FAILED";
+    case HEXLIB_DSP_ERR_NO_KERNEL:      return "ERR_NO_KERNEL";
+    case HEXLIB_DSP_ERR_VTCM_TOO_SMALL: return "ERR_VTCM_TOO_SMALL";
+    case HEXLIB_DSP_ERR_VTCM_RECLAIMED: return "ERR_VTCM_RECLAIMED";
+    case HEXLIB_DSP_ERR_REQUIRES:       return "ERR_REQUIRES";
+    case HEXLIB_DSP_ERR_NOT_STARTED:    return "ERR_NOT_STARTED";
+    default:                            return "UNKNOWN";
+    }
+}
+
 /* CARRY A STATUS OUT THROUGH AN AEEResult, for the one call that has no response
  * buffer to put it in. `invoke` returns its status inside the response blob, but
  * `start` fails before any blob exists, so a bare AEE_EFAILED there flattened

@@ -664,3 +664,72 @@ def test_the_layout_enum_has_the_same_values_in_c_as_on_the_wire(tmp_path):
         "hexlib_tensor.layout; a mismatch is a correctly-shaped wrong answer, "
         "not a compile error."
     )
+
+
+# ---------------------------------------------------------------------------
+# The status names, on both sides at once
+# ---------------------------------------------------------------------------
+
+
+@needs_cc
+def test_the_status_names_agree_between_c_and_the_wire_table(tmp_path):
+    """`hexlib_dsp_status_name` vs `wire.STATUS`, COMPILED.
+
+    The host prints this string when the DSP tags a real status into an
+    AEEResult (`session.c`, via `HEXLIB_AEE_IS_STATUS`). Before that decode
+    existed, every cause of a failed `start()` printed the same bare negative
+    number -- a VTCM contention failure looked exactly like a signing failure or
+    a missing skel, which is the operator confusion the tag was added to remove.
+    A wrong NAME here is a different flavour of the same problem: it sends
+    someone to debug the wrong subsystem.
+
+    Compiled rather than grepped, for the reason this whole file exists: a source
+    assertion over `case` labels is satisfiable by a comment, and twice was by a
+    string literal. This drives the real function with every value in
+    `wire.STATUS` and compares what it actually returns.
+
+    Both directions are checked. Every wire status must have a name (a status
+    added to the Python table and not the switch), and the switch must not
+    invent one for a value the table does not have -- the `default` returns
+    "UNKNOWN", so an out-of-range value is reported as unknown rather than
+    silently reading a neighbouring string.
+    """
+    names = sorted(wire.STATUS.items(), key=lambda kv: kv[1])
+    lines = ['#include <stdio.h>', '#include "hexlib_dsp.h"', "int main(void) {"]
+    for _, value in names:
+        lines.append(f'    printf("%d %s' + r'\n' + f'", {value}, '
+                     f"hexlib_dsp_status_name({value}));")
+    # And one value deliberately outside the enum.
+    lines.append('    printf("%d %s' + r'\n' + '", 999, hexlib_dsp_status_name(999));')
+    lines += ["    return 0;", "}", ""]
+
+    c_path = tmp_path / "status_probe.c"
+    c_path.write_text("\n".join(lines))
+    exe = tmp_path / ("sp.exe" if sys.platform == "win32" else "sp")
+    cc = subprocess.run(
+        [HOST_CC, "-o", str(exe), str(c_path), "-I", str(DSP_H.parent.resolve())],
+        capture_output=True, text=True,
+    )
+    assert cc.returncode == 0, (
+        "the status-name probe did not compile -- hexlib_dsp.h itself may not, "
+        f"which is a finding and not a reason to skip:\n{cc.stdout}\n{cc.stderr}"
+    )
+    run = subprocess.run([str(exe)], capture_output=True, text=True)
+    assert run.returncode == 0, f"status probe exited {run.returncode}"
+
+    got = {}
+    for line in run.stdout.split("\n"):
+        parts = line.split()
+        if len(parts) == 2:
+            got[int(parts[0])] = parts[1]
+
+    for name, value in names:
+        assert got.get(value) == name, (
+            f"wire.STATUS says {value} is {name!r} but hexlib_dsp_status_name "
+            f"returns {got.get(value)!r}. The host prints this string to tell an "
+            f"operator which subsystem failed."
+        )
+    assert got.get(999) == "UNKNOWN", (
+        f"a status outside the enum returned {got.get(999)!r}; it must be "
+        f"reported as unknown rather than resolving to some other name"
+    )

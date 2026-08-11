@@ -178,7 +178,25 @@ int hexlib_open(hexlib_ctx **out, int domain) {
     rc = hexlib_iface_start(ctx->handle, /* sess_id */ 0, /* n_hvx */ 0,
                             /* n_hmx */ 0, /* max_vmem: unbounded for now */ 0);
     if (rc != AEE_SUCCESS) {
-        fprintf(stderr, "hexlib: hexlib_iface_start failed (rc %d)\n", rc);
+        /* DECODED, NOT PRINTED RAW. `skel.c:58-72` tags a real DSP status into
+         * the AEE return with HEXLIB_AEE_FROM_STATUS precisely so a VTCM
+         * contention failure can be told apart from a signing failure or a
+         * missing skel -- and until now NOTHING ON THE HOST READ IT. The macros
+         * appeared only in the header and in a test probe, so the detail was on
+         * the wire and every cause printed the same bare negative number, which
+         * is the operator confusion the tag exists to remove. */
+        if (HEXLIB_AEE_IS_STATUS(rc)) {
+            fprintf(stderr,
+                    "hexlib: hexlib_iface_start failed (rc %d) -- the DSP "
+                    "reported status %d: %s\n",
+                    rc, HEXLIB_AEE_STATUS(rc),
+                    hexlib_dsp_status_name(HEXLIB_AEE_STATUS(rc)));
+        } else {
+            fprintf(stderr,
+                    "hexlib: hexlib_iface_start failed (rc %d) -- no DSP status "
+                    "tag, so this came from qaic or the RPC layer, not from the "
+                    "skel's own code\n", rc);
+        }
         hexlib_iface_close(ctx->handle);
         free(ctx);
         return -1;
