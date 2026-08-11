@@ -17,20 +17,49 @@ KIND IDS ARE EXPLICIT AND ORDERED. They cross the wire, so they must not depend
 on dict iteration order: a silent renumber sends every op to the wrong kernel.
 Appending is safe; reordering is not.
 
-WHAT `requires` CAN AND CANNOT VERIFY HERE. `hexlib_args` (see
-`hexlib/runtime/skel/hexlib_dsp.h`) carries `dtype[HEXLIB_MAX_BUFS]` per buffer,
-filled from the same `DTYPE_ID` table `hexlib/runtime/wire.py` uses to serialize
-a tensor's dtype -- so a `("dtype", ...)` requirement is a real, reachable check
-against that field. It carries no field at all for a permutation, a shape, or any
-other host-side attribute, so a `("perm", ...)` requirement (or anything else not
-representable in `ne`/`dtype`/`layout`) CANNOT be checked here: today it is
-enforced only on the host, in `RunnerSpec.check_requires`, before the op is ever
-put on the wire. Writing an `if` here that always passes would be a check that
-protects nothing, so none is emitted for those keys -- only a comment saying so.
+`KIND_ID` BELOW IS THE ONE SOURCE OF TRUTH FOR THOSE IDS, AND THE COPIES ARE
+TEST-BOUND. It is hand-maintained (nothing derives it from the op registry,
+whatever an earlier draft of the design spec claimed), and there are two other
+places the same numbers appear: the generated DSP dispatch table, which
+`emit_table` below writes straight from this dict, and one `#define
+HEXLIB_KIND_SCALE 9u` in `hexlib/runtime/host/main.c`, which is a hand-copy
+because the host binary has no generated header to read. Three tests hold that
+together, because a wrong id is not a compile error and not a crash:
+`test_host_source.py::test_the_hosts_scale_kind_id_is_the_same_number_the_dsp_
+dispatches_on` binds main.c's `#define` to this dict (mutating either fails),
+`test_runtime_genentry.py::test_the_shipped_kind_ids_never_move` freezes the 11
+shipped values against a renumber, and
+`::test_every_kind_a_COMPILED_PLAN_can_contain_has_a_wire_id` checks the table
+covers every kind a plan can actually contain (the registry's 13 minus
+`fuse.FUSABLE_ACTS`, which fusion absorbs into `matmul_epilogue`).
+
+DTYPES ARE CHECKED PER BUFFER, ALWAYS -- NOT ONLY WHEN `requires` MENTIONS THEM.
+`hexlib_args` carries `dtype[HEXLIB_MAX_BUFS]`, filled from the same `DTYPE_ID`
+table `hexlib/runtime/wire.py` serializes with, and each buffer is about to be
+cast to the C type this spec DECLARES for it. So each cast is guarded by the
+matching check: a batch declaring a `scale` input as fp32 would otherwise be read
+through `const hexlib_hf *` at half stride -- half the tensor, HEXLIB_DSP_OK, a
+plausible wrong answer. That hazard is named in `emit_entry`'s own docstring and
+was previously guarded on this side only for whichever single buffer a `requires`
+entry happened to mention.
+
+WHAT `requires` CAN AND CANNOT VERIFY HERE. A `("dtype", ...)` requirement lands
+on the per-buffer check just described -- and, because the only serializer there
+is (`hexlib/exec/dsp.py`) fills that field from `spec.out_dtype`, the check
+compares the spec with itself on that path and passes by construction. It is
+genuinely reachable from a hand-built batch (main.c, `run_raw`, a future
+planner), which is why it is emitted; what it CANNOT do is police the attr a
+caller asked for. That is `RunnerSpec.check_requires`'s job, on the host, and
+both transports now call it. `hexlib_args` carries no field at all for a
+permutation, a shape, or any other op-level attribute, so a `("perm", ...)`
+requirement cannot be checked here in any form: writing an `if` that always
+passes would be a check that protects nothing, so none is emitted -- only a
+comment saying so.
 """
 from __future__ import annotations
 
 import os
+from typing import Sequence
 
 from hexlib.exec.runner import RunnerSpec, Scalar
 from hexlib.runtime.wire import DTYPE_ID
@@ -50,9 +79,11 @@ KIND_ID: dict[str, int] = {
 }
 
 # hexlib_args C types. Keyed by the same wire-dtype strings as
-# `hexlib.exec.runner.WIRE_DTYPE` ("int32", not "i32" -- a mismatch here would
-# KeyError the first time a kernel declares an int32 input or output, silently
-# never today because no current spec uses it).
+# `hexlib.exec.runner.WIRE_DTYPE` AND `hexlib.runtime.wire.DTYPE_ID` -- all
+# three spell int32 "int32". `DTYPE_ID` spelled it "i32" until this was fixed,
+# which meant a spec declaring an int32 input was accepted by `RunnerSpec`,
+# refused by `pack_batch` as an unknown dtype, and a KeyError here at generate
+# time. test_runtime_wire.py binds the three key sets so they cannot drift again.
 _CTYPE = {"fp16": "hexlib_hf", "fp32": "float", "int32": "int"}
 
 # C types for values packed into the `a->params` blob, matching
@@ -64,6 +95,18 @@ _PARAM_CTYPE = {"int": "int", "float": "float"}
 
 class GenError(Exception):
     pass
+
+
+def _comment(text: str) -> str:
+    """One block comment, wrapped, at the entry body's indent. Generated code is
+    still read by people -- a 400-column comment line is not."""
+    import textwrap
+
+    lines = textwrap.wrap(" ".join(text.split()), width=72)
+    if len(lines) == 1:
+        return f"    /* {lines[0]} */"
+    body = "\n".join(f"     * {ln}" for ln in lines[1:])
+    return f"    /* {lines[0]}\n{body} */"
 
 
 def _scalar_expr(sc: Scalar, spec: RunnerSpec, param_index: int) -> str:
@@ -82,24 +125,69 @@ def _scalar_expr(sc: Scalar, spec: RunnerSpec, param_index: int) -> str:
     raise GenError(f"unknown scalar source {src!r} in spec for {spec.kind}")
 
 
-def _requires_check(key: str, want, out_idx: int) -> str:
+def _dtype_check(idx: int, dtype: str, role: str) -> str:
+    """The guard for ONE buffer, emitted for every buffer the entry casts.
+
+    `a->dtype[idx]` is filled by `skel_dispatch.c` from the tensor's own dtype
+    field, which the host serialized through the same `DTYPE_ID` table imported
+    here -- so this compares the dtype the BATCH declared with the dtype this
+    entry is about to cast the pointer to. Without it, a batch declaring an
+    fp32 buffer where the kernel wants fp16 is read (or written) at half
+    stride, over half the tensor, and returns HEXLIB_DSP_OK.
+    """
+    return (
+        _comment(
+            f"{role} buf[{idx}] is cast to {_CTYPE[dtype]} *, so the batch must "
+            f"have declared it {dtype} ({DTYPE_ID[dtype]} in "
+            f"hexlib.runtime.wire.DTYPE_ID). Casting a wider or narrower dtype "
+            f"would silently halve or double every stride."
+        )
+        + f"\n    if (a->dtype[{idx}] != {DTYPE_ID[dtype]}u) "
+        f"return HEXLIB_DSP_ERR_REQUIRES;"
+    )
+
+
+def _requires_check(key: str, want, spec: RunnerSpec, out_idx: int) -> str:
     """One `requires` clause as C, or an honest comment if it cannot be one.
 
     Only `("dtype", <wire-dtype>)` maps onto a field `hexlib_args` actually
-    carries: `a->dtype[out_idx]`, filled from the same `DTYPE_ID` table the
-    host used to serialize the tensor. Everything else (`perm`, and anything
-    not representable in `ne`/`dtype`/`layout`) has no wire representation at
-    all, so it is documented as unverified rather than given a check that
-    cannot fail.
+    carries, and it is already covered: `_dtype_check` emits a guard for EVERY
+    buffer from the spec's own declared dtypes, so the clause for `out_idx` is
+    the same condition this would emit. Rather than emit it twice, this points
+    at it.
+
+    WHICH BUFFER A REQUIREMENT IS ABOUT CANNOT BE SAID. This used to assume
+    `out_idx` for every key -- correct for `cast`, whose requirement is about
+    its output, and silently wrong for any future dtype requirement about an
+    INPUT, which would have inspected the output's dtype instead. `requires`
+    has no place to name a buffer, so the ambiguous case is refused at generate
+    time instead of guessed at: a dtype requirement that is not the spec's own
+    declared output dtype is either about an input (unexpressible) or a
+    contradiction (it would refuse every batch the host serializer can build,
+    since that stamps the output's dtype from `spec.out_dtype`).
+
+    Everything else (`perm`, and anything not representable in
+    `ne`/`dtype`/`layout`) has no wire representation at all, so it is
+    documented as unverified rather than given a check that cannot fail.
     """
     if key == "dtype":
-        want_id = DTYPE_ID[want]
-        return (
-            f"    /* requires {key} == {want!r}: checked -- a->dtype[{out_idx}] "
-            f"mirrors hexlib.runtime.wire.DTYPE_ID, filled in by the host per "
-            f"buffer. */\n"
-            f"    if (a->dtype[{out_idx}] != {want_id}u) "
-            f"return HEXLIB_DSP_ERR_REQUIRES;"
+        if want != spec.out_dtype:
+            raise GenError(
+                f"{spec.kind}: requires ('dtype', {want!r}) but the spec's "
+                f"out_dtype is {spec.out_dtype!r}. `requires` cannot say WHICH "
+                f"buffer a dtype requirement is about, and assuming the output "
+                f"would emit a check that either inspects the wrong buffer or "
+                f"refuses every batch the host can build. Declare the dtype on "
+                f"the buffer itself (inputs=/out_dtype=) instead."
+            )
+        return _comment(
+            f"requires {key} == {want!r}: checked above, by the "
+            f"a->dtype[{out_idx}] guard emitted for this kernel's declared "
+            f"output dtype -- the same condition, from the same DTYPE_ID table. "
+            f"NOTE it cannot fail through hexlib/exec/dsp.py, which fills that "
+            f"field from spec.out_dtype: only a hand-built batch can violate it. "
+            f"The CALLER'S attr is policed on the host, in "
+            f"RunnerSpec.check_requires."
         )
     # HONEST GAP: hexlib_args has no field for this key. buf/ne/dtype/layout are
     # all per-buffer tensor properties; `perm` (and anything else outside that
@@ -148,11 +236,19 @@ def emit_entry(name: str, spec: RunnerSpec) -> str:
     for i in range(n_buf):
         checks.append(f"    if (!a->buf[{i}]) return HEXLIB_DSP_ERR_INVAL_PARAMS;")
 
+    # EVERY buffer's declared dtype, not just whichever one `requires` mentions
+    # -- see `_dtype_check` and the module docstring. After the count and null
+    # checks, because `a->dtype[i]` means nothing for a buffer the batch did not
+    # supply.
+    for i, in_dtype in enumerate(spec.inputs):
+        checks.append(_dtype_check(i, in_dtype, "input"))
+    checks.append(_dtype_check(out_idx, spec.out_dtype, "output"))
+
     # `requires` is enforced HERE as well as on the host where it is genuinely
     # checkable -- see `_requires_check` for exactly which keys that is, and the
     # module docstring for why the rest are documented rather than faked.
     for key, want in spec.requires:
-        checks.append(_requires_check(key, want, out_idx))
+        checks.append(_requires_check(key, want, spec, out_idx))
 
     body = ",\n                ".join(args)
     return f'''/* GENERATED by hexlib/runtime/genentry.py -- do not edit.
@@ -196,15 +292,34 @@ const uint32_t hexlib_kernel_table_len =
 '''
 
 
-def generate(repo_root: str, out_dir: str) -> list[str]:
+def generate(repo_root: str, out_dir: str,
+             expect: Sequence[str] | None = None) -> list[str]:
     """Emit entries for every kernel that does not hand-write its own.
 
     `spec.kernel_dir` is already repo-relative ("kernels/scale_fp16"), so it is
     joined to the REPO root, not to a kernels root -- joining it to `.../kernels`
     would produce `kernels/kernels/scale_fp16` and silently find nothing, which
     would emit an empty dispatch table rather than an error.
+
+    `expect` is the set of op kinds whose kernel directory MUST be present,
+    defaulting to every kind with a `RunnerSpec`. A tree missing any of them is
+    an incomplete checkout, not a smaller build -- see the partial-table comment
+    below. Pass a narrower tuple only from a caller that genuinely holds a
+    subset and says so (the unit tests in test_runtime_genentry.py, which build
+    one-kernel trees in tmp dirs).
     """
     from hexlib.exec.runner import SPECS
+
+    if expect is None:
+        expect = tuple(SPECS)
+    else:
+        unknown = sorted(set(expect) - set(SPECS))
+        if unknown:
+            raise GenError(
+                f"expect names {unknown}, which has no RunnerSpec; `expect` "
+                f"narrows a claim about what is on disk, it cannot invent a "
+                f"kernel. Known kinds: {sorted(SPECS)}"
+            )
 
     os.makedirs(out_dir, exist_ok=True)
     written: list[str] = []
@@ -214,13 +329,6 @@ def generate(repo_root: str, out_dir: str) -> list[str]:
         if not os.path.isdir(kdir):
             continue
         used[name] = spec
-        fn = os.path.basename(spec.kernel_dir)
-        if os.path.isfile(os.path.join(kdir, "dsp_entry.c")):
-            continue  # hand-written wins
-        path = os.path.join(out_dir, f"{fn}_entry.c")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(emit_entry(name, spec))
-        written.append(path)
 
     # AN EMPTY TABLE IS AN ERROR, NOT AN EMPTY SUCCESS. It would link cleanly and
     # then answer every op with ERR_NO_KERNEL at run time, which reads as "the
@@ -233,6 +341,31 @@ def generate(repo_root: str, out_dir: str) -> list[str]:
             f"{sorted(SPECS)} — kernel_dir is repo-relative "
             f"('kernels/scale_fp16'), so pass the REPO root"
         )
+
+    # AND A PARTIAL TABLE IS THE SAME BUG ONE STEP DOWN. Finding SOME kernels
+    # used to be enough: the table came out missing those rows, no error was
+    # raised, and the affected ops answered ERR_NO_KERNEL at run time -- which
+    # reads as a broken kernel rather than an incomplete tree. Checked BEFORE
+    # anything is written, so a refused run leaves no half-generated table for a
+    # build to pick up.
+    missing = sorted(set(expect) - set(used))
+    if missing:
+        raise GenError(
+            f"kernel directory missing under {repo_root!r} for {missing} "
+            f"(expected {sorted(expect)}, found {sorted(used)}). Generating "
+            f"anyway would emit a dispatch table without those rows, which "
+            f"links cleanly and then answers ERR_NO_KERNEL at run time."
+        )
+
+    for name, spec in used.items():
+        kdir = os.path.join(repo_root, spec.kernel_dir)
+        fn = os.path.basename(spec.kernel_dir)
+        if os.path.isfile(os.path.join(kdir, "dsp_entry.c")):
+            continue  # hand-written wins
+        path = os.path.join(out_dir, f"{fn}_entry.c")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(emit_entry(name, spec))
+        written.append(path)
 
     path = os.path.join(out_dir, "hexlib_kernel_table.c")
     with open(path, "w", encoding="utf-8") as f:

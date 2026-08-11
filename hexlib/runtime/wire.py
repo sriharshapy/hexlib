@@ -48,7 +48,16 @@ STATUS = {
 }
 STATUS_NAME = {v: k for k, v in STATUS.items()}
 
-DTYPE_ID = {"fp32": 0, "fp16": 1, "q4_0": 2, "i32": 3}
+# Keyed by the SAME strings as `hexlib.exec.runner.WIRE_DTYPE` and
+# `hexlib.runtime.genentry._CTYPE` -- "int32", not "i32". The ids are the ABI
+# (they are what `hexlib_tensor.dtype` carries); the keys are host-side names,
+# so this spelling fix changed no byte on the wire. It was a live break, not a
+# tidy-up: the first spec declaring an int32 input would have been refused by
+# `pack_batch` as an unknown dtype AND have KeyError'd genentry's `requires`
+# codegen, while `RunnerSpec` accepted it happily.
+# `test_runtime_wire.py::test_the_dtype_table_uses_the_same_SPELLING_as_the_
+# runner_and_the_generator` binds the three tables so they cannot drift again.
+DTYPE_ID = {"fp32": 0, "fp16": 1, "q4_0": 2, "int32": 3}
 LAYOUT_ID = {"row_major": 0, "tiled_32x32": 1, "q4_0_repacked": 2}
 
 _HDR = "<10I"
@@ -153,6 +162,19 @@ def pack_batch(bufs, tensors, ops) -> bytes:
             raise WireError(f"op {i} has {len(op.params)} params, max {MAX_PARAMS}")
         if len(op.src) > MAX_SRC or len(op.dst) > MAX_DST:
             raise WireError(f"op {i} exceeds MAX_SRC/MAX_DST")
+        # THE SUM, WHICH THE TWO CHECKS ABOVE DO NOT COVER. MAX_SRC + MAX_DST is
+        # 10 and MAX_BUFS is 8: the DSP walks src then dst into ONE `a->buf[]`
+        # array (`skel_dispatch.c`) and abandons the op at
+        # `nb >= HEXLIB_MAX_BUFS`, which surfaces as a bare batch status
+        # INVAL_PARAMS with no way to tell it from any other cause. Named here
+        # with the actual counts instead.
+        if len(op.src) + len(op.dst) > MAX_BUFS:
+            raise WireError(
+                f"op {i} names {len(op.src)} sources + {len(op.dst)} "
+                f"destinations = {len(op.src) + len(op.dst)} buffers, but "
+                f"hexlib_args.buf[] holds HEXLIB_MAX_BUFS ({MAX_BUFS}); the DSP "
+                f"would abandon the op and report only INVAL_PARAMS"
+            )
         for j in tuple(op.src) + tuple(op.dst):
             if not 0 <= j < len(tensors):
                 raise WireError(f"op {i} names tensor {j}, out of range")

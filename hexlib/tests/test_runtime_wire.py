@@ -109,6 +109,69 @@ def test_too_many_buffers_is_refused_before_the_dsp_sees_it():
         )
 
 
+def test_an_op_naming_more_buffers_than_the_dsp_can_hold_is_refused():
+    """MAX_SRC + MAX_DST is 10, and HEXLIB_MAX_BUFS is 8. The two limits were
+    checked separately and their SUM never was, so a 6-source/3-destination
+    fused op -- a shape `matmul_epilogue` is one input short of already -- packed
+    cleanly here and came back from the DSP as a bare batch status 6
+    (INVAL_PARAMS: `skel_dispatch.c` stops filling `a->buf[]` at
+    `nb >= HEXLIB_MAX_BUFS`), indistinguishable from a dozen other causes. This
+    module's whole reason for existing is that a refusal belongs where it can
+    name the numbers rather than where it can only answer with one."""
+    bufs = [wire.BufDesc(fd=0, size=4096)]
+    tensors = [
+        wire.TensorDesc(bi=0, offset=64 * i, nbytes=64, dtype="fp16",
+                        layout="row_major", ne=(32, 1, 1, 1))
+        for i in range(9)
+    ]
+    with pytest.raises(wire.WireError, match=r"6 sources \+ 3 destinations"):
+        wire.pack_batch(
+            bufs=bufs, tensors=tensors,
+            ops=[wire.OpDesc(kind=1, src=(0, 1, 2, 3, 4, 5), dst=(6, 7, 8))],
+        )
+    # 6 + 2 is exactly HEXLIB_MAX_BUFS: the boundary is allowed, so the check
+    # cannot be an off-by-one that refuses a legal fused op.
+    wire.pack_batch(
+        bufs=bufs, tensors=tensors,
+        ops=[wire.OpDesc(kind=1, src=(0, 1, 2, 3, 4, 5), dst=(6, 7))],
+    )
+
+
+def test_the_dtype_table_uses_the_same_SPELLING_as_the_runner_and_the_generator():
+    """THREE TABLES, ONE SET OF KEYS. `wire.DTYPE_ID` names the ids that cross
+    the wire; `runner.WIRE_DTYPE` names the numpy form of the same dtype;
+    `genentry._CTYPE` names its C form. genentry.py's own comment claims they
+    are keyed alike -- they were not: `DTYPE_ID` spelled int32 as "i32".
+
+    The first `RunnerSpec` declaring an int32 input would then fail twice, in
+    two different places, for the same reason: `pack_batch` raising "unknown
+    dtype 'int32'" and `_requires_check` raising KeyError at generate time.
+    Loud, but it means the wire cannot carry a tensor `RunnerSpec` accepts --
+    and `rope_2d` and `patchify`, both about to be written, are the kernels that
+    would hit it.
+
+    q4_0 is the one deliberate asymmetry, asserted rather than tolerated: it has
+    a wire id because a block-quantized weight is a real tensor on the DSP, and
+    no numpy/C scalar form because it is staged as raw bytes.
+    """
+    from hexlib.exec.runner import WIRE_DTYPE
+    from hexlib.runtime.genentry import _CTYPE
+
+    assert set(WIRE_DTYPE) <= set(wire.DTYPE_ID), (
+        f"{sorted(set(WIRE_DTYPE) - set(wire.DTYPE_ID))} can be declared by a "
+        "RunnerSpec but cannot be serialized"
+    )
+    assert set(_CTYPE) <= set(wire.DTYPE_ID), (
+        f"{sorted(set(_CTYPE) - set(wire.DTYPE_ID))} has a C type in the "
+        "generated entry but no wire id"
+    )
+    assert set(WIRE_DTYPE) == set(_CTYPE), (
+        "every dtype a spec can declare needs a C type in the generated entry, "
+        "and vice versa"
+    )
+    assert set(wire.DTYPE_ID) - set(WIRE_DTYPE) == {"q4_0"}
+
+
 def test_tensor_naming_a_nonexistent_buffer_is_refused():
     with pytest.raises(wire.WireError, match="buffer index"):
         wire.pack_batch(

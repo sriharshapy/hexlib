@@ -488,6 +488,39 @@ def test_usage_mentions_the_new_self_test_modifiers(main):
     assert "--coherency-check" in body
 
 
+def test_the_hosts_scale_kind_id_is_the_same_number_the_dsp_dispatches_on(main):
+    """THE ONE HAND-COPIED KIND ID, BOUND TO ITS SOURCE OF TRUTH.
+
+    `genentry.KIND_ID` is where kind ids live; `genentry.emit_table` writes the
+    DSP's dispatch table straight from it. This host binary has no generated
+    header to read, so `#define HEXLIB_KIND_SCALE 9u` is a hand-copy, pinned by
+    a comment and -- until now -- by nothing executable. Mutating it to `10u`
+    left the entire offline suite green.
+
+    A WRONG VALUE HERE IS NOT ALWAYS LOUD. main.c's own comment argues it is
+    (`hexlib_dispatch_batch` would answer ERR_NO_KERNEL, which --self-test
+    reports as a failure), and that is true only while the number it drifts to
+    is unregistered. 10 is `softmax` and 11 is `transpose`: as soon as either
+    has a kernel, a `scale` request dispatches to it, the buffer count matches,
+    both pointers are non-null, and the status is HEXLIB_DSP_OK. The wire
+    carries no table version and `skel_dispatch.c` matches on the id alone, so
+    nothing else in the system can notice.
+
+    Read off the COMMENT-BLANKED source, so the "== 9" in the explanatory
+    comment above the `#define` cannot satisfy this. Mutating either side --
+    the `#define` or the Python dict -- fails it.
+    """
+    from hexlib.runtime.genentry import KIND_ID
+
+    m = re.search(r"#define\s+HEXLIB_KIND_SCALE\s+(\d+)u\b", main)
+    assert m, "main.c no longer defines HEXLIB_KIND_SCALE as a decimal literal"
+    assert int(m.group(1)) == KIND_ID["scale"], (
+        f"main.c dispatches scale as kind {m.group(1)}; genentry.KIND_ID says "
+        f"{KIND_ID['scale']}. One of the two copies drifted, and the DSP obeys "
+        f"the id it is sent."
+    )
+
+
 def test_build_scale_batch_factor_is_call_site_specific(main):
     """run_self_test must build its batch with SELF_TEST_FACTOR (0.125f, a
     power of two, exact in fp16) and run_coherency_check must use

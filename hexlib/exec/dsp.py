@@ -291,7 +291,31 @@ class DspSimBackend:
         self.so_path = rb.build_sim_so(work_dir, sdk_root=self.sdk_root)
         rb.write_qurt_sim_configs(work_dir, sdk_root=self.sdk_root)
 
+    def _clear_outputs(self) -> None:
+        """Delete the previous call's artifacts before this one runs.
+
+        Mirrors `hexlib/exec/hexagon.py`'s own removal of `hexlib_out.bin` and
+        its reason: A STALE OUTPUT WOULD BE READ AS THIS CALL'S RESULT if the
+        run failed to write one. `simhost.c` writes `hexlib_out.bin` only when
+        the batch status is OK and `hexlib_rsp.bin` only once the invoke
+        returned, so a launch that prints its `SIMHOST invoke ... status=1`
+        line and then dies (or a `hexagon-sim` that never gets that far at all)
+        leaves whatever the LAST call wrote sitting in the work directory, at
+        the same names and -- for a same-shaped op -- at the same offsets.
+        Deleting them here rather than merely not trusting them is deliberate:
+        it means any future code path that reads these files inherits the
+        guarantee instead of having to re-derive it.
+
+        Every call shape goes through `_write_call`, so this runs for `run`,
+        `run_unmapped`, `run_raw` and `hwinfo` alike.
+        """
+        for name in (OUT_NAME, RSP_NAME):
+            path = os.path.join(self.work_dir, name)
+            if os.path.exists(path):
+                os.remove(path)
+
     def _write_call(self, blob: bytes, payload: bytes) -> None:
+        self._clear_outputs()
         with open(os.path.join(self.work_dir, BATCH_NAME), "wb") as f:
             f.write(blob)
         with open(os.path.join(self.work_dir, IN_NAME), "wb") as f:
@@ -315,8 +339,39 @@ class DspSimBackend:
         start 128-byte aligned (see the module docstring's "ALIGNMENT"), a
         single op naming them by index, and reads the result back out of
         `hexlib_out.bin` at the output tensor's own offset.
+
+        WHAT IS REFUSED HERE, AND WHY IT CANNOT BE REFUSED ANYWHERE ELSE. See
+        `spec.check_requires` below: an op kind is not always one kernel, and
+        the DSP has no field to check the difference against. Everything this
+        method refuses has the same failure mode if it is not refused -- a
+        correctly-shaped, OK-status wrong answer -- which is why each check is
+        an error and never a fallback.
         """
         spec = SPECS[kind]
+
+        # AN OP KIND IS NOT ALWAYS ONE KERNEL, and the check has to be here.
+        # `hexlib/exec/hexagon.py` has always done this, for the reason its own
+        # comment gives: the failure mode otherwise is a correctly-shaped wrong
+        # answer. This path skipped it, and the DSP cannot make up the
+        # difference -- `hexlib_args` carries no field for a perm at all (see
+        # genentry.py's `_requires_check`), and for the one key it DOES carry,
+        # `dtype`, the generated check compares a value THIS serializer derived
+        # from `spec.out_dtype` against the same spec's own requirement, so it
+        # passes by construction whatever the caller asked for. Only a check
+        # against the CALLER'S OWN attrs can fail, and this is it.
+        spec.check_requires(attrs)
+
+        # `zip` stops at the shorter sequence, so an op mis-wired with an extra
+        # input array silently dropped it: `add` with three inputs computed
+        # a+b, ignored c, and returned the right shape with no error.
+        # `RunnerSpec.payload` raises on the other transport for exactly this.
+        if len(arrays) != len(spec.inputs):
+            raise DspSimError(
+                f"{kind} takes {len(spec.inputs)} inputs, got {len(arrays)}; "
+                "an extra array would be dropped and a missing one would leave "
+                "the op naming a tensor that was never packed"
+            )
+
         arrays = tuple(
             np.ascontiguousarray(a, dtype=WIRE_DTYPE[dt])
             for a, dt in zip(arrays, spec.inputs)
@@ -342,6 +397,12 @@ class DspSimBackend:
                 offset = aligned
 
         out_offset = offset
+        # The output tensor's dtype describes the BYTES this buffer will hold,
+        # so it comes from the spec, not from any attr -- the buffer was sized
+        # from the same place two lines up. That is precisely why a
+        # `("dtype", ...)` requirement cannot be validated on the DSP through
+        # this serializer (it would be comparing the spec with itself), and why
+        # `check_requires` above is the check that actually decides it.
         tensors.append(wire.TensorDesc(
             bi=0, offset=out_offset, nbytes=out_nbytes, dtype=spec.out_dtype,
             layout="row_major", ne=_ne(out_shape),
@@ -352,7 +413,8 @@ class DspSimBackend:
         src = tuple(range(len(arrays)))
         dst = (len(arrays),)
         params = _encode_params(spec, arrays, attrs)
-        ops = [wire.OpDesc(kind=KIND_ID[kind], params=params, src=src, dst=dst)]
+        kind_id = KIND_ID[kind]
+        ops = [wire.OpDesc(kind=kind_id, params=params, src=src, dst=dst)]
         blob = wire.pack_batch(bufs, tensors, ops)
 
         self._write_call(blob, bytes(payload))
@@ -360,6 +422,45 @@ class DspSimBackend:
         if res.status != wire.STATUS["OK"]:
             name = wire.STATUS_NAME.get(res.status, res.status)
             raise DspSimError(f"{kind}: DSP invoke returned status {name} ({res.status})")
+        # `simhost.c` returns 0 if and only if the batch status was
+        # HEXLIB_DSP_OK, so an OK status line together with a nonzero exit means
+        # the process died AFTER printing it -- before, for instance, writing
+        # the output file. This was captured in the result and never read.
+        if res.exit_code not in (0, None):
+            raise DspSimError(
+                f"{kind}: the batch reported OK but the simulator process "
+                f"exited {res.exit_code}, so it did not finish. Anything it had "
+                f"written by then is a partial result, not an answer.\n"
+                f"{res.stdout}"
+            )
+
+        # WHAT CAME BACK MUST ANSWER WHAT WAS ASKED. `skel_dispatch.c` fills
+        # `results[i].kind` from the op's own kind BEFORE the table lookup, so
+        # this compares the id that reached the DSP with the id packed here. It
+        # is the only host-side check that can see the host and the DSP
+        # disagreeing about kind ids -- a drift that otherwise dispatches an op
+        # to another kernel with a matching buffer count and reports OK. The
+        # per-op status is a separate field from the batch header's status
+        # (`wire.BatchResponse.ok` requires both) and was never read either.
+        rsp = self._read_response()
+        if rsp.n_ops != 1 or len(rsp.results) != 1:
+            raise DspSimError(
+                f"{kind}: the batch carried 1 op but the response reports "
+                f"n_ops={rsp.n_ops} with {len(rsp.results)} results"
+            )
+        result = rsp.results[0]
+        if result.kind != kind_id:
+            raise DspSimError(
+                f"{kind}: asked for kind {kind_id} but the response answers for "
+                f"kind {result.kind}. The host and the DSP disagree about kind "
+                f"ids, so this op was served by another kernel."
+            )
+        if not result.ok:
+            name = wire.STATUS_NAME.get(result.status, result.status)
+            raise DspSimError(
+                f"{kind}: the batch status was OK but the op itself returned "
+                f"{name} ({result.status})"
+            )
 
         out_path = os.path.join(self.work_dir, OUT_NAME)
         if not os.path.isfile(out_path):
