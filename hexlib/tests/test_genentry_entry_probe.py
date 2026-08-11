@@ -77,14 +77,22 @@ static int g_calls;
 static int g_n;
 static float g_factor;
 
+/* WHICH BUFFER EACH ARGUMENT ACTUALLY WAS. The src-then-dst packing contract is
+ * stated in exactly one place -- skel_dispatch.c's fill loop -- and mirrored by
+ * genentry's `out_idx = n_in`; nothing checked that the two agree. Recording the
+ * pointers turns an "outputs first" refactor from a silent swap into a failure. */
+static const void *g_in0;
+static const void *g_in1;
+static const void *g_out;
+
 void scale_fp16(const hexlib_hf *x, hexlib_hf *y, int n, float factor) {
-    (void) x; (void) y; g_calls++; g_n = n; g_factor = factor;
+    g_calls++; g_n = n; g_factor = factor; g_in0 = x; g_out = y;
 }
 void cast_f32_f16(const float *x, hexlib_hf *y, int n) {
-    (void) x; (void) y; g_calls++; g_n = n;
+    g_calls++; g_n = n; g_in0 = x; g_out = y;
 }
 void add_fp16(const hexlib_hf *a, const hexlib_hf *b, hexlib_hf *y, int n) {
-    (void) a; (void) b; (void) y; g_calls++; g_n = n;
+    g_calls++; g_n = n; g_in0 = a; g_in1 = b; g_out = y;
 }
 
 extern int scale_fp16_entry(const hexlib_args *);
@@ -107,6 +115,13 @@ static void base(hexlib_args *a, unsigned int n_buf) {
     a->params = params;
 }
 
+/* putchar(10) emits the newline: this C is carried inside a Python
+ * string literal, so an escape sequence here round-trips badly. */
+static void report_order(const char *label, int ok) {
+    printf("%s=%d", label, ok ? 1 : 0);
+    putchar(10);
+}
+
 static void report(const char *label, int rc) {
     printf("case=%s rc=%d calls=%d n=%d\\n", label, rc, g_calls, g_n);
 }
@@ -119,6 +134,8 @@ int main(void) {
     base(&a, 2); a.dtype[0] = ID_FP16; a.dtype[1] = ID_FP16;
     rc = scale_fp16_entry(&a);
     report("scale_ok", rc);
+    report_order("scale_order",
+                 g_in0 == (const void *) b0 && g_out == (const void *) b1);
     printf("factor_ok=%d\\n", g_factor == 0.125f ? 1 : 0);
 
     g_calls = 0; g_n = -1;
@@ -145,6 +162,9 @@ int main(void) {
     base(&a, 3); a.dtype[0] = ID_FP16; a.dtype[1] = ID_FP16; a.dtype[2] = ID_FP16;
     rc = add_fp16_entry(&a);
     report("add_ok", rc);
+    report_order("add_order",
+                 g_in0 == (const void *) b0 && g_in1 == (const void *) b1
+                 && g_out == (const void *) b2);
 
     g_calls = 0; g_n = -1;
     base(&a, 3); a.dtype[0] = ID_FP16; a.dtype[1] = ID_FP32; a.dtype[2] = ID_FP16;
@@ -207,6 +227,8 @@ def probe(tmp_path_factory):
     }
     assert len(cases) == 9, f"probe printed {sorted(cases)}:\n{run.stdout}"
     cases["_factor_ok"] = ("factor_ok=1" in run.stdout, 0, 0)
+    cases["_scale_order"] = ("scale_order=1" in run.stdout, 0, 0)
+    cases["_add_order"] = ("add_order=1" in run.stdout, 0, 0)
     return cases
 
 
@@ -281,3 +303,29 @@ def test_the_structural_checks_still_come_first(probe):
     rc, calls, _ = probe["scale_null_output"]
     assert rc == STATUS["ERR_INVAL_PARAMS"], f"a null output returned {rc}"
     assert calls == 0
+
+
+@needs_cc
+def test_buffers_are_packed_sources_then_destinations(probe):
+    """THE CONTRACT, PINNED FROM BOTH SIDES AT ONCE.
+
+    `skel_dispatch.c`'s fill loop is the only statement anywhere that `a->buf[]`
+    holds sources followed by destinations, and `genentry.py` hardcodes the
+    mirror image as `out_idx = n_in`. Neither referenced the other and no test
+    compared them, so an "outputs first" refactor could swap input and output
+    pointers in every generated entry at once: `scale_fp16` would write into its
+    own input and return the zero-filled output region, at the right length,
+    with status OK. Only the @sdk-gated numeric test would have noticed, and CI
+    does not run it.
+
+    This checks the POINTERS the kernel actually received, so it fails on the
+    swap rather than on the spelling of any particular index expression. b0/b1/b2
+    are distinct static arrays, which is what makes identity meaningful."""
+    assert probe["_scale_order"][0], (
+        "scale_fp16 must receive buf[0] as its input and buf[1] as its output "
+        "(1 source, then 1 destination)"
+    )
+    assert probe["_add_order"][0], (
+        "add_fp16 must receive buf[0] and buf[1] as its two inputs and buf[2] as "
+        "its output -- the destination sits at index n_in, not index 0"
+    )
