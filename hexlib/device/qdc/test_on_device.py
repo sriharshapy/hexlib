@@ -92,7 +92,7 @@ def test_the_dsp_refuses_an_unmapped_fd_on_silicon_too():
     the single most important thing this job can report; hence this is
     asserted explicitly rather than left implicit in a passing self-test.
 
-    KNOWN GAP, READ BEFORE THIS IS EVER RUN FOR REAL. `hexlib_run`'s
+    SUPERSEDED 2026-08-11 -- THE FLAG NOW EXISTS (cd2582b). Kept because it records why it was added. Formerly: `hexlib_run`'s
     `main()` only ever inspects `argv[1]` (`--caps` / `--self-test` /
     `--batch`) -- there is no `--unmapped` flag today, unlike
     `hexlib/runtime/simhost/simhost.c`'s, which deliberately skips
@@ -137,7 +137,7 @@ def test_cache_coherency_is_independent_of_marshalling_and_of_any_kernel():
     where there is no cheaper way to tell them apart. This check exists so a
     failure says WHICH of the two it is on the FIRST job, not the third.
 
-    KNOWN GAP, READ BEFORE THIS IS EVER RUN FOR REAL. Unlike the unmapped-fd
+    SUPERSEDED 2026-08-11 -- THE FLAG NOW EXISTS (cd2582b) AND THIS DESIGN WAS INCOMPLETE; see the correction at the end. Formerly: Unlike the unmapped-fd
     flag above, `--coherency-check` does not exist ANYWHERE today, not even
     in shape (there is no simulator equivalent to mirror, because host and
     DSP share one address space there and a cache-coherency question does
@@ -172,6 +172,20 @@ def test_cache_coherency_is_independent_of_marshalling_and_of_any_kernel():
     Until that lands, this test's own `sh()` call fails the moment the flag
     is rejected -- which is the honest state of this discriminator today: not
     yet expressible, not silently skipped.
+
+    CRUCIAL CORRECTION (design doc 6.1, 2026-08-11): THE SENTINEL ALONE DOES
+    NOT DISCRIMINATE. If dispatch silently no-ops and still returns
+    HEXLIB_DSP_OK -- a MARSHALLING bug -- the observable is identical to a
+    coherency miss: status OK, sentinel intact. What separates them is
+    `cycles_total` from the response header, which a no-op cannot fake:
+      cycles 0,  sentinel intact      -> kernel never ran: a dispatch bug
+      cycles >0, sentinel intact      -> ran, write never reached host: COHERENCY
+      cycles >0, sentinel overwritten -> healthy, for this direction
+    Two limits stated rather than implied: riding on `scale_fp16` is NOT
+    kernel-independent (needs a skel-side echo op, deferred), and this covers
+    only DSP-write -> host-read. The host-write -> DSP-read direction, which
+    every input buffer and the batch blob depend on, is UNTESTED.
+
     """
     out = sh(
         f"cd {DEV} && ADSP_LIBRARY_PATH={DEV} ./hexlib_run --self-test "
