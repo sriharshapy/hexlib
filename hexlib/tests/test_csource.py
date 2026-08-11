@@ -11,10 +11,27 @@ landing on the wrong block, or raising "unbalanced braces" outright -- which
 is the failure mode this module exists to close. See the task report for the
 manual before/after run that confirms this (reverting `csource.py` to the
 comment-blind implementation makes these fail).
+
+THE SECOND PROPERTY, ADDED AFTER A MUTATION FOUND THE GAP: the text these
+slicers RETURN must be comment-blanked too, not just their boundaries
+comment-aware. The original implementation returned a slice of the raw,
+comment-bearing source, so any payload check a consumer ran against it
+(`x in body`, `re.search(..., body)`) could be satisfied by a comment INSIDE
+the extracted body -- which is exactly how a proven mutation of skel_bufs.c
+kept test_skel_bufs_source.py at 8 passed while deleting the branch's central
+invariant. `test_*_returns_comment_blanked_text*` below pin that half: each
+one fails against the old, non-stripping implementation.
 """
+import pathlib
 import re
 
-from hexlib.tests.csource import block_after_call, block_from, function_body, strip_comments
+from hexlib.tests.csource import (
+    block_after_call,
+    block_from,
+    code_only,
+    function_body,
+    strip_comments,
+)
 
 
 def test_strip_comments_blanks_comments_but_preserves_length_and_strings():
@@ -128,3 +145,110 @@ def test_function_body_still_finds_the_real_definition_with_no_comments():
     case it is layered on top of."""
     src = "int plain(void) {\n    return 7;\n}\n"
     assert "return 7;" in function_body(src, "plain")
+
+
+# ==============================================================================
+# The returned text, not just the boundaries. A guard deleted and left behind
+# as a comment must not satisfy a payload check run against the slice -- the
+# exact hole a mutation of skel_bufs.c walked through.
+# ==============================================================================
+
+
+def test_function_body_returns_comment_blanked_text_by_default():
+    """The mutation shape, in miniature: the real `return -1;` is gone and
+    survives only as a comment inside the body. `"return -1;" in body` must
+    NOT be true, and the code that IS still there must still be visible."""
+    src = (
+        "int guard(int x) {\n"
+        "    if (x < 0) {\n"
+        "        /* return -1; */\n"
+        "        x = 0;\n"
+        "    }\n"
+        "    return x;\n"
+        "}\n"
+    )
+    body = function_body(src, "guard")
+    assert "return -1;" not in body, (
+        "a commented-out return must not satisfy a payload check on the body"
+    )
+    assert "x = 0;" in body
+    assert "return x;" in body
+    # length is preserved, so offsets taken from the slice still line up with
+    # the same slice of the original text
+    assert len(body) == len(function_body(src, "guard", strip=False))
+
+
+def test_function_body_strip_false_still_returns_the_original_text():
+    """The escape hatch is real, and explicit: `strip=False` gives back the
+    comment-bearing slice for a caller that means to inspect comments."""
+    src = "int guard(void) {\n    /* return -1; */\n    return 0;\n}\n"
+    raw = function_body(src, "guard", strip=False)
+    assert "/* return -1; */" in raw
+
+
+def test_block_from_returns_comment_blanked_text_by_default():
+    """Same property for `block_from`: the guarded block's payload must be
+    code. A commented-out `return -1;` inside the block is not a refusal."""
+    text = "if (x) {\n    /* return -1; */\n    log_it();\n}\n"
+    block = block_from(text, text.index(")"))
+    assert "return -1;" not in block
+    assert "log_it();" in block
+
+
+def test_block_after_call_returns_comment_blanked_text_by_default():
+    """Same property for `block_after_call`: the status the caller looks for
+    in the checked block must be returned, not merely mentioned in prose."""
+    body = (
+        "int rc = real_call(a, b);\n"
+        "if (rc != 0) {\n"
+        "    /* return HEXLIB_DSP_ERR_INTERNAL; */\n"
+        "    rc = 0;\n"
+        "}\n"
+    )
+    block = block_after_call(body, "real_call")
+    assert not re.search(r"return\s+HEXLIB_DSP_ERR_\w+\s*;", block), (
+        "a commented-out error return must not count as propagating a status"
+    )
+    assert "rc = 0;" in block
+
+
+def test_no_test_file_carries_its_own_private_copy_of_the_slicer():
+    """THE CONSOLIDATION CLAIM, MADE SELF-ENFORCING RATHER THAN PROMISED.
+    csource.py's docstring asserted the consolidation was complete while two
+    private copies were still live -- a claim about the codebase written in
+    prose, which is exactly the kind of thing that rots silently. This checks
+    it instead.
+
+    A private copy is a `def` of one of these names in any hexlib/tests module
+    other than csource.py itself. An `import ... as _function_body` alias is
+    not a copy and is the intended usage, so only `def` is matched.
+    `_macro_body` in test_host_source.py is deliberately excluded: it slices a
+    backslash-continued `#define`, which brace counting cannot do, and its own
+    docstring says why it is a narrowly-scoped sibling rather than a fourth
+    slicer."""
+    shared = ("strip_comments", "code_only", "function_body", "block_from",
+              "block_after_call")
+    here = pathlib.Path(__file__).parent
+    offenders = []
+    for path in sorted(here.glob("test_*.py")):
+        text = path.read_text(encoding="utf-8")
+        for name in shared:
+            if re.search(rf"^\s*def\s+_?{name}\s*\(", text, re.M):
+                offenders.append(f"{path.name} defines its own {name}()")
+    assert not offenders, (
+        "private copies of the shared C slicer are back -- import them from "
+        "hexlib.tests.csource instead, and see that module's docstring for why "
+        "a near-copy is worse than no copy: "
+        + "; ".join(offenders)
+    )
+
+
+def test_code_only_is_the_whole_file_form_of_the_same_guarantee():
+    """`code_only` is what a whole-file fixture goes through before any
+    payload check runs against it -- same blanking, same length, so a
+    constant or a call named only in a comment cannot satisfy (or trip) a
+    file-wide check."""
+    src = '/* calls HAP_mmap() here */\nint f(void) { return 0; }\n'
+    assert "HAP_mmap" not in code_only(src)
+    assert len(code_only(src)) == len(src)
+    assert "int f(void) { return 0; }" in code_only(src)

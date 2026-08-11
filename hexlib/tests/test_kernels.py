@@ -7,30 +7,25 @@ reintroducing themselves in source review, where a runtime repro is
 impractical (the defect below is a static out-of-bounds read that the
 standalone Hexagon simulator has no sanitizer to catch, and which is
 unreachable under every conforming call anyway).
+
+THE SLICER IS SHARED, NOT COPIED. This file carried a fourth private copy of
+the brace-counting slicer `hexlib/tests/csource.py` exists to consolidate, and
+the weakest of the four: `src.index("void " + name + "(")` with no comment
+handling at all. That mattered here specifically, because the assertion below
+is `"else" not in body` -- a NEGATIVE check, which any comment inside
+rmsnorm_fp16 containing the word "else" (or "otherwise... else", or a prose
+mention of the removed branch) would trip, and which the comment-blanked slice
+from `csource.function_body` cannot be tripped by. Migrated.
 """
 from __future__ import annotations
 
 import pathlib
 import re
 
+from hexlib.tests.csource import function_body as _function_body
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 RMSNORM_KERNEL_C = REPO_ROOT / "kernels" / "rmsnorm_fp16" / "kernel.c"
-
-
-def _function_body(src: str, name: str) -> str:
-    start = src.index(f"void {name}(")
-    # Body starts at the first '{' after the signature and ends at the
-    # matching '}' (no nested braces of that name appear before it here).
-    brace = src.index("{", start)
-    depth = 0
-    for i in range(brace, len(src)):
-        if src[i] == "{":
-            depth += 1
-        elif src[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return src[brace:i + 1]
-    raise AssertionError(f"unbalanced braces in {name}")
 
 
 def test_rmsnorm_fp16_has_no_dead_and_unsafe_else_branch():

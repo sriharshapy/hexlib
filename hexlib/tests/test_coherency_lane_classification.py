@@ -52,6 +52,16 @@ source, mechanically reverts the mask to the original `bits == 0x0000`
 compare, compiles THAT, and confirms 0x8000 is misclassified under it --
 concrete, run evidence that this test suite would have caught the original
 defect, not just an assertion that it currently doesn't reproduce it.
+
+THE COMPILER-INDEPENDENT GUARD BELOW WAS ONCE FOOLABLE BY A COMMENT. Same
+history as test_session_arch_decode.py's -- see that file's docstring.
+`csource.function_body` used to return the raw, comment-BEARING body, so
+reverting hexlib_classify_coherency_lane() to `bits == 0x0000u` and dropping
+HEXLIB_LANE_OTHER, with the old code left in a comment inside the body, passed
+`test_the_classification_function_the_behavioural_test_depends_on_still_exists`
+-- the one test in this file that runs when there is no host `cc`, and
+therefore the only guard at all on such a machine. `function_body` now returns
+comment-blanked text; that exact revert now fails it. Verified by mutation.
 """
 import ctypes
 import pathlib

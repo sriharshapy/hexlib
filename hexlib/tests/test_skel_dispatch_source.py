@@ -10,7 +10,7 @@ status field, or a genuine call to the shared header-writer -- never merely
 "the token appears somewhere in the file", which a FARF-only downgrade would
 still satisfy.
 
-Comments are stripped from both fixtures before any check runs, in both
+Comments are blanked out of both fixtures before any check runs, in both
 directions: a mutation cannot satisfy a positive check ("X must be assigned")
 by demoting the assignment to a comment, and a mutation cannot trip a negative
 check ("X must not appear here") merely by mentioning X in prose -- which
@@ -18,70 +18,38 @@ happened during development of this file (a comment in the invoke-before-start
 refusal that named `hexlib_dispatch_batch` in prose briefly failed
 test_invoke_before_start_is_refused for exactly that reason).
 
-`_function_body()` is adapted from `hexlib/tests/test_skel_bufs_source.py`
-(Task 4), which established the pattern for exactly this reason: whole-file
-substring checks can't tell a real guard from a comment, and can't isolate ONE
-of several return sites being downgraded while the others stay real.
+THE SLICER IS SHARED, NOT COPIED. This file carried its own private
+`_strip_comments`/`_function_body`/`_brace_block` -- the third copy of the
+slicer `hexlib/tests/csource.py` was written to consolidate, and a WEAKER one:
+its `_strip_comments` DELETED comment text rather than blanking it, so every
+offset in the stripped text was shifted relative to the real file and no
+offset could be reported back against the source. Migrated to `csource`
+(`code_only` for the fixtures, `function_body`/`block_from` for the slices),
+which keeps the same-length blanking property. See csource.py's own module
+docstring for the full history, including the payload-check hole that stripping
+comments only at the BOUNDARIES left open.
 """
 import pathlib
 import re
 
 import pytest
 
+from hexlib.tests.csource import block_from as _block_from
+from hexlib.tests.csource import code_only as _code_only
+from hexlib.tests.csource import function_body as _function_body
+
 DISPATCH = pathlib.Path("hexlib/runtime/skel/skel_dispatch.c")
 SKEL = pathlib.Path("hexlib/runtime/skel/skel.c")
 
 
-def _strip_comments(text):
-    """Remove /* ... */ and // ... comments, replacing each with nothing (not
-    whitespace) so a comment can never contribute a stray brace to the
-    depth-counting slicer below, and so a name mentioned only in prose can
-    never satisfy -- or spuriously trip -- a code-level check."""
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
-    text = re.sub(r"//.*", "", text)
-    return text
-
-
 @pytest.fixture(scope="module")
 def d():
-    return _strip_comments(DISPATCH.read_text())
+    return _code_only(DISPATCH.read_text())
 
 
 @pytest.fixture(scope="module")
 def s():
-    return _strip_comments(SKEL.read_text())
-
-
-def _function_body(src, name):
-    """Slice the text of a C function from its signature to its matching
-    closing brace, by simple brace-depth counting. Good enough for this
-    project's straight-line C; not a general C parser."""
-    m = re.search(rf"\b{re.escape(name)}\s*\([^;{{]*\)\s*\{{", src)
-    assert m, f"could not find the definition of {name}() in the source"
-    start = m.end() - 1  # position of the opening brace
-    depth = 0
-    for i in range(start, len(src)):
-        if src[i] == "{":
-            depth += 1
-        elif src[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return src[start:i + 1]
-    raise AssertionError(f"unbalanced braces while slicing {name}()")
-
-
-def _brace_block(text, open_brace_idx):
-    """Given the index of an opening '{', return the text up to and including
-    its matching closing '}'."""
-    depth = 0
-    for i in range(open_brace_idx, len(text)):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return text[open_brace_idx:i + 1]
-    raise AssertionError("unbalanced braces")
+    return _code_only(SKEL.read_text())
 
 
 def test_the_response_is_written_before_any_op_runs(d):
@@ -118,7 +86,7 @@ def test_total_size_is_checked_against_the_actual_length(d):
     body = _function_body(d, "hexlib_dispatch_batch")
     m = re.search(r"if\s*\(\s*hdr\.total_size\s*!=\s*len\s*\)\s*\{", body)
     assert m, "no guard comparing hdr.total_size against the actual length"
-    guard = _brace_block(body, m.end() - 1)
+    guard = _block_from(body, m.end() - 1)
     assert "HEXLIB_DSP_ERR_TRUNCATED" in guard
 
 
@@ -155,7 +123,7 @@ def test_an_unknown_kind_is_refused(d):
     body = _function_body(d, "hexlib_dispatch_batch")
     m = re.search(r"if\s*\(\s*!\s*k\s*\)\s*\{", body)
     assert m, "no null-kernel-pointer guard (`if (!k)`) found"
-    guard = _brace_block(body, m.end() - 1)
+    guard = _block_from(body, m.end() - 1)
     assert re.search(r"results\[i\]\.status\s*=\s*HEXLIB_DSP_ERR_NO_KERNEL", guard)
     assert re.search(r"batch_status\s*=\s*HEXLIB_DSP_ERR_NO_KERNEL", guard)
     assert "break" in guard, "an unknown kind must stop the batch, not continue it"
@@ -171,7 +139,7 @@ def test_vtcm_reclaim_is_reported_not_ignored(d):
     body = _function_body(d, "hexlib_dispatch_batch")
     m = re.search(r"if\s*\(\s*ctx->vtcm_needs_release\s*\)\s*\{", body)
     assert m, "no check of ctx->vtcm_needs_release inside the dispatcher"
-    guard = _brace_block(body, m.end() - 1)
+    guard = _block_from(body, m.end() - 1)
     assert "hexlib_vtcm_release(" in guard, "must actually release VTCM, not just stop"
     assert re.search(r"batch_status\s*=\s*HEXLIB_DSP_ERR_VTCM_RECLAIMED", guard)
     assert "break" in guard, "must stop at the op boundary, not continue"
@@ -186,7 +154,7 @@ def test_invoke_before_start_is_refused(s):
     body = _function_body(s, "hexlib_iface_invoke")
     m = re.search(r"if\s*\(\s*!\s*ctx->started\s*\)\s*\{", body)
     assert m, "hexlib_iface_invoke does not guard on ctx->started"
-    guard = _brace_block(body, m.end() - 1)
+    guard = _block_from(body, m.end() - 1)
     assert re.search(
         r"hexlib_write_rsp_hdr\s*\([^;]*HEXLIB_DSP_ERR_NOT_STARTED", guard
     ), "the refusal must write NOT_STARTED into the response, not just log it"
@@ -194,12 +162,57 @@ def test_invoke_before_start_is_refused(s):
 
 
 def test_hwinfo_reports_the_acquired_vtcm_size(s):
-    assert "vtcm_size" in s
+    """The size on the wire must be READ OUT of the session context that
+    skel_vtcm.c filled in from HAP_compute_res, never a constant.
+
+    `"vtcm_size" in s` was satisfied by the qaic-generated OUT-PARAMETER's own
+    name in hexlib_iface_hwinfo's signature, and the negative half banned only
+    one spelling of one constant -- so `*vtcm_size = (uint64)(8*1024*1024);`
+    passed both. The check is now the assignment itself: whatever
+    hexlib_iface_hwinfo writes through that pointer must be derived from
+    ctx->vtcm_size, which is the only value the acquisition path ever sets."""
+    body = _function_body(s, "hexlib_iface_hwinfo")
+    m = re.search(r"\*\s*vtcm_size\s*=\s*([^;]+);", body)
+    assert m, "hexlib_iface_hwinfo must write something through *vtcm_size"
+    rhs = m.group(1)
+    assert "ctx->vtcm_size" in rhs, (
+        f"hwinfo must report the ACQUIRED size (ctx->vtcm_size, set by "
+        f"skel_vtcm.c from HAP_compute_res), not `{rhs.strip()}` -- the part "
+        f"total is not the usable budget, in any spelling"
+    )
     assert "8388608" not in s, "hwinfo must report what was acquired, not a constant"
 
 
+# Each qaic entry point, paired with the one thing it must actually DO. The
+# entry points are thin by design -- they exist to delegate -- so the call each
+# one delegates to IS its whole content, and a body that does not contain it is
+# a stub regardless of what it returns.
+_IFACE_DELEGATIONS = {
+    "hexlib_iface_open": r"\*\s*handle\s*=",
+    "hexlib_iface_close": r"\bhexlib_vtcm_free\s*\(",
+    "hexlib_iface_start": r"\bhexlib_vtcm_alloc\s*\(",
+    "hexlib_iface_stop": r"\bhexlib_vtcm_free\s*\(",
+    "hexlib_iface_mmap": r"\bhexlib_bufs_register\s*\(",
+    "hexlib_iface_munmap": r"\bhexlib_bufs_unregister\s*\(",
+    "hexlib_iface_hwinfo": r"__HEXAGON_ARCH__",
+    "hexlib_iface_invoke": r"\bhexlib_dispatch_batch\s*\(",
+}
+
+
 def test_skel_defines_the_iface_symbols_qaic_expects(s):
-    for sym in ("hexlib_iface_open", "hexlib_iface_close", "hexlib_iface_start",
-                "hexlib_iface_stop", "hexlib_iface_mmap", "hexlib_iface_munmap",
-                "hexlib_iface_hwinfo", "hexlib_iface_invoke"):
-        assert sym in s, sym
+    """Each symbol must be a real DEFINITION that does its own job -- not
+    merely a token present in the file.
+
+    THIS WAS EIGHT `sym in s` CHECKS, AND EACH WAS SATISFIED BY THAT
+    FUNCTION'S OWN SIGNATURE. Gutting every body in skel.c to `return
+    AEE_SUCCESS;` passed all eight: the names were still there, on the empty
+    shells. `function_body` raising on a removed or renamed symbol covers the
+    presence half properly; the delegation table above covers the "and it
+    still does something" half, one required call per entry point."""
+    for sym, required in _IFACE_DELEGATIONS.items():
+        body = _function_body(s, sym)   # raises if the definition is gone
+        assert re.search(required, body), (
+            f"{sym}() is defined but does not {required!r} -- a FastRPC entry "
+            f"point that returns AEE_SUCCESS without delegating is a stub, and "
+            f"a stub reports success for work that never happened"
+        )

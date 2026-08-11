@@ -3,13 +3,33 @@
 device, which is exactly why stage 2 exists as a separate gate: so stage 3
 spends minutes on one unknown rather than five.
 
-TIGHTENED PAST THE DRAFT. A first draft of these ten checked for bare
-substrings anywhere in a file -- which a comment, a dead branch, or a FARF log
-line naming the right constant would also satisfy. Every earlier task in this
-plan had the same problem and needed the same fix (see
-test_skel_bufs_source.py, test_skel_vtcm_source.py), so these are
-function-scoped wherever the underlying claim is about ONE function's
-behaviour, and check actual `return`s / call ORDER rather than mere presence.
+TIGHTENED TWICE. A first draft of these checked for bare substrings anywhere
+in a file -- which a comment, a dead branch, or a FARF log line naming the
+right constant would also satisfy. Every earlier task in this plan had the
+same problem and needed the same fix (see test_skel_bufs_source.py,
+test_skel_vtcm_source.py), so these became function-scoped wherever the
+underlying claim is about ONE function's behaviour, checking actual `return`s
+and call ORDER rather than mere presence.
+
+THE SECOND TIGHTENING, AND WHY IT WAS NEEDED. Function scope alone was not
+enough, because the checks still ran against comment-BEARING text. Three
+mutations proved it:
+
+  * reverting hexlib_decode_bcd_arch (session.c) to the shipped bug
+    (`return arch_ver;`) with the arithmetic left in a comment INSIDE the body
+    still matched the `>> 4` / `* 10` / `& 0x0f` regexes below;
+  * reverting hexlib_classify_coherency_lane (main.c) to its `bits == 0x0000u`
+    bug, old code left in a body comment, left this whole file at 22 passed;
+  * `handle = dlopen(...)` -> `handle = NULL;` passed, because `"dlopen(" in
+    body` was satisfied by driver.c's own dlopen-failed error format string;
+    same shape for `"dlsym(" in driver`.
+
+So every fixture here is COMMENT-BLANKED (`csource.code_only`), every slice
+inherits that, and presence checks that used to be bare tokens are now call-
+or assignment-shaped. The single test that legitimately inspects COMMENTS --
+test_coherency_check_documents_its_own_scope_limits, whose whole claim is that
+a caveat is written down for a human reader -- takes the `main_comments`
+fixture instead and says so.
 """
 import pathlib
 import re
@@ -17,6 +37,7 @@ import re
 import pytest
 
 from hexlib.tests.csource import block_from as _block_from
+from hexlib.tests.csource import code_only as _code_only
 from hexlib.tests.csource import function_body as _function_body
 
 H = pathlib.Path("hexlib/runtime/host")
@@ -24,21 +45,30 @@ H = pathlib.Path("hexlib/runtime/host")
 
 @pytest.fixture(scope="module")
 def driver():
-    return (H / "driver.c").read_text()
+    return _code_only((H / "driver.c").read_text())
 
 
 @pytest.fixture(scope="module")
 def session():
-    return (H / "session.c").read_text()
+    return _code_only((H / "session.c").read_text())
 
 
 @pytest.fixture(scope="module")
 def buffers():
-    return (H / "buffers.c").read_text()
+    return _code_only((H / "buffers.c").read_text())
 
 
 @pytest.fixture(scope="module")
 def main():
+    return _code_only((H / "main.c").read_text())
+
+
+@pytest.fixture(scope="module")
+def main_comments():
+    """main.c WITH its comments, for the one test whose subject IS a comment
+    (test_coherency_check_documents_its_own_scope_limits). Every other check
+    in this file must use the `main` fixture above -- see the module
+    docstring."""
     return (H / "main.c").read_text()
 
 
@@ -47,7 +77,13 @@ def _macro_body(src, name):
     continuations. `_function_body`'s brace-counting does not apply to a
     macro definition (its own braces are a `do { ... } while (0)` wrapper,
     not the boundary we want), so this is a narrowly-scoped sibling rather
-    than a reuse -- there is exactly one macro these tests need to isolate."""
+    than a reuse -- there is exactly one macro these tests need to isolate.
+
+    Comment-blanked like everything else here: `csource.code_only` preserves
+    length, and a blanked `/* ... */` inside a macro leaves any trailing
+    backslash continuation exactly where it was, so the line walk is
+    unaffected."""
+    src = _code_only(src)
     m = re.search(rf"#define\s+{re.escape(name)}\b", src)
     assert m, f"could not find #define {name} in the source"
     lines = src[m.start():].splitlines()
@@ -69,10 +105,23 @@ def test_libcdsprpc_is_dlopened_not_linked(driver):
     failed -- must actually fail hexlib_drv_init from inside its own check,
     not merely be logged: a build that calls dlopen() and ignores a NULL
     result would otherwise satisfy the presence checks above and still crash
-    the first time a dlsym() runs against it."""
+    the first time a dlsym() runs against it.
+
+    THE HANDLE MUST COME FROM THE CALL. `"dlopen(" in body` was satisfied by
+    driver.c's own `"hexlib: dlopen(%s) failed: %s\\n"` format string, three
+    lines below the real call -- so `handle = dlopen(candidates[i], RTLD_NOW);`
+    could be replaced outright with `handle = NULL;` and this test still
+    passed, with the readable-message property it exists to protect gone and
+    the loader never consulted at all."""
     body = _function_body(driver, "hexlib_drv_init")
-    assert "dlopen(" in body
-    assert "libcdsprpc.so" in body
+    assert re.search(r"\bhandle\s*=\s*dlopen\s*\(", body), (
+        "the driver handle must be ASSIGNED from a real dlopen() call -- a "
+        "mention of dlopen in an error message is not loading anything"
+    )
+    assert '"libcdsprpc.so"' in body, (
+        "the candidate path must be a real string literal in the loading "
+        "function, not merely named in prose"
+    )
 
     null_check = re.search(r"handle\s*==\s*NULL", body)
     assert null_check, "a failed dlopen() must be checked, not assumed to succeed"
@@ -86,7 +135,15 @@ def test_libcdsprpc_is_dlopened_not_linked(driver):
 def test_every_symbol_is_resolved_by_name_and_checked(driver):
     """Each required symbol must be the subject of an actual HEXLIB_DLSYM(...)
     call inside hexlib_drv_init -- not merely named somewhere in the file,
-    which a stale comment or a typedef alone would also satisfy."""
+    which a stale comment or a typedef alone would also satisfy.
+
+    AND THE MACRO MUST RESOLVE BY NAME, THROUGH dlsym, INTO THE POINTER.
+    `"dlsym(" in driver` was whole-file and was satisfied by the macro's own
+    `"hexlib: dlsym(%s) failed: %s\\n"` error format string, so the real
+    `(pfn) = (__typeof__(pfn)) dlsym(handle, #symbol);` could be replaced with
+    anything at all -- including `(pfn) = NULL;`, which would make every
+    symbol below "resolve" and then null-call later, the exact bug the macro
+    exists to prevent."""
     body = _function_body(driver, "hexlib_drv_init")
     for sym in (
         "rpcmem_alloc", "rpcmem_free", "rpcmem_to_fd", "fastrpc_mmap",
@@ -94,7 +151,18 @@ def test_every_symbol_is_resolved_by_name_and_checked(driver):
         "remote_handle_control", "remote_session_control",
     ):
         assert re.search(rf"HEXLIB_DLSYM\([^;]*\b{re.escape(sym)}\b", body), sym
-    assert "dlsym(" in driver
+
+    macro = _macro_body(driver, "HEXLIB_DLSYM")
+    assert re.search(r"\(\s*pfn\s*\)\s*=[^;]*\bdlsym\s*\(", macro), (
+        "HEXLIB_DLSYM must assign the function pointer from an actual "
+        "dlsym() call -- naming dlsym in its own failure message is not "
+        "resolving anything"
+    )
+    assert re.search(r"\bdlsym\s*\(\s*handle\s*,\s*#\s*symbol\s*\)", macro), (
+        "the symbol must be resolved BY NAME out of the dlopen'd handle "
+        "(dlsym(handle, #symbol)), which is what makes a missing symbol a "
+        "named error rather than a null call later"
+    )
 
 
 def test_a_missing_symbol_is_an_error_not_a_null_call(driver):
@@ -504,12 +572,23 @@ def test_coherency_check_treats_negative_zero_as_the_expected_zero_result(main):
         "(0x7FFF), not compare bit-exact equality to +0.0 alone -- see this "
         "function's own header comment on why -0.0 must count as zero"
     )
-    assert not re.search(r"memcmp\(&yr\[i\],\s*&zero\b", main), (
-        "must not have regressed to a bit-exact memcmp against a literal "
-        "zero for the expected-result check"
-    )
-
     body = _function_body(main, "run_coherency_check")
+    # THIS NEGATIVE WAS VACUOUS AND IS NOW BOUND TO SOMETHING REAL. It used to
+    # be `not re.search(r"memcmp\(&yr\[i\],\s*&zero\b", main)` -- text that
+    # has never existed anywhere in main.c, in any revision, so the assertion
+    # could not fail no matter what the C did. What it MEANT to forbid is a
+    # bit-exact byte compare standing in for the magnitude classification, so
+    # forbid that: run_coherency_check's read-back loop must reach its verdict
+    # only through hexlib_classify_coherency_lane(). It uses memcpy (to get at
+    # raw bits) and never memcmp, so any memcmp appearing in this function is
+    # a comparison that has bypassed the classifier -- which is exactly the
+    # regression. Verified by mutation: inserting a memcmp here fails this.
+    assert "memcmp(" not in body, (
+        "run_coherency_check must not compare the read-back buffer with "
+        "memcmp -- every lane's verdict goes through "
+        "hexlib_classify_coherency_lane(), and a bit-exact byte compare is "
+        "how the -0.0 false coherency miss happened the first time"
+    )
     assert re.search(r"hexlib_classify_coherency_lane\s*\(", body), (
         "run_coherency_check must classify each lane through "
         "hexlib_classify_coherency_lane(), not reimplement the check inline "
@@ -541,14 +620,21 @@ def test_coherency_check_verifies_the_surviving_bytes_are_really_the_sentinel(ma
     assert '"COHERENCY buffer_garbled\\n"' in body
 
 
-def test_coherency_check_documents_its_own_scope_limits(main):
+def test_coherency_check_documents_its_own_scope_limits(main_comments):
     """Design doc §6.1 (corrected 2026-08-11): the table that makes
     cycles_total load-bearing covers ONLY the DSP-write -> host-read
     direction, for scale_fp16's own write pattern -- not the reverse
     direction, and not every kernel. That caveat must live in this file's
     own comments, not only in the on-device test's docstring, or a future
     reader of just this file could believe a pass here is a general
-    coherency proof."""
+    coherency proof.
+
+    THE ONE TEST IN THIS FILE THAT TAKES `main_comments`, NOT `main`. Its
+    subject IS the comment text -- a prose caveat written for a human reader --
+    so blanking comments out would make it assert nothing and it would fail
+    immediately. Every other check here must use `main`; see the module
+    docstring."""
+    main = main_comments
     assert "DSP-write" in main and "host-read" in main
     assert "host-write" in main and "DSP-read" in main
     assert "kernel-independent" in main.lower()

@@ -31,6 +31,23 @@ anything. If the decode is present but wrong, the compiled call below
 returns something other than 75. Either way, this test fails; it does not
 merely fail to notice.
 
+THE COMPILER-INDEPENDENT GUARD BELOW WAS ONCE FOOLABLE BY A COMMENT, AND IS
+NOT ANY MORE -- SAY SO RATHER THAN LET IT BE REDISCOVERED.
+`test_the_decode_function_the_behavioural_test_depends_on_still_exists` calls
+itself compiler-independent, and it is: it runs with no `cc` on PATH, which on
+such a machine makes it the ONLY guard on this fix. But when
+`csource.function_body` returned the raw, comment-BEARING body, that guard
+could be defeated exactly as easily as the source assertion in
+test_host_source.py it exists to back up: reverting the body to `return
+arch_ver;` and leaving `(val >> 4) * 10 + (val & 0x0f)` behind in a comment
+INSIDE the body satisfied all three regexes below, and this test passed while
+the three behavioural tests correctly failed -- so on a machine with no host C
+compiler the regression really was invisible, which is the one thing this
+test's docstring promised it could not be. `csource.function_body` now returns
+comment-BLANKED text by default (see its module docstring), so the three
+regexes below see only code. Verified by mutation, not by inspection: that
+exact revert now fails this test.
+
 Adapted from llama.cpp's own htpdrv_get_arch (ggml-hexagon/htp-drv.cpp:
 412-413, MIT; see ATTRIBUTION.md): `val = arch_ver & 0xff; arch = (val >> 4)
 * 10 + (val & 0x0f)`.
@@ -68,8 +85,11 @@ def test_the_decode_function_the_behavioural_test_depends_on_still_exists(
     hexlib_decode_bcd_arch() is never invisible on a machine with no host C
     compiler on PATH. `decode_fn_source` itself already raises (failing this
     test) if the function is gone; this test additionally pins that its body
-    still contains real BCD-decode arithmetic, not merely SOME function by
-    that name that could compile into anything. Pairs the exact NAME the
+    still contains real BCD-decode arithmetic -- as CODE, not as a comment
+    left behind by whoever deleted it, which is a hole this test had until
+    `csource.function_body` began returning comment-blanked text (see this
+    module's docstring) -- not merely SOME function by that name that could
+    compile into anything. Pairs the exact NAME the
     behavioural tests below extract with what session.c actually contains,
     so the pair cannot silently drift apart -- see this module's docstring's
     "decisive property" and the module docstring's WHY for the full
