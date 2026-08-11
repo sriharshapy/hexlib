@@ -76,6 +76,15 @@ KIND_ID: dict[str, int] = {
     "scale": 9,
     "softmax": 10,
     "transpose": 11,
+    # KIND_ID IS KEYED BY KERNEL VARIANT, NOT BY OP KIND, from here on. The first
+    # eleven happen to coincide because each of those op kinds had at most one
+    # kernel; `transpose_hd` is the first that does not. The encoder's 60
+    # transposes are two different permutations needing two different kernels
+    # (see runner.SPECS), and THE WIRE CARRIES NO ATTRS -- the DSP gets an id and
+    # a buffer list, with no perm to branch on. So the variant has to be resolved
+    # on the host, by `runner.select`, and then named on the wire by its own id.
+    # Appending is safe; reordering is not.
+    "transpose_hd": 12,
 }
 
 # hexlib_args C types. Keyed by the same wire-dtype strings as

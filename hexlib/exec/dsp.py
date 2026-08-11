@@ -80,7 +80,14 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from hexlib import toolchain as tc
-from hexlib.exec.runner import RawTensor, RunnerSpec, SPECS, WIRE_DTYPE, WIRE_RAW
+from hexlib.exec.runner import (
+    RawTensor,
+    RunnerSpec,
+    SPECS,
+    WIRE_DTYPE,
+    WIRE_RAW,
+    select,
+)
 from hexlib.runtime import build as rb
 from hexlib.runtime import wire
 from hexlib.runtime.genentry import KIND_ID
@@ -347,7 +354,13 @@ class DspSimBackend:
         correctly-shaped, OK-status wrong answer -- which is why each check is
         an error and never a fallback.
         """
-        spec = SPECS[kind]
+        # THE VARIANT IS CHOSEN HERE, FROM THE ATTRS, because the wire cannot
+        # choose it later. `transpose` is two kernels -- perm(1,0,2) moves whole
+        # aligned vectors, perm(0,2,1) shares no contiguous run and needed a
+        # different implementation -- and the DSP is handed an id and a buffer
+        # list with no perm to branch on. `select` refuses an op no variant
+        # accepts, and refuses ambiguity rather than taking the first match.
+        spec_name, spec = select(kind, attrs)
 
         # AN OP KIND IS NOT ALWAYS ONE KERNEL, and the check has to be here.
         # `hexlib/exec/hexagon.py` has always done this, for the reason its own
@@ -440,7 +453,12 @@ class DspSimBackend:
         src = tuple(range(len(arrays)))
         dst = (len(arrays),)
         params = _encode_params(spec, arrays, attrs)
-        kind_id = KIND_ID[kind]
+        # THE VARIANT'S id, not the op kind's. For a kind with one kernel these
+        # are the same string; for `transpose` they are not, and sending
+        # KIND_ID["transpose"] for a perm(0,2,1) op would dispatch it to the
+        # perm(1,0,2) kernel -- right shape, right status, wrong answer. This is
+        # the one place the host's variant decision becomes a number on the wire.
+        kind_id = KIND_ID[spec_name]
         ops = [wire.OpDesc(kind=kind_id, params=params, src=src, dst=dst)]
         blob = wire.pack_batch(bufs, tensors, ops)
 

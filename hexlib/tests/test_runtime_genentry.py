@@ -205,8 +205,8 @@ def test_the_shipped_kind_ids_never_move():
 
 def test_every_kind_a_COMPILED_PLAN_can_contain_has_a_wire_id():
     """THE COVERAGE CLAIM, CHECKED AGAINST THE REGISTRY RATHER THAN ASSUMED.
-    `KIND_ID` holds 11 entries and the op registry holds 13. The two absentees
-    are `gelu_tanh` and `gelu_erf`, and both are in `fuse.FUSABLE_ACTS`: fusion
+    The op registry holds 13 kinds. The two with no id of their own are
+    `gelu_tanh` and `gelu_erf`, and both are in `fuse.FUSABLE_ACTS`: fusion
     absorbs them into `matmul_epilogue`'s `act` attr, so neither can appear as a
     standalone plan step and there is no live wire gap today.
 
@@ -214,20 +214,55 @@ def test_every_kind_a_COMPILED_PLAN_can_contain_has_a_wire_id():
     the claim that stops being true the moment a new op kind is registered
     without an id -- at which point `dsp.py` raises KeyError on a graph that
     compiles fine. So the registry is compared here rather than trusted, and a
-    new kind that is neither fusable nor given an id fails this."""
+    new kind that is neither fusable nor given an id fails this.
+
+    `KIND_ID` IS KEYED BY KERNEL VARIANT, NOT BY OP KIND. This test used to
+    assert `set(KIND_ID) <= set(REGISTRY.all_kinds())` -- every id is an op kind
+    -- which was true only while every kind had at most one kernel. It stopped
+    being true with `transpose_hd`: the encoder's 60 transposes are two
+    permutations needing two genuinely different kernels, the wire carries no
+    perm for the DSP to branch on, so each variant needs its own id and
+    `runner.select` resolves which one on the host.
+
+    The claim that assertion was really making -- that no id is a dead or
+    invented name -- is still worth holding, so it is made precisely instead of
+    being dropped: every id must name a `SPECS` variant, and every variant's
+    `.kind` must be a registered op kind. That still fails on a typo, on an id
+    left behind by a deleted kernel, and on a variant claiming a kind that does
+    not exist."""
     import hexlib.graph.opdefs  # noqa: F401  -- registers the op defs
     from hexlib.graph.fuse import FUSABLE_ACTS
     from hexlib.graph.ops import REGISTRY
 
-    dispatchable = set(REGISTRY.all_kinds()) - set(FUSABLE_ACTS)
-    missing = sorted(dispatchable - set(ge.KIND_ID))
-    assert not missing, (
-        f"{missing} can appear as a plan step and has no wire id; dsp.py would "
+    kinds = set(REGISTRY.all_kinds())
+    dispatchable = kinds - set(FUSABLE_ACTS)
+
+    # Every dispatchable KIND must be reachable: at least one variant implements
+    # it and that variant has an id. Asking for the kind's own name in KIND_ID
+    # would now be wrong -- a kind served only by differently-named variants is
+    # still perfectly reachable.
+    unreachable = sorted(
+        k for k in dispatchable
+        if not any(n in ge.KIND_ID for n in rn.variants_for(k))
+        and k in {s.kind for s in rn.SPECS.values()}
+    )
+    assert not unreachable, (
+        f"{unreachable} has a kernel variant but no wire id for it; dsp.py would "
         f"raise KeyError on a graph that compiled cleanly"
     )
-    assert set(ge.KIND_ID) <= set(REGISTRY.all_kinds()), (
-        f"{sorted(set(ge.KIND_ID) - set(REGISTRY.all_kinds()))} has a wire id "
-        f"but is not an op kind at all"
+
+    # AND NO ID IS A NAME NOTHING CAN EVER MEAN. Two kinds of key are legitimate:
+    # an op kind's own name, which reserves an id before any kernel exists (the
+    # DSP answers ERR_NO_KERNEL for those, which is why `matmul` and `patchify`
+    # have ids and no spec), or a SPECS variant name whose `.kind` is registered.
+    # Anything else is a typo, or an id left behind by a deleted kernel.
+    meaningless = sorted(
+        n for n in ge.KIND_ID
+        if n not in kinds and (n not in rn.SPECS or rn.SPECS[n].kind not in kinds)
+    )
+    assert not meaningless, (
+        f"{meaningless} has a wire id but is neither a registered op kind nor a "
+        f"SPECS variant of one, so nothing can ever dispatch to it"
     )
 
 

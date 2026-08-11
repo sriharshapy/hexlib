@@ -219,6 +219,17 @@ class RunnerSpec:
             return ("row_major",) * (len(self.inputs) + 1)
         return self.layouts
 
+    def accepts(self, attrs: Mapping[str, Any]) -> bool:
+        """True if this variant's `requires` are all satisfied.
+
+        The predicate form of `check_requires`, for `select` to choose between
+        variants of one op kind. Kept as the same loop over the same tuple so the
+        two cannot disagree about what "satisfied" means -- a spec that `accepts`
+        an op but whose `check_requires` then raises would make dispatch depend
+        on which one a caller happened to ask.
+        """
+        return all(attrs.get(key) == want for key, want in self.requires)
+
     def check_requires(self, attrs: Mapping[str, Any]) -> None:
         for key, want in self.requires:
             got = attrs.get(key)
@@ -371,7 +382,34 @@ SPECS: dict[str, RunnerSpec] = {
             "The remaining 12 are perm (0,2,1), which transposes the INNERMOST "
             "two axes -- no contiguous run survives, so it is a genuinely "
             "different kernel. `requires` refuses them rather than returning a "
-            "correctly-shaped wrong answer."
+            "correctly-shaped wrong answer -- and `transpose_hd` below is now "
+            "that kernel, selected by `select()` off the same `perm` attr."
+        ),
+    ),
+    "transpose_hd": RunnerSpec(
+        kind="transpose",
+        kernel_dir="kernels/transpose_hd_fp16",
+        inputs=("fp16",),
+        out_dtype="fp16",
+        scalars=(
+            Scalar("dim:0:0", "int"),    # B
+            Scalar("dim:0:1", "int"),    # T
+            Scalar("dim:0:2", "int"),    # D
+        ),
+        requires=(("perm", (0, 2, 1)),),
+        notes=(
+            "THE OTHER 12 TRANSPOSES, and the first case of two kernels serving "
+            "one op kind -- which is why `SPECS` is keyed by variant and not by "
+            "kind. fp16 [12,256,64]->[12,64,256], the QK^T operand layout move.\n"
+            "perm(0,2,1) transposes the INNERMOST two axes, so unlike its sibling "
+            "no run is contiguous on both operands and no whole-vector "
+            "permutation exists. The kernel gathers a strided column scalar-wise "
+            "and commits each contiguous output row with one HVX vector store; "
+            "the store side is vectorised and the load side is not, which its "
+            "header says rather than claiming more.\n"
+            "`requires` is the disjoint half of `transpose`'s: between them the "
+            "two cover all 60 ops and no op matches both, which `select` "
+            "verifies by refusing ambiguity."
         ),
     ),
     "layernorm": RunnerSpec(
@@ -406,5 +444,69 @@ SPECS: dict[str, RunnerSpec] = {
 }
 
 
+def variants_for(kind: str) -> tuple[str, ...]:
+    """Every SPECS key implementing this op kind, in declaration order."""
+    return tuple(name for name, s in SPECS.items() if s.kind == kind)
+
+
+def select(kind: str, attrs: Mapping[str, Any]) -> tuple[str, RunnerSpec]:
+    """The variant of `kind` this op belongs to: `(spec_name, spec)`.
+
+    ONE OP KIND IS NOT ONE KERNEL, and `transpose` is where that stopped being a
+    hypothetical. The encoder's 60 transposes are two different permutations:
+    48 at perm(1,0,2), which `transpose_th_fp16` does by moving whole aligned
+    128-byte vectors, and 12 at perm(0,2,1), which shares no contiguous run
+    between its operands and needed a completely different kernel. Neither can
+    serve the other's ops -- the result would be correctly shaped and silently
+    wrong -- so `SPECS` is keyed by VARIANT and `RunnerSpec.kind` says which op
+    kind each variant implements.
+
+    THE WIRE CARRIES NO ATTRS, which is why the variant has to be resolved HERE,
+    on the host, and why each variant then needs its own entry in `KIND_ID`. The
+    DSP is handed an id and a buffer list; it has no perm, no axis and no
+    activation to branch on, and inventing a field for them would mean the DSP
+    re-deciding something the host already knew. `check_requires` remains the
+    guard for the case where a caller reaches a specific spec directly.
+
+    Refuses ambiguity rather than taking the first match: two variants that both
+    accept an op means the `requires` sets are not actually disjoint, and picking
+    one by dict order would be a coin flip whose outcome is a wrong answer.
+    """
+    cands = [(n, s) for n, s in SPECS.items() if s.kind == kind]
+    if not cands:
+        raise KeyError(
+            f"no kernel implements {kind!r}; known kinds are "
+            f"{sorted({s.kind for s in SPECS.values()})}"
+        )
+    ok = [(n, s) for n, s in cands if s.accepts(attrs)]
+    if len(ok) == 1:
+        return ok[0]
+    if not ok:
+        detail = "; ".join(
+            f"{n} requires {dict(s.requires)}" for n, s in cands
+        )
+        raise ValueError(
+            f"no {kind!r} kernel accepts this op's attrs "
+            f"{ {k: attrs.get(k) for _, s in cands for k, _ in s.requires} }. "
+            f"Candidates: {detail}. Dispatching it to any of them would produce "
+            f"a correctly-shaped wrong answer, so it is refused."
+        )
+    raise ValueError(
+        f"{len(ok)} {kind!r} kernels all accept this op ({[n for n, _ in ok]}); "
+        f"their `requires` sets are not disjoint. Resolving that by dict order "
+        f"would make which kernel runs an accident."
+    )
+
+
 def spec_for(kind: str) -> RunnerSpec | None:
-    return SPECS.get(kind)
+    """The sole variant of `kind`, or None.
+
+    For the standalone-ELF path (`hexlib/exec/hexagon.py`), which predates
+    variants and drives one kernel per kind with no attrs to select on. Returns
+    None rather than guessing when a kind has several variants -- that caller
+    has no attrs, so it genuinely cannot choose, and a guess would be silent.
+    """
+    names = variants_for(kind)
+    if len(names) != 1:
+        return None
+    return SPECS[names[0]]

@@ -125,25 +125,60 @@ class _NeverLaunches:
 # --- F1: `requires` is enforced on the host, because nothing else can ---------
 
 
-def test_run_refuses_a_perm_the_kernel_does_not_implement(tmp_path, monkeypatch):
-    """THE FINDING. `transpose_th_fp16` implements perm (1,0,2). A perm (0,2,1)
-    op has a DIFFERENT output shape, which `_out_shape` computes from the
-    requested perm -- so the byte count matches, the status is OK, and the
-    caller gets an attention layout with the wrong permutation that every
-    downstream shape check accepts.
+def test_run_refuses_a_perm_NO_kernel_implements(tmp_path, monkeypatch):
+    """THE FINDING, with the example moved because the old one got a kernel.
+
+    A transpose op whose perm no kernel implements has a DIFFERENT output shape,
+    which `_out_shape` computes from the REQUESTED perm -- so the byte count
+    matches whatever kernel it lands on, the status is OK, and the caller gets an
+    attention layout with the wrong permutation that every downstream shape check
+    accepts.
 
     The DSP cannot catch this: `hexlib_args` has no field carrying a
     permutation (genentry.py emits an honest comment instead of a check that
     could not fail). So the host is the only place it can be refused, and
     `hexlib/exec/hexagon.py` has always done so -- this path did not.
+
+    WHY THE PERM CHANGED. This used to pass perm (0,2,1), which was then
+    unimplemented. `kernels/transpose_hd_fp16` implements it now, so that op is
+    legitimately accepted and `runner.select` routes it to the second variant --
+    the test was asserting the absence of a kernel, not the guard. (2,1,0) is a
+    real permutation of three axes that no kernel serves, so the guard is still
+    the only thing standing between this call and a wrong answer. The
+    companion below checks the (0,2,1) op is now ROUTED rather than refused,
+    which is what stops this pair from being weakened in the other direction.
     """
     monkeypatch.setattr(dspmod, "run_sim", _NeverLaunches())
     b = _backend(tmp_path)
     x = np.zeros((4, 3, 2), dtype=np.float16)
     with pytest.raises(ValueError, match=r"perm"):
-        b.run("transpose", [x], {"perm": (0, 2, 1)})
+        b.run("transpose", [x], {"perm": (2, 1, 0)})
     assert not os.listdir(tmp_path), (
-        "the batch must not even be written for an op this kernel cannot serve"
+        "the batch must not even be written for an op no kernel can serve"
+    )
+
+
+def test_the_two_transpose_perms_route_to_their_own_kernels(tmp_path, monkeypatch):
+    """The other half: a perm that IS implemented must reach its OWN kernel.
+
+    One op kind, two kernels, and the wire carries no perm -- so the variant is
+    resolved on the host by `runner.select` and then named on the wire by its own
+    `KIND_ID`. Sending KIND_ID["transpose"] for a perm(0,2,1) op would dispatch
+    it to the perm(1,0,2) kernel: right shape, right status, wrong answer, and
+    nothing downstream could tell. So this asserts the mapping directly rather
+    than through a run, because the mapping is the whole mechanism.
+    """
+    from hexlib.exec.runner import select
+    from hexlib.runtime.genentry import KIND_ID
+
+    th_name, th_spec = select("transpose", {"perm": (1, 0, 2)})
+    hd_name, hd_spec = select("transpose", {"perm": (0, 2, 1)})
+
+    assert th_spec.kernel_dir == "kernels/transpose_th_fp16"
+    assert hd_spec.kernel_dir == "kernels/transpose_hd_fp16"
+    assert KIND_ID[th_name] != KIND_ID[hd_name], (
+        "both transpose variants would go on the wire as the same kind id, so "
+        "the DSP would run one kernel for both perms"
     )
 
 
