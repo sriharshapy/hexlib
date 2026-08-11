@@ -1,0 +1,18 @@
+{
+  "task_id": "rope_2d_fp16",
+  "dtype": "fp16",
+  "caps": [],
+  "mechanisms": ["hvx"],
+  "params": {
+    "T": 6,
+    "H": 3,
+    "D": 64,
+    "encoder_shape": "x fp16 [256, 12, 64]; cos/sin fp32 CONST [256, 64]",
+    "encoder_op_count": 24,
+    "pairing": "split-half (i, i+D/2), NEOX-style -- structural.py:253",
+    "table_axes": "cos/sin indexed by (token, head_dim); no head axis -- broadcast across all heads"
+  },
+  "expert_kernel_cycles": null,
+  "tolerance": "hexlib_close_f16",
+  "tags": ["rope", "positional-encoding", "vision", "encoder", "elementwise"]
+}

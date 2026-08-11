@@ -1,0 +1,18 @@
+{
+  "task_id": "softmax_fp16",
+  "dtype": "fp16",
+  "caps": [],
+  "mechanisms": ["hvx"],
+  "params": {
+    "R": 6,
+    "C": 256,
+    "axis": -1,
+    "encoder_shape": "[12, 256, 256], fp16, axis=-1",
+    "encoder_op_count": 12,
+    "encoder_rows_total": 3072,
+    "reductions_vectorised": "mostly (vector max/sum reduction over full 64-lane blocks; scalar only for the C % 64 tail, which the encoder's C=256 never exercises)"
+  },
+  "expert_kernel_cycles": null,
+  "tolerance": "hexlib_close_f16",
+  "tags": ["softmax", "attention", "encoder", "reduce-then-broadcast", "first-rung"]
+}
