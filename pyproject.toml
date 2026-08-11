@@ -16,6 +16,20 @@ hexlib = "hexlib.cli:main"
 include = ["hexlib*"]
 
 [project.optional-dependencies]
+# Everything needed to run the offline test suite. numpy is a hard dependency
+# already; pytest is the only addition. Deliberately NOT listed: pytest-asyncio
+# (no test in this repo is async -- it only appears in local warning output
+# because it happens to be installed in one dev environment), and
+# `qualcomm_device_cloud_sdk`, which is account-gated and imported lazily inside
+# hexlib/device/qdc/job.py so that importing the package never requires it.
+#
+# CI installs THIS extra. It must stay sufficient on its own: `.github/workflows
+# /ci.yml` used to read `pip install -e ".[dev]" || pip install -e . pytest`,
+# intending the second half as a safety net, but no `dev` extra existed and pip
+# treats a missing extra as a WARNING with exit 0 -- so the `||` could never
+# fire and pytest was never installed. The build went red on `No module named
+# pytest` rather than falsely green, but the fallback was doing nothing.
+dev = ["pytest>=8"]
 oracle = ["torch>=2.0", "transformers>=5.10"]
 
 [tool.setuptools.package-data]

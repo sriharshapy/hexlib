@@ -13,7 +13,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -e ".[dev]" || pip install -e . pytest
+      # No `|| pip install -e . pytest` fallback. That was here to be a safety
+      # net and could not be one: pip treats a missing extra as a warning and
+      # exits 0, so with no `dev` extra defined the fallback never ran and
+      # pytest was never installed. The extra is defined in pyproject.toml now
+      # and this install is required to be sufficient by itself.
+      - run: pip install -e ".[dev]"
       - run: python -m pytest -q -m "not sdk"
 
   kernel-contract:
