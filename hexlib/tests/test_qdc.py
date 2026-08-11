@@ -77,6 +77,32 @@ def test_wait_polls_log_files_and_never_job_status(monkeypatch):
     assert calls["logs"] >= 2
 
 
+def test_wait_never_polls_the_jobs_list_either(monkeypatch):
+    # get_jobs_list lagged more than 30 minutes on both jobs observed on
+    # this account -- as dangerous as get_job_status, and nothing stops a
+    # future edit from wiring it into wait() by mistake. This guard exists
+    # so that edit fails a test instead of silently reintroducing the
+    # exact failure mode this module was built to make impossible.
+    calls = {"logs": 0}
+
+    class F:
+        filename = "TestLogs/results.xml"
+
+    def fake_logs(client, job_id):
+        calls["logs"] += 1
+        return [F()] if calls["logs"] >= 2 else []
+
+    def boom(*a, **k):
+        raise AssertionError("get_jobs_list must never be polled")
+
+    monkeypatch.setattr(job, "_client", lambda: object())
+    monkeypatch.setattr(job.qdc_api, "get_job_log_files", fake_logs, raising=False)
+    monkeypatch.setattr(job.qdc_api, "get_jobs_list", boom, raising=False)
+    monkeypatch.setattr(job, "POLL_S", 0)
+    assert job.wait(1234, cap_s=10) is True
+    assert calls["logs"] >= 2
+
+
 def test_wait_returns_false_at_the_cap_rather_than_hanging(monkeypatch):
     monkeypatch.setattr(job, "_client", lambda: object())
     monkeypatch.setattr(job.qdc_api, "get_job_log_files",
@@ -94,6 +120,66 @@ def test_a_job_with_no_results_xml_is_not_complete(monkeypatch):
                         lambda c, j: [F()], raising=False)
     monkeypatch.setattr(job, "POLL_S", 0)
     assert job.wait(1234, cap_s=0) is False
+
+
+def _inject_fake_sdk(monkeypatch, *, get_public_api_client_using_api_key, client_ctor=None):
+    """Inject a fake qualcomm_device_cloud_sdk package into sys.modules so
+    job._client()'s internal lazy imports resolve to fakes -- proving
+    _client()'s default-vs-override branching without the real SDK
+    installed or reachable, and without network access."""
+    import sys
+    import types as _types
+
+    vendor = _types.SimpleNamespace(
+        get_public_api_client_using_api_key=get_public_api_client_using_api_key,
+    )
+    api_pkg = _types.SimpleNamespace(qdc_api=vendor)
+    sdk_pkg = _types.ModuleType("qualcomm_device_cloud_sdk")
+    sdk_pkg.api = api_pkg
+    if client_ctor is not None:
+        sdk_pkg.Client = client_ctor
+
+    monkeypatch.setitem(sys.modules, "qualcomm_device_cloud_sdk", sdk_pkg)
+    monkeypatch.setitem(sys.modules, "qualcomm_device_cloud_sdk.api", api_pkg)
+    monkeypatch.setitem(sys.modules, "qualcomm_device_cloud_sdk.api.qdc_api", vendor)
+
+
+def test_client_uses_the_sdks_default_endpoint_when_not_overridden(monkeypatch):
+    monkeypatch.delenv("QDC_BASE_URL", raising=False)
+    monkeypatch.setenv("QDC_API_KEY", "irrelevant-for-this-test")
+    calls = {}
+
+    def fake_default(**kwargs):
+        calls["kwargs"] = kwargs
+        return "vendor-client"
+
+    _inject_fake_sdk(monkeypatch, get_public_api_client_using_api_key=fake_default)
+    assert job._client() == "vendor-client"
+    assert calls["kwargs"]["api_key_header"] == "irrelevant-for-this-test"
+
+
+def test_client_honors_a_base_url_override_without_the_sdk_default(monkeypatch):
+    monkeypatch.setenv("QDC_BASE_URL", "https://private-tenant.example/qdc")
+    monkeypatch.setenv("QDC_API_KEY", "irrelevant-for-this-test")
+
+    def boom(**kwargs):
+        raise AssertionError(
+            "the SDK's default-endpoint client must not be built when "
+            "QDC_BASE_URL is set"
+        )
+
+    seen = {}
+
+    class FakeClient:
+        def __init__(self, base_url=None, headers=None):
+            seen["base_url"] = base_url
+            seen["headers"] = headers
+
+    _inject_fake_sdk(monkeypatch, get_public_api_client_using_api_key=boom,
+                     client_ctor=FakeClient)
+    job._client()
+    assert seen["base_url"] == "https://private-tenant.example/qdc"
+    assert seen["headers"]["Authorization"] == "irrelevant-for-this-test"
 
 
 def test_the_api_key_is_read_from_the_environment_not_committed(monkeypatch):
