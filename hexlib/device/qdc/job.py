@@ -365,6 +365,24 @@ def _local_log_path(dest: str, name: str) -> str | None:
     Returns None for anything that would escape `dest` -- an absolute path, a
     drive letter, or a `..` component. QDC's own names have never looked like
     that, which is exactly why nothing would notice if one did.
+
+    THE CHECK MUST NOT DEPEND ON THE HOST OS, and it did. This used
+    `os.path.isabs` and `os.path.splitdrive`, both of which are the RUNNING
+    platform's notion of a path. So `C:/Windows/System32/evil.txt` was refused
+    on Windows and ACCEPTED on Linux -- where it is not absolute at all, merely
+    a relative path whose first component happens to be named `C:` -- and the
+    file landed in `dest/C:/Windows/System32/evil.txt`. The mirror case is
+    `/etc/passwd`, absolute on POSIX and not on Windows.
+
+    That asymmetry matters because the two ends run on different systems: the
+    developer machine here is Windows, CI is Linux, and the name being screened
+    arrives from a remote service. A traversal guard that only holds on the
+    platform you happened to test on is the "claim of protection that protects
+    nothing" pattern, in a place where the input is not ours.
+
+    Both flavours are now consulted, so a name is refused if EITHER OS would
+    read it as absolute or drive-qualified, regardless of where this runs.
+    Found by CI on the first push after CI itself was repaired.
     """
     unified = name.replace("\\", "/").strip()
     if not unified:
@@ -372,7 +390,14 @@ def _local_log_path(dest: str, name: str) -> str | None:
     parts = [p for p in unified.split("/") if p not in ("", ".")]
     if not parts or any(p == ".." for p in parts):
         return None
-    if os.path.isabs(unified) or os.path.splitdrive(unified)[0]:
+    for flavour in (pathlib.PureWindowsPath, pathlib.PurePosixPath):
+        p = flavour(unified)
+        if p.is_absolute() or p.anchor or p.drive:
+            return None
+    # A bare drive-relative name (`C:foo`) has no anchor under PureWindowsPath
+    # but still names a drive, and a component containing `:` cannot be a
+    # legitimate QDC log path segment on any platform we target.
+    if any(":" in p for p in parts):
         return None
     return os.path.join(dest, *parts)
 
