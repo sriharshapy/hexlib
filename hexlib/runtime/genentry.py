@@ -141,6 +141,18 @@ def _scalar_expr(sc: Scalar, spec: RunnerSpec, param_index: int) -> str:
     if src.startswith("dim:"):
         _, i, axis = src.split(":")
         return f"(int) a->ne[{i}][{axis}]"
+    if src.startswith("rows:"):
+        # numel / ne[axis], both from the tensor's OWN extents. `ne` is padded to
+        # four with ones, so this is exact for any rank -- and the axis is named
+        # rather than inferred because "the last axis" of a rank-3 tensor is
+        # ambiguous once the padding is there. A zero extent would divide by
+        # zero, so the guard is emitted alongside rather than assumed away: a
+        # batch declaring ne[axis] = 0 is malformed, and the DSP says so.
+        _, i, axis = src.split(":")
+        return (
+            f"(a->ne[{i}][{axis}] ? (int) ((a->ne[{i}][0] * a->ne[{i}][1] * "
+            f"a->ne[{i}][2] * a->ne[{i}][3]) / a->ne[{i}][{axis}]) : 0)"
+        )
     raise GenError(f"unknown scalar source {src!r} in spec for {spec.kind}")
 
 

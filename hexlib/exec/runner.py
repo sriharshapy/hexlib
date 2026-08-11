@@ -150,11 +150,22 @@ def raw_bytes(kind: str, idx: int, dtype: str, value) -> bytes:
 class Scalar:
     """One value in the header.
 
-    `source` is either 'attr:<name>' (read from the op's attrs), 'numel:<i>'
-    (the element count of input i), or 'dim:<i>:<axis>' (one dimension of input
-    i). Those three cover every kernel in the encoder without letting a spec
-    smuggle in arbitrary host-side computation, which would put logic somewhere
-    no kernel test looks.
+    `source` is one of:
+      'attr:<name>'      read from the op's attrs
+      'numel:<i>'        the element count of input i
+      'dim:<i>:<axis>'   one dimension of input i
+      'rows:<i>:<axis>'  input i's element count divided by that axis
+
+    These four cover every kernel in the encoder without letting a spec smuggle
+    in arbitrary host-side computation, which would put logic somewhere no kernel
+    test looks.
+
+    `rows:` EXISTS FOR LAST-AXIS REDUCTIONS OVER A RANK-3 TENSOR. `softmax` is
+    called on fp16 (12, 256, 256) with axis -1, and its kernel takes (R, C) --
+    3072 rows of 256. R is the PRODUCT of two axes, which no single `dim:` can
+    give, and `numel:` alone cannot either. The axis is named rather than assumed
+    to be the last one, because `ne` is padded to four with ones and "the last
+    axis" of a rank-3 tensor is then ambiguous between index 2 and index 3.
     """
 
     source: str
@@ -173,9 +184,19 @@ class Scalar:
         if kind == "dim":
             idx, _, axis = rest.partition(":")
             return int(arrays[int(idx)].shape[int(axis)])
+        if kind == "rows":
+            idx, _, axis = rest.partition(":")
+            a = arrays[int(idx)]
+            extent = int(a.shape[int(axis)])
+            if extent <= 0:
+                raise ValueError(
+                    f"runner scalar {self.source!r}: axis {axis} of input {idx} "
+                    f"has extent {extent}, so rows cannot be computed"
+                )
+            return int(a.size) // extent
         raise ValueError(
             f"unknown runner scalar source {self.source!r}; expected attr:, "
-            "numel: or dim:"
+            "numel:, dim: or rows:"
         )
 
 
@@ -410,6 +431,68 @@ SPECS: dict[str, RunnerSpec] = {
             "`requires` is the disjoint half of `transpose`'s: between them the "
             "two cover all 60 ops and no op matches both, which `select` "
             "verifies by refusing ambiguity."
+        ),
+    ),
+    "softmax": RunnerSpec(
+        kind="softmax",
+        kernel_dir="kernels/softmax_fp16",
+        inputs=("fp16",),
+        out_dtype="fp16",
+        scalars=(
+            Scalar("rows:0:2", "int"),   # R = numel / C = 12*256 = 3072
+            Scalar("dim:0:2", "int"),    # C = 256, the reduced axis
+        ),
+        requires=(("axis", -1),),
+        notes=(
+            "12 ops, all one signature: fp16 (12,256,256) with axis -1, i.e. 3072 "
+            "independent rows of 256. Attention softmax, over the QK^T scores.\n"
+            "FIRST USE OF `rows:`, and the reason it exists: the kernel takes "
+            "(R, C) and R is the PRODUCT of the two leading axes, which no single "
+            "`dim:` can express. The axis is named rather than taken to be the "
+            "last, because `ne` is padded to four with ones and 'the last axis' "
+            "of a rank-3 tensor is then ambiguous between index 2 and 3.\n"
+            "`requires` pins axis=-1. softmax is a general op kind and softmax "
+            "along any other axis is a different kernel -- and with the last two "
+            "dims both 256, a wrong-axis result has the SAME SHAPE and byte count, "
+            "so nothing downstream could catch it. The kernel's own harness is "
+            "6x256 for exactly that reason.\n"
+            "Uses hvx_vec_exp_f32, NOT hvx_vec_exp2_f16, whose E5 coefficient is "
+            "wrong upstream (0x5082 for 0x090c, 262% error at frac 0.7). 11292 "
+            "cycles at the gate shape; max and sum reductions are vectorised, "
+            "with a scalar tail for C % 64 that C=256 never reaches."
+        ),
+    ),
+    "rope_2d": RunnerSpec(
+        kind="rope_2d",
+        kernel_dir="kernels/rope_2d_fp16",
+        inputs=("fp16", "fp32", "fp32"),
+        out_dtype="fp16",
+        scalars=(
+            Scalar("dim:0:0", "int"),    # T = 256 tokens
+            Scalar("dim:0:1", "int"),    # H = 12 heads
+            Scalar("dim:0:2", "int"),    # D = 64 head_dim
+        ),
+        notes=(
+            "24 ops, all one signature: fp16 (256,12,64) against fp32 (256,64) "
+            "cos and sin tables. Second op here with three inputs and mixed input "
+            "dtypes, after layernorm.\n"
+            "THE PAIRING IS SPLIT-HALF -- i with i + D/2, GPT-NeoX style -- read "
+            "off hexlib/graph/opdefs/structural.py:253, where the registry builds "
+            "concat(-x[..., half:], x[..., :half]). NOT adjacent pairs. A wrong "
+            "pairing is a correctly-shaped wrong answer, so it was checked against "
+            "two independent implementations as well: forge2's verified reference "
+            "for this exact shape, and llama.cpp's hvx_rope_neox_f32_aa (which "
+            "HTP_ROPE_TYPE_VISION routes to). All three agree sign for sign.\n"
+            "No `requires`: the tables carry the position encoding, so there is no "
+            "attr that could select a different kernel. Note the tables are "
+            "indexed by token and head_dim but NOT by head -- the same rotation "
+            "applies to every head at a given token, and a near-miss that indexes "
+            "them by head is one of the six the harness rejects.\n"
+            "1212 cycles, fully vectorised with no scalar remainder: split-half "
+            "makes both halves contiguous runs, so the rotation needs no "
+            "deinterleave, and unlike layernorm this op has no reduction at all. "
+            "D=64 is the only head_dim the encoder uses; other D fall back to a "
+            "correct scalar loop."
         ),
     ),
     "layernorm": RunnerSpec(
