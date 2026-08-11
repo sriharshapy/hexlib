@@ -166,10 +166,25 @@ class Scalar:
     give, and `numel:` alone cannot either. The axis is named rather than assumed
     to be the last one, because `ne` is padded to four with ones and "the last
     axis" of a rank-3 tensor is then ambiguous between index 2 and index 3.
+
+    `codes` TURNS A NON-NUMERIC ATTR INTO AN int PARAM, which `matmul_epilogue`
+    needs: fusion folds `gelu_tanh` and `gelu_erf` into its `act` attr (see
+    `graph/fuse.py`'s `FUSABLE_ACTS`), so the attr is a STRING and the wire
+    carries only ints and floats. `int("gelu_tanh")` raises, and the alternative
+    -- three separate kernels selected by `requires` -- would triple a 75-op
+    kernel to spare one switch.
+
+    It is a tuple of pairs rather than a dict because `Scalar` is frozen and
+    hashable. THE MAPPING BELONGS BESIDE THE KERNEL THAT DECODES IT: these
+    numbers are a contract with one kernel's `kernel_api.h`, not a project-wide
+    enum, and an unmapped value is refused rather than defaulted -- silently
+    sending 0 for an unknown activation means running the wrong epilogue and
+    getting a correctly-shaped wrong answer.
     """
 
     source: str
     ctype: str = "int"
+    codes: tuple[tuple[str, int], ...] = ()
 
     def value(self, arrays: tuple[np.ndarray, ...], attrs: Mapping[str, Any]) -> Any:
         kind, _, rest = self.source.partition(":")
@@ -178,7 +193,18 @@ class Scalar:
                 raise KeyError(
                     f"runner scalar wants attr {rest!r}; op attrs are {sorted(attrs)}"
                 )
-            return attrs[rest]
+            value = attrs[rest]
+            if self.codes:
+                table = dict(self.codes)
+                if value not in table:
+                    raise ValueError(
+                        f"runner scalar {self.source!r}: {value!r} is not one of "
+                        f"{sorted(table)}. Refused rather than defaulted -- "
+                        f"sending a code this kernel does not implement runs the "
+                        f"wrong branch and returns a correctly-shaped wrong answer."
+                    )
+                return table[value]
+            return value
         if kind == "numel":
             return int(arrays[int(rest)].size)
         if kind == "dim":
