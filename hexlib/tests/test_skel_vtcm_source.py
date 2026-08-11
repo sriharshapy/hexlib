@@ -10,6 +10,15 @@ and moving `ctx->vtcm_needs_release = 1;` into `hexlib_vtcm_alloc` passed,
 because `callback_body = src[:registered_at]` was not a body at all -- it was
 the whole file up to the registration call, so anything defined above it
 counted. Both are now scoped to the function whose behaviour is claimed.
+
+AND (3) -- FOUND LATER, AT THE MERGE GATE -- BOTH OF THOSE FIXES LEANED ON
+FUNCTION SCOPE WHILE `csource` STILL HANDED STRING LITERALS BACK INTACT, so the
+FARF vector described in (1) was never actually closed for anything: any
+`X in body` check here remained satisfiable by a format string, and a `}`
+inside one truncated any slice. Literals are blanked now (see csource.py). The
+remaining hole of the same shape is that a scoped negative cannot see a
+construct moved into a helper, so `release_callback`'s "must not release VTCM
+itself" is stated as an exhaustive callee set rather than two named bans.
 """
 import pathlib
 import re
@@ -18,6 +27,7 @@ import pytest
 
 from hexlib.tests.csource import block_after_call as _block_after_call
 from hexlib.tests.csource import block_from as _block_from
+from hexlib.tests.csource import calls as _calls
 from hexlib.tests.csource import code_only as _code_only
 from hexlib.tests.csource import function_body as _function_body
 
@@ -145,6 +155,19 @@ def test_a_release_callback_is_registered(src):
         "release_callback must record the reclaim request by setting "
         "ctx->vtcm_needs_release = 1 -- if some other function sets it, the "
         "reclaim request itself is being dropped on the floor"
+    )
+    # THE CALLBACK CALLS NOTHING AT ALL, which is both what the C actually does
+    # and the only form of this claim a rename cannot dodge. The two named bans
+    # this replaces asked "does this body mention either release function", and
+    # the answer is no the moment the release moves into a helper the callback
+    # calls -- the same escape proven against skel_dispatch.c's pcycle wrapper.
+    # Releasing from here frees memory the batch in flight is still reading.
+    assert _calls(callback_body) == set(), (
+        f"release_callback must only RECORD the request: it runs on "
+        f"HAP_compute_res's own QuRT thread while a batch may be mid-op, so "
+        f"anything it calls is a candidate for freeing memory a kernel is "
+        f"still using. Releasing is the dispatcher's job at an op boundary. "
+        f"Found calls to {_calls(callback_body)!r}"
     )
     assert "HAP_compute_res_release(" not in callback_body
     assert "HAP_compute_res_release_cached(" not in callback_body

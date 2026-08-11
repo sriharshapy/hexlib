@@ -21,6 +21,33 @@ the extracted body -- which is exactly how a proven mutation of skel_bufs.c
 kept test_skel_bufs_source.py at 8 passed while deleting the branch's central
 invariant. `test_*_returns_comment_blanked_text*` below pin that half: each
 one fails against the old, non-stripping implementation.
+
+THE THIRD PROPERTY, AND WHY THIS FILE'S OWN FIRST TEST USED TO ENCODE THE BUG.
+Everything above was about COMMENTS, and this file had ZERO coverage of string
+literals -- all twelve tests used comments only. Worse, its first test asserted
+`'"not a // comment or /* one */ either"' in stripped`: it pinned literal
+PRESERVATION as the property to protect. Preservation is right for one narrow
+purpose (a literal must be recognized and consumed as one token, so a `//`
+inside it is not misread as a comment start) and wrong for the two purposes
+that actually matter to every consumer -- brace counting, and the payload text
+handed back. A merge-gate review showed literals were the comment hole in a
+different vehicle, in three distinct mechanisms, each reproduced against the
+then-current code and each pinned by its own test below:
+
+  (A) a positive check satisfied by a FARF/printf format string while the real
+      code is deleted -- `test_*_blanks_a_log_lines_payload*`;
+  (B) a `}` inside a literal truncating a brace-depth slice, so every negative
+      check after it is answered by a fragment -- `test_*_not_truncated_by_a_
+      closing_brace_in_a_literal`;
+  (C) a `{` inside a literal extending a block past its real end, destroying
+      the scoping the whole module exists to provide -- `test_block_from_is_
+      not_extended_by_an_opening_brace_in_a_literal`.
+
+Each of those fails against the literal-preserving implementation. The narrow
+purpose preservation was right for is pinned separately, in
+`test_a_comment_lookalike_inside_a_literal_is_not_a_comment_start`: the
+literal's PAYLOAD is blanked, and the code after it still survives, which is
+only possible if the `//` inside it was never treated as a comment start.
 """
 import pathlib
 import re
@@ -29,23 +56,91 @@ from hexlib.tests.csource import (
     block_after_call,
     block_from,
     code_only,
+    code_only_keeping_strings,
     function_body,
-    strip_comments,
 )
 
 
-def test_strip_comments_blanks_comments_but_preserves_length_and_strings():
+def test_code_only_blanks_comments_preserving_length():
     src = (
         '/* block\n comment */int x = 1; // trailing\n'
-        'const char *s = "not a // comment or /* one */ either";\n'
+        'int y = 2;\n'
     )
-    stripped = strip_comments(src)
+    stripped = code_only(src)
     assert len(stripped) == len(src)
     assert "block" not in stripped
     assert "trailing" not in stripped
-    # the string literal (including its embedded comment-lookalikes) survives
-    assert '"not a // comment or /* one */ either"' in stripped
     assert "int x = 1;" in stripped
+    assert "int y = 2;" in stripped
+
+
+def test_a_comment_lookalike_inside_a_literal_is_not_a_comment_start():
+    """THE NARROW PROPERTY LITERAL PRESERVATION WAS ACTUALLY FOR, kept, while
+    the payload is blanked. This is what this file's first test used to get
+    backwards: it asserted the whole literal SURVIVED.
+
+    A `//` inside a string must not be mistaken for a comment start -- if it
+    were, everything after it on that line (here, the statement terminator and
+    the following line's code) would be blanked away too. So the literal has to
+    be recognized and consumed as ONE token. What is written back for that
+    token is a separate question, and the answer is: delimiters kept, interior
+    blanked. Both halves are asserted here, and the second half fails against
+    the implementation that returned literals untouched."""
+    src = (
+        'const char *s = "not a // comment or /* one */ either";\n'
+        'int after = 1;\n'
+    )
+    out = code_only(src)
+    assert len(out) == len(src)
+    # Consumed as one token: the code after the literal is still there, which
+    # could not be true if the `//` inside it had started a comment.
+    assert "int after = 1;" in out
+    assert 'const char *s =' in out
+    # ... and it is still visibly a literal, so "a string is present here" is
+    # still answerable -- only its contents are gone.
+    assert out.count('"') == 2
+    # The payload, on the other hand, must not be readable as code.
+    assert "comment" not in out
+    assert "either" not in out
+
+
+def test_code_only_keeping_strings_is_the_deliberate_escape_hatch():
+    """The escape hatch really does return the literal, for the few checks
+    whose subject IS literal text -- and it still blanks comments, so it is
+    never a way back to raw source."""
+    src = '/* a note */ printf("PASS (%d values)"); // trailing\n'
+    out = code_only_keeping_strings(src)
+    assert len(out) == len(src)
+    assert '"PASS (%d values)"' in out
+    assert "a note" not in out
+    assert "trailing" not in out
+    # And the two views are interchangeable in either order, so a fixture built
+    # with one can be re-blanked by a slicer using the other.
+    assert code_only(out) == code_only(src)
+    assert code_only_keeping_strings(code_only(src)) == code_only(src)
+
+
+def test_an_include_header_name_is_not_a_string_literal_and_survives():
+    """`#include "HAP_perf.h"` is a header-name token, not a string literal:
+    no escapes, no concatenation, and it cannot be used to hide code because it
+    has to name a file that exists for the translation unit to compile. So it
+    survives `code_only`, and test_skel_dispatch_source.py's check that the SDK
+    header is really INCLUDED (rather than named in a comment) needs no escape
+    hatch."""
+    src = (
+        '#include "HAP_perf.h"\n'
+        "#include <string.h>\n"
+        '  #  include "skel_internal.h"\n'
+        'const char *s = "HAP_perf.h";\n'
+    )
+    out = code_only(src)
+    assert len(out) == len(src)
+    assert '#include "HAP_perf.h"' in out
+    assert "#include <string.h>" in out
+    assert '#  include "skel_internal.h"' in out
+    # But a plain literal that merely SPELLS a header name is still blanked --
+    # the exemption is for the directive, not for the text.
+    assert out.count("HAP_perf.h") == 1
 
 
 def test_function_body_is_not_derailed_by_a_comment_naming_it_first():
@@ -212,6 +307,201 @@ def test_block_after_call_returns_comment_blanked_text_by_default():
     assert "rc = 0;" in block
 
 
+# ==============================================================================
+# MECHANISM (A): the payload of a log line is not code. `assert "TOKEN" in
+# body` must not be satisfiable by `FARF(HIGH, "TOKEN")` with the real code
+# deleted. Reproduced on skel_bufs.c (`b->base = 0;` demoted to a FARF printing
+# that text, `b->base = m->base;` deleted) and on skel_dispatch.c (the
+# total_size guard logging HEXLIB_DSP_ERR_TRUNCATED and falling through).
+# ==============================================================================
+
+
+def test_function_body_blanks_a_log_lines_payload_by_default():
+    src = (
+        "int guard(struct buf *b) {\n"
+        '    FARF(HIGH, "b->base = 0; return HEXLIB_DSP_ERR_UNMAPPED;");\n'
+        "    return 0;\n"
+        "}\n"
+    )
+    body = function_body(src, "guard")
+    assert "HEXLIB_DSP_ERR_UNMAPPED" not in body, (
+        "a status constant named only inside a format string must not satisfy "
+        "a payload check on the body"
+    )
+    assert not re.search(r"return\s+HEXLIB_DSP_ERR_\w+\s*;", body)
+    assert not re.search(r"b->base\s*=\s*0\s*;", body), (
+        "an assignment spelled out inside a log message is not an assignment"
+    )
+    # The call itself is still visible -- only its payload is gone, so a check
+    # that the LOGGING happens is still possible.
+    assert "FARF(HIGH," in body
+    assert "return 0;" in body
+    assert len(body) == len(function_body(src, "guard", strip=False))
+
+
+def test_block_from_blanks_a_log_lines_payload_by_default():
+    text = (
+        "if (hdr.total_size != len) {\n"
+        '    FARF(ERROR, "hexlib: HEXLIB_DSP_ERR_TRUNCATED size mismatch");\n'
+        "}\n"
+    )
+    block = block_from(text, text.index(")"))
+    assert "HEXLIB_DSP_ERR_TRUNCATED" not in block, (
+        "the guard block must not be able to report a status by logging its "
+        "name -- that is the fall-through mutation this pins"
+    )
+    assert "FARF(ERROR," in block
+
+
+def test_block_after_call_blanks_a_log_lines_payload_by_default():
+    body = (
+        "int rc = real_call(a, b);\n"
+        "if (rc != 0) {\n"
+        '    FARF(ERROR, "returning return HEXLIB_DSP_ERR_INTERNAL; now");\n'
+        "    rc = 0;\n"
+        "}\n"
+    )
+    block = block_after_call(body, "real_call")
+    assert not re.search(r"return\s+HEXLIB_DSP_ERR_\w+\s*;", block), (
+        "a status named in a log message must not count as propagating it"
+    )
+    assert "rc = 0;" in block
+
+
+# ==============================================================================
+# MECHANISM (B): a `}` inside a literal must not truncate a brace-depth slice.
+# Reproduced on skel_dispatch.c: `hexlib_read_pcycle` reverted to
+# `__asm__("%0 = c15:14")` hidden behind `FARF(HIGH, "pcycle }")`, which made
+# every "this must NOT appear here" check in the wrapper look at a fragment
+# ending at the literal's brace. 12 passed.
+# ==============================================================================
+
+
+def test_function_body_is_not_truncated_by_a_closing_brace_in_a_literal():
+    src = (
+        "static uint64_t read_pcycle(void) {\n"
+        "    uint64_t v = 0;\n"
+        '    FARF(HIGH, "hexlib: pcycle }");\n'
+        '    __asm__ __volatile__("%0 = c15:14" : "=r"(v));\n'
+        "    return v;\n"
+        "}\n"
+    )
+    body = function_body(src, "read_pcycle")
+    assert "__asm__" in body, (
+        "code after a literal containing `}` must still be inside the body -- "
+        "otherwise every negative check on this function is answered by a "
+        "fragment that stops at the literal"
+    )
+    assert "return v;" in body
+    assert body.rstrip().endswith("}")
+    assert body.count("{") == 1 and body.count("}") == 1, (
+        "the literal's brace must have been blanked, not counted"
+    )
+
+
+def test_a_brace_in_a_char_literal_does_not_truncate_a_body_either():
+    """The single-quoted form of the same thing -- and the one shape that can
+    turn up in real code without anybody trying (`if (c == '}')`)."""
+    src = (
+        "int f(char c) {\n"
+        "    if (c == '}') return 1;\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    body = function_body(src, "f")
+    assert "return 0;" in body
+    assert body.count("}") == 1
+
+
+def test_block_from_is_not_truncated_by_a_closing_brace_in_a_literal():
+    text = (
+        "if (ctx->vtcm_needs_release) {\n"
+        '    FARF(HIGH, "reclaim }");\n'
+        "    hexlib_vtcm_release(ctx);\n"
+        "}\n"
+    )
+    block = block_from(text, text.index(")"))
+    assert "hexlib_vtcm_release(ctx);" in block
+    assert block.count("{") == 1 and block.count("}") == 1
+
+
+# ==============================================================================
+# MECHANISM (C): a `{` inside a literal must not extend a block past its real
+# end. The mirror image of (B), and the one that destroys scoping: an
+# `if`-block check would see the whole rest of the function.
+# ==============================================================================
+
+
+def test_block_from_is_not_extended_by_an_opening_brace_in_a_literal():
+    text = (
+        "if (x) {\n"
+        '    FARF(HIGH, "entering {");\n'
+        "    inside_the_block();\n"
+        "}\n"
+        "after_the_block();\n"
+        "if (y) {\n"
+        "    return HEXLIB_DSP_ERR_INTERNAL;\n"
+        "}\n"
+    )
+    block = block_from(text, text.index(")"))
+    assert "inside_the_block();" in block
+    assert "after_the_block();" not in block, (
+        "a `{` inside a literal must not make the block swallow the code "
+        "after it -- that is scoping destroyed, and the whole reason these "
+        "checks are block-scoped rather than function-wide"
+    )
+    assert "HEXLIB_DSP_ERR_INTERNAL" not in block
+    assert block.count("{") == 1 and block.count("}") == 1
+
+
+def test_block_after_call_is_not_derailed_by_a_literal_naming_the_call():
+    """A literal that mentions the call by name, with its own parens and its
+    own `{`, sits BEFORE the real call. With literals preserved, the call-site
+    search lands inside the format string, the paren-walk closes on the
+    literal's own `)`, and the block search picks up the literal's `{` -- so
+    the block returned has nothing to do with checking the call's result."""
+    body = (
+        '    FARF(ERROR, "real_call() failed { ");\n'
+        "    int rc = real_call(a, b);\n"
+        "    if (rc != 0) {\n"
+        "        return HEXLIB_DSP_ERR_INTERNAL;\n"
+        "    }\n"
+    )
+    block = block_after_call(body, "real_call")
+    assert "HEXLIB_DSP_ERR_INTERNAL" in block
+    assert block.count("{") == 1 and block.count("}") == 1
+
+
+# ==============================================================================
+# The escape hatch, end to end: `keep_strings=True` returns literal text but
+# must NOT move a boundary, because boundaries are always found in the fully
+# blanked view.
+# ==============================================================================
+
+
+def test_keep_strings_returns_literals_without_moving_any_boundary():
+    src = (
+        "static void usage(void) {\n"
+        '    printf("  --unmapped }\\n");\n'
+        "    printf(\"  --coherency-check {\\n\");\n"
+        "    return;\n"
+        "}\n"
+    )
+    body = function_body(src, "usage", keep_strings=True)
+    assert "--unmapped" in body and "--coherency-check" in body, (
+        "the escape hatch must actually hand back the literal text"
+    )
+    assert "return;" in body, (
+        "and the literals' own braces must still not truncate or extend the "
+        "slice -- boundaries come from the fully blanked view either way"
+    )
+    # Same boundaries as the default view, so an offset found in one is valid
+    # in the other. This is what lets a consumer locate a flag string in the
+    # literal-bearing view and brace-slice the block in the blanked one.
+    assert len(body) == len(function_body(src, "usage"))
+    assert len(body) == len(function_body(src, "usage", strip=False))
+
+
 def test_no_test_file_carries_its_own_private_copy_of_the_slicer():
     """THE CONSOLIDATION CLAIM, MADE SELF-ENFORCING RATHER THAN PROMISED.
     csource.py's docstring asserted the consolidation was complete while two
@@ -222,12 +512,16 @@ def test_no_test_file_carries_its_own_private_copy_of_the_slicer():
     A private copy is a `def` of one of these names in any hexlib/tests module
     other than csource.py itself. An `import ... as _function_body` alias is
     not a copy and is the intended usage, so only `def` is matched.
+    `strip_comments` stays on this list although `csource` no longer exports it:
+    it was the name of the comments-only transformation, and a test file
+    growing its own `_strip_comments` again is the same regression whether or
+    not the shared module still has that name.
     `_macro_body` in test_host_source.py is deliberately excluded: it slices a
     backslash-continued `#define`, which brace counting cannot do, and its own
     docstring says why it is a narrowly-scoped sibling rather than a fourth
     slicer."""
-    shared = ("strip_comments", "code_only", "function_body", "block_from",
-              "block_after_call")
+    shared = ("strip_comments", "code_only", "code_only_keeping_strings",
+              "calls", "function_body", "block_from", "block_after_call")
     here = pathlib.Path(__file__).parent
     offenders = []
     for path in sorted(here.glob("test_*.py")):
@@ -246,9 +540,16 @@ def test_no_test_file_carries_its_own_private_copy_of_the_slicer():
 def test_code_only_is_the_whole_file_form_of_the_same_guarantee():
     """`code_only` is what a whole-file fixture goes through before any
     payload check runs against it -- same blanking, same length, so a
-    constant or a call named only in a comment cannot satisfy (or trip) a
-    file-wide check."""
+    constant or a call named only in a comment (or in a log message) cannot
+    satisfy (or trip) a file-wide check."""
     src = '/* calls HAP_mmap() here */\nint f(void) { return 0; }\n'
     assert "HAP_mmap" not in code_only(src)
     assert len(code_only(src)) == len(src)
     assert "int f(void) { return 0; }" in code_only(src)
+
+    logged = 'int f(void) { FARF(ERROR, "HAP_mmap failed"); return 0; }\n'
+    assert "HAP_mmap" not in code_only(logged), (
+        "a whole-file fixture must not be able to satisfy a presence check "
+        "with a log message either"
+    )
+    assert len(code_only(logged)) == len(logged)

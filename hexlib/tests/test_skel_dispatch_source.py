@@ -18,6 +18,23 @@ happened during development of this file (a comment in the invoke-before-start
 refusal that named `hexlib_dispatch_batch` in prose briefly failed
 test_invoke_before_start_is_refused for exactly that reason).
 
+AND SO ARE STRING LITERALS, AS OF THE MERGE-GATE REVIEW THAT FOUND THEM DOING
+THE SAME JOB. `csource.code_only` used to hand literals back intact, so this
+file's whole promise above was available in a second vehicle: the total_size
+guard could log HEXLIB_DSP_ERR_TRUNCATED and fall through (12 passed), and a
+`}` inside `FARF(HIGH, "pcycle }")` truncated `function_body`'s slice so the
+"no raw register read here" negatives were answered by a fragment that stopped
+at the literal (12 passed, with `__asm__("%0 = c15:14")` back in the wrapper).
+Both are fixed in `csource`; see its docstring.
+
+FUNCTION SCOPE IS NOT REACHABILITY, WHICH IS THE THIRD THING THIS FILE HAD
+WRONG. Moving the raw register read into a new `hexlib_raw_pcycle()` helper
+that `hexlib_read_pcycle` calls left this file at 12 passed with no comment or
+literal trick at all -- a scoped negative cannot see a rename. Every negative
+here is now paired with either a whole-FILE ban (for a construct that must not
+exist anywhere) or an exhaustive `csource.calls()` set (for one that must not
+be REACHED from a particular block).
+
 THE SLICER IS SHARED, NOT COPIED. This file carried its own private
 `_strip_comments`/`_function_body`/`_brace_block` -- the third copy of the
 slicer `hexlib/tests/csource.py` was written to consolidate, and a WEAKER one:
@@ -35,6 +52,7 @@ import re
 import pytest
 
 from hexlib.tests.csource import block_from as _block_from
+from hexlib.tests.csource import calls as _calls
 from hexlib.tests.csource import code_only as _code_only
 from hexlib.tests.csource import function_body as _function_body
 
@@ -87,7 +105,23 @@ def test_total_size_is_checked_against_the_actual_length(d):
     m = re.search(r"if\s*\(\s*hdr\.total_size\s*!=\s*len\s*\)\s*\{", body)
     assert m, "no guard comparing hdr.total_size against the actual length"
     guard = _block_from(body, m.end() - 1)
-    assert "HEXLIB_DSP_ERR_TRUNCATED" in guard
+    # WAS `assert "HEXLIB_DSP_ERR_TRUNCATED" in guard`, which is the bare-token
+    # check this file's own docstring says it does not do: a guard that FARFs
+    # the constant's name and FALLS THROUGH satisfied it (12 passed), letting a
+    # batch whose declared size disagrees with its actual length go on to be
+    # walked. Both halves of reporting are now required, in the shapes the
+    # docstring promises -- the header-writer call the host reads its status
+    # from, and the return that stops the walk.
+    assert re.search(
+        r"hexlib_write_rsp_hdr\s*\([^;]*HEXLIB_DSP_ERR_TRUNCATED", guard
+    ), (
+        "the length disagreement must be written into the response header the "
+        "host actually reads, not merely logged"
+    )
+    assert re.search(r"return\s+HEXLIB_DSP_ERR_TRUNCATED\s*;", guard), (
+        "and it must RETURN -- a guard that reports and then falls through "
+        "walks the batch anyway, which is the whole thing this check is for"
+    )
 
 
 def test_the_cycle_counter_is_read_through_the_sdks_own_api(d):
@@ -106,10 +140,22 @@ def test_the_cycle_counter_is_read_through_the_sdks_own_api(d):
     PD instead of an indistinguishable bug of ours.
 
     BOTH HALVES ARE ASSERTED, and both are scoped to the wrapper's own body
-    (comments already blanked by `code_only`), so neither can be satisfied by
-    prose: the SDK call must be PRESENT, and the raw register read must be
-    ABSENT. A revert to inline asm fails the second half even if the first is
-    left behind as dead code."""
+    (comments and literals already blanked by `code_only`), so neither can be
+    satisfied by prose or by a log line: the SDK call must be PRESENT, and the
+    raw register read must be ABSENT. A revert to inline asm fails the second
+    half even if the first is left behind as dead code.
+
+    AND THE NEGATIVE HALF IS ALSO ASSERTED AT FILE SCOPE, WHICH IS THE ONLY
+    SCOPE THAT MEANS ANYTHING FOR IT. A scoped negative asks "is the forbidden
+    construct in THIS function", and the answer is no as soon as it is moved
+    into a helper this function calls -- proven, and it needed no comment and no
+    string literal: `hexlib_raw_pcycle()` holding the `__asm__` while
+    `hexlib_read_pcycle` called it (with a dead `if (0)` branch keeping the
+    positive half green) left this file at 12 passed, with the wrapper reading a
+    register that cannot advance in the PD the skel actually runs in. The claim
+    was never really about this function: it is that NOTHING in this
+    translation unit reads the counter by hand. So it is checked that way, over
+    the whole comment- and literal-blanked file."""
     body = _function_body(d, "hexlib_read_pcycle")
     assert re.search(r"\bHAP_perf_get_pcycles\s*\(\s*\)", body), (
         "hexlib_read_pcycle must read the counter through the SDK's own "
@@ -123,7 +169,27 @@ def test_the_cycle_counter_is_read_through_the_sdks_own_api(d):
     assert "c15:14" not in body and "C15:14" not in body, (
         f"no raw register read may survive in this wrapper: {body!r}"
     )
+    # THE SAME TWO BANS, AT FILE SCOPE. `d` is comment- AND literal-blanked, so
+    # this file's own header comment discussing the `__asm__("%0 = c15:14")` it
+    # replaced does not trip these, and neither would a FARF quoting it.
+    assert "c15:14" not in d and "C15:14" not in d, (
+        "no raw c15:14 read may survive anywhere in skel_dispatch.c -- moving "
+        "it into a helper the wrapper calls is the same bug with a new name"
+    )
+    assert "asm" not in d, (
+        "no inline asm anywhere in skel_dispatch.c: the counter's one legal "
+        "read is HAP_perf_get_pcycles(), and a hand-rolled read one call level "
+        "away is still a hand-rolled read"
+    )
+    # And the wrapper must be the ONLY thing that reads the counter, so the
+    # bracketing test below is measuring what it thinks it is.
+    assert _calls(body) == {"HAP_perf_get_pcycles"}, (
+        f"hexlib_read_pcycle must call the SDK's reader and nothing else -- an "
+        f"extra callee here is where a hand-rolled read hides: {_calls(body)!r}"
+    )
     # And the include that makes it legal, in code rather than in a comment.
+    # (`#include "HAP_perf.h"` is a header-name, not a string literal, so
+    # `code_only` leaves it intact on purpose -- see csource.py.)
     assert re.search(r'#\s*include\s+"HAP_perf\.h"', d), (
         "HAP_perf.h must actually be included, not merely referred to"
     )
@@ -153,7 +219,20 @@ def test_pcycle_brackets_only_the_kernel_call(d):
     assert len(calls) >= 2, "expected at least a before/after pair of calls"
     lo, hi = calls[0], calls[-1]
     between = body[lo:hi]
-    assert "->fn(" in between, "the kernel call must be inside the bracket"
+    assert re.search(r"\bk->fn\s*\(", between), (
+        "the kernel call must be inside the bracket -- and it must be the call "
+        "through the table's own function pointer, not merely the text `->fn(`"
+    )
+    # THE EXHAUSTIVE CALLEE SET, NOT THREE NAMED BANS. The three below were
+    # named because they were the three things that existed when this was
+    # written; anything else that got moved between the reads -- including a
+    # one-line helper wrapping the resolve, which is exactly how the same
+    # escape was proven against the pcycle wrapper above -- would have gone
+    # unnoticed while inflating every measured cycle count on silicon.
+    assert _calls(between) == {"hexlib_read_pcycle", "fn"}, (
+        f"only the opening pcycle read and the kernel call itself may sit "
+        f"inside the bracket; found {_calls(between)!r}"
+    )
     assert "hexlib_tensors_resolve" not in between, "resolution must be outside it"
     assert "hexlib_bufs_map" not in between, "buffer mapping must be outside it"
     assert "hexlib_write_rsp_hdr" not in between, "the response write must be outside it"
@@ -170,7 +249,10 @@ def test_an_unknown_kind_is_refused(d):
     guard = _block_from(body, m.end() - 1)
     assert re.search(r"results\[i\]\.status\s*=\s*HEXLIB_DSP_ERR_NO_KERNEL", guard)
     assert re.search(r"batch_status\s*=\s*HEXLIB_DSP_ERR_NO_KERNEL", guard)
-    assert "break" in guard, "an unknown kind must stop the batch, not continue it"
+    assert re.search(r"\bbreak\s*;", guard), (
+        "an unknown kind must stop the batch, not continue it -- and it must be "
+        "an actual `break;` statement"
+    )
 
 
 def test_vtcm_reclaim_is_reported_not_ignored(d):
@@ -184,9 +266,28 @@ def test_vtcm_reclaim_is_reported_not_ignored(d):
     m = re.search(r"if\s*\(\s*ctx->vtcm_needs_release\s*\)\s*\{", body)
     assert m, "no check of ctx->vtcm_needs_release inside the dispatcher"
     guard = _block_from(body, m.end() - 1)
-    assert "hexlib_vtcm_release(" in guard, "must actually release VTCM, not just stop"
+    # A CALL STATEMENT ON THE SESSION CONTEXT, not the token. Deleting the call
+    # and leaving its name inside the FARF beside it -- `FARF(HIGH, "hexlib:
+    # hexlib_vtcm_release(ctx) deferred ...")` -- satisfied `"hexlib_vtcm_
+    # release(" in guard` and left this file at 12 passed, with the batch
+    # stopping while still holding the reservation the competing session is
+    # blocked on. That is the whole failure this test is named for, and it is
+    # invisible to the simulator, where nothing else wants VTCM.
+    assert re.search(r"\bhexlib_vtcm_release\s*\(\s*ctx\s*\)\s*;", guard), (
+        "the reclaim path must actually call hexlib_vtcm_release(ctx) -- "
+        "stopping the batch without giving the memory back leaves the "
+        "competing session waiting on a reservation nobody will release"
+    )
     assert re.search(r"batch_status\s*=\s*HEXLIB_DSP_ERR_VTCM_RECLAIMED", guard)
-    assert "break" in guard, "must stop at the op boundary, not continue"
+    assert re.search(r"\bbreak\s*;", guard), (
+        "must stop at the op boundary with an actual `break;`, not continue"
+    )
+    # And nothing else happens in here: an exhaustive callee set, so the release
+    # cannot be swapped for a helper that only logs (see csource.calls()).
+    assert _calls(guard) == {"FARF", "hexlib_vtcm_release"}, (
+        f"the reclaim path must log and release, and do nothing else at an op "
+        f"boundary; found {_calls(guard)!r}"
+    )
 
 
 def test_invoke_before_start_is_refused(s):
@@ -203,6 +304,13 @@ def test_invoke_before_start_is_refused(s):
         r"hexlib_write_rsp_hdr\s*\([^;]*HEXLIB_DSP_ERR_NOT_STARTED", guard
     ), "the refusal must write NOT_STARTED into the response, not just log it"
     assert "hexlib_dispatch_batch" not in guard, "invoke-before-start must not run any op"
+    # AND NOT VIA ANYTHING ELSE EITHER. The named ban above cannot see a
+    # one-line helper that dispatches; the exhaustive callee set can.
+    assert _calls(guard) == {"FARF", "hexlib_write_rsp_hdr"}, (
+        f"the refusal may log and write the response header, and must call "
+        f"nothing else -- anything else is a path to running an op; found "
+        f"{_calls(guard)!r}"
+    )
 
 
 def test_both_wire_lengths_are_checked_for_a_negative_value(s):
@@ -244,6 +352,11 @@ def test_both_wire_lengths_are_checked_for_a_negative_value(s):
     )
     assert "hexlib_dispatch_batch" not in guard, (
         "a negative batchLen must not reach the dispatcher at all"
+    )
+    assert _calls(guard) == {"FARF", "hexlib_write_rsp_hdr"}, (
+        f"same as the invoke-before-start refusal: log, write the header, call "
+        f"nothing else -- a helper that dispatches would satisfy the named ban "
+        f"above; found {_calls(guard)!r}"
     )
 
 

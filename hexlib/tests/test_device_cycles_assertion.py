@@ -35,9 +35,12 @@ The rest of the on-device file's assertions genuinely cannot be executed here
 and are reviewed only; that is stated plainly rather than implied by this
 file's existence.
 """
+import ast
 import importlib.util
+import inspect
 import pathlib
 import sys
+import textwrap
 import types
 
 import pytest
@@ -142,23 +145,58 @@ def test_the_regex_does_not_match_a_non_numeric_value(on_device):
         on_device.assert_cycles_total_is_a_real_measurement(out, "x")
 
 
+_HELPER = "assert_cycles_total_is_a_real_measurement"
+
+
+def _calls_in(fn):
+    """The set of function names CALLED in `fn`'s body, read out of its parsed
+    syntax tree.
+
+    WHY AN AST AND NOT A SUBSTRING SEARCH. This test used to be
+    `_HELPER + "(" in src`, over `inspect.getsource` text with only the
+    DOCSTRING removed. That is comment-blind: deleting the real call and leaving
+    `# assert_cycles_total_is_a_real_measurement(out, tag)` behind kept this
+    file at 6 passed while nothing on device checked the measurement at all --
+    the same defect class the C source-assertion tests were rewritten twice for,
+    reappearing in the one place the subject is Python.
+
+    WHY NOT `csource`, WHICH IS WHERE THE C SIDE'S ANSWER LIVES. It is a C
+    lexer: its comment tokens are `/* */` and `//`, and Python's is `#`. Handing
+    it Python source blanks the string literals and leaves every `#` comment
+    exactly where it was -- so it would not close this hole, only appear to. An
+    AST closes it by construction instead: a commented-out call is not a Call
+    node, a call named inside a string is not a Call node, and a docstring is
+    not a Call node, so none of the three need special handling. It is also
+    stricter than the text check ever was, because `_HELPER` appearing in an
+    unrelated expression (an f-string, a variable name) no longer counts.
+
+    Attribute calls (`utils.foo()`) contribute their attribute name, so a call
+    reached through a module or object alias is still seen."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    found = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                found.add(func.id)
+            elif isinstance(func, ast.Attribute):
+                found.add(func.attr)
+    return found
+
+
 def test_both_device_invocations_assert_the_measurement(on_device):
     """Both `--self-test` and `--self-test --coherency-check` must call the
     helper -- reviewed by source here, since the calls themselves can only run
-    on a device. Scoped to each function's own source, so one call cannot
-    cover for the other's absence."""
-    import inspect
-
+    on a device. Scoped to each function's own syntax tree, so one call cannot
+    cover for the other's absence, and a commented-out call cannot cover for
+    either (see `_calls_in`)."""
     for name in (
         "test_scale_fp16_runs_on_the_dsp_and_is_correct",
         "test_cache_coherency_is_independent_of_marshalling_and_of_any_kernel",
     ):
         fn = getattr(on_device, name)
-        src = inspect.getsource(fn)
-        # Strip the docstring: it discusses cycles_total at length, and a
-        # discussion is not an assertion.
-        body = src.replace(fn.__doc__ or "", "")
-        assert "assert_cycles_total_is_a_real_measurement(" in body, (
-            f"{name} does not assert cycles_total is a real measurement -- "
-            f"nothing on device would then check it at all"
+        assert _HELPER in _calls_in(fn), (
+            f"{name} does not CALL {_HELPER}() -- nothing on device would then "
+            f"check the measurement at all, and a mention of it in a comment or "
+            f"a docstring is not a call"
         )

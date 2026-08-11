@@ -30,6 +30,21 @@ or assignment-shaped. The single test that legitimately inspects COMMENTS --
 test_coherency_check_documents_its_own_scope_limits, whose whole claim is that
 a caveat is written down for a human reader -- takes the `main_comments`
 fixture instead and says so.
+
+THE THIRD TIGHTENING: STRING LITERALS ARE BLANKED NOW TOO. `csource.code_only`
+used to leave string and character literals intact, so the very defect the
+second tightening's third bullet describes -- `"dlopen(" in body` satisfied by
+driver.c's own error format string -- was still available to every other check
+in this file, and to a `}` inside a literal truncating any slice. Fixed in
+`csource` (see its module docstring for the three mechanisms and the
+mutations). What that means HERE is that `code_only` now hands back text with
+no literal payload in it at all, and the handful of checks in this file whose
+subject genuinely IS literal text -- a printed line another test asserts on, a
+command-line flag string, the dlopen candidate path, the `&_dom=cdsp` spelling
+that must NOT appear -- take one of the `*_strings` fixtures below and pass
+`keep_strings=True` to the slicer, saying so at the call site. Every other
+check keeps the ordinary fixture, because for those a token inside a format
+string is evidence of nothing.
 """
 import pathlib
 import re
@@ -37,7 +52,9 @@ import re
 import pytest
 
 from hexlib.tests.csource import block_from as _block_from
+from hexlib.tests.csource import calls as _calls
 from hexlib.tests.csource import code_only as _code_only
+from hexlib.tests.csource import code_only_keeping_strings as _code_with_strings
 from hexlib.tests.csource import function_body as _function_body
 
 H = pathlib.Path("hexlib/runtime/host")
@@ -61,6 +78,32 @@ def buffers():
 @pytest.fixture(scope="module")
 def main():
     return _code_only((H / "main.c").read_text())
+
+
+# --------------------------------------------------------------------------
+# THE `*_strings` FIXTURES: comments blanked, STRING LITERALS INTACT. For the
+# few claims whose subject IS literal text. Blanking is length-preserving in
+# both views, so an offset found in a `*_strings` slice is valid in the
+# ordinary slice of the same function and vice versa -- which is how a test can
+# locate a flag string in one view and then brace-slice the block in the other.
+# Never use these for a "this guard is here" / "this constant is absent" check;
+# that is what the plain fixtures are for. See csource.py's docstring.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def driver_strings():
+    return _code_with_strings((H / "driver.c").read_text())
+
+
+@pytest.fixture(scope="module")
+def session_strings():
+    return _code_with_strings((H / "session.c").read_text())
+
+
+@pytest.fixture(scope="module")
+def main_strings():
+    return _code_with_strings((H / "main.c").read_text())
 
 
 @pytest.fixture(scope="module")
@@ -95,7 +138,7 @@ def _macro_body(src, name):
     return "\n".join(out)
 
 
-def test_libcdsprpc_is_dlopened_not_linked(driver):
+def test_libcdsprpc_is_dlopened_not_linked(driver, driver_strings):
     """A missing driver becomes a readable message instead of a loader
     failure with no output -- this is why a well-built capability probe works
     the first time it runs on real hardware. Scoped to hexlib_drv_init():
@@ -118,7 +161,13 @@ def test_libcdsprpc_is_dlopened_not_linked(driver):
         "the driver handle must be ASSIGNED from a real dlopen() call -- a "
         "mention of dlopen in an error message is not loading anything"
     )
-    assert '"libcdsprpc.so"' in body, (
+    # THE ONE CHECK HERE WHOSE SUBJECT IS A LITERAL: the candidate path is a
+    # string, so it has to be looked for in the literal-bearing view. The
+    # `handle = dlopen(...)` check above deliberately does NOT -- that is the
+    # one the format string used to satisfy.
+    body_strings = _function_body(driver_strings, "hexlib_drv_init",
+                                  keep_strings=True)
+    assert '"libcdsprpc.so"' in body_strings, (
         "the candidate path must be a real string literal in the loading "
         "function, not merely named in prose"
     )
@@ -211,7 +260,7 @@ def test_cdsp_domain_three_and_unsigned_pd(session):
     assert "DSPRPC_CONTROL_UNSIGNED_MODULE" in enable_body
 
 
-def test_the_uri_is_built_not_hardcoded_with_a_domain(session):
+def test_the_uri_is_built_not_hardcoded_with_a_domain(session, session_strings):
     """The URI must be assembled from hexlib_iface_URI (qaic-generated) and
     CDSP_DOMAIN (<remote.h>'s own "&_dom=cdsp" macro) as adjacent string
     literals -- never spelled out as a literal "&_dom=cdsp" string, which
@@ -231,7 +280,13 @@ def test_the_uri_is_built_not_hardcoded_with_a_domain(session):
     assert construct, (
         "hexlib_open must build the URI from hexlib_iface_URI and CDSP_DOMAIN"
     )
-    assert '"&_dom=cdsp"' not in session
+    # LITERAL-BEARING VIEW, DELIBERATELY. This negative is about a STRING
+    # SPELLING -- the whole claim is that nobody wrote the domain suffix out by
+    # hand -- so it must be checked against text in which literals survive.
+    # Against `code_only` text it would pass vacuously (every literal blanked,
+    # so no literal can ever be found), which is a weaker check than the one
+    # this line was written to make.
+    assert '"&_dom=cdsp"' not in session_strings
 
     var = construct.group(1)
     open_call = re.search(rf"\bhexlib_iface_open\s*\(\s*{re.escape(var)}\s*,", body)
@@ -384,15 +439,52 @@ def test_the_host_never_puts_an_address_on_the_wire(buffers):
     """hexlib_buf_to_desc -- the one place a hexlib_buf_desc is filled in from
     this side -- must zero `base` itself, first (right after the memset, not
     merely somewhere before the struct is used), and nothing in the file may
-    derive `base` from the host pointer (`buf->ptr`/`ptr`)."""
+    derive `base` from the host pointer (`buf->ptr`/`ptr`).
+
+    TWO INDEPENDENT WEAKNESSES, BOTH PROVEN, BOTH FIXED HERE. `d->base =
+    (uint64_t)(uintptr_t) buf->ptr;` -- the host's own virtual address on the
+    wire, which works perfectly under the simulator's shared address space and
+    can only fail on silicon -- passed all 28 tests in this file when written
+    two ways at once:
+
+      * the `base = 0;` positive was satisfied by an `fprintf` format string
+        containing that text (`csource` used to hand literals back intact; it
+        no longer does), and
+      * the whole-file `base\\s*=[^;]*\\bptr\\b` negative was satisfied by
+        routing the pointer through a temp named `hostaddr`, because the
+        forbidden token no longer appeared on the assignment's own line. A
+        negative check written as a pattern over the RHS can always be dodged
+        by a rename; that is a property of the shape of the check, not of the
+        name chosen.
+
+    So the check is inverted into an EXHAUSTIVE one, which a rename cannot
+    dodge: enumerate every assignment to `d->base` in this function and require
+    that the complete set of right-hand sides is exactly `0`. And require that
+    this function never reads the host pointer AT ALL -- no `ptr` token in its
+    body -- so there is nothing available to launder through a temp under any
+    name. `hexlib_buf_to_desc` legitimately needs only `buf->size` and
+    `buf->fd`."""
     body = _function_body(buffers, "hexlib_buf_to_desc")
-    assert re.search(r"d->base\s*=\s*0", body) or re.search(r"\bbase\s*=\s*0", body)
+    assigned = [rhs.strip() for rhs in re.findall(r"d->base\s*=\s*([^;]+);", body)]
+    assert assigned == ["0"], (
+        f"hexlib_buf_to_desc must assign d->base exactly once, and the value "
+        f"must be 0 -- the DSP fills it in from its own mapping table "
+        f"(skel_bufs.c). Found right-hand sides {assigned!r}"
+    )
     memset_end = body.index(";", body.index("memset(")) + 1
     base_clear = re.search(r"\bbase\s*=\s*0\s*;", body)
     assert base_clear, "base must be explicitly cleared, not left to memset alone"
     assert base_clear.start() < body.index("d->size", memset_end), (
         "base must be cleared before the other fields are filled in"
     )
+    assert "ptr" not in body, (
+        "hexlib_buf_to_desc must not so much as READ the host pointer -- it "
+        "needs buf->size and buf->fd and nothing else, and a function that "
+        "cannot see the address cannot put it on the wire under any variable "
+        "name"
+    )
+    # Kept as a belt, and honestly labelled: this is the rename-defeatable
+    # form. The exhaustive check above is the one that holds.
     assert not re.search(r"base\s*=[^;]*\bptr\b", buffers), (
         "base must never be derived from a host pointer anywhere in this file"
     )
@@ -457,6 +549,16 @@ def test_unmapped_alloc_skips_only_the_dsp_registration_call(main):
         "the skip_dsp_register branch must NOT call hexlib_iface_mmap -- "
         "withholding exactly that call is the whole point of --unmapped"
     )
+    # AND NOTHING THAT COULD REGISTER IT UNDER ANOTHER NAME. The named ban above
+    # is satisfied by moving the registration into a one-line helper and calling
+    # THAT from here, which would silently un-break --unmapped: the fd would be
+    # registered after all, hexlib_bufs_map would find it, and the mode would
+    # report success for the case it exists to make fail. An exhaustive callee
+    # set cannot be dodged by a rename (see csource.calls()).
+    assert _calls(skip_block) == {"printf"}, (
+        f"the --unmapped branch must do nothing but say so on stdout; found "
+        f"calls to {_calls(skip_block)!r}"
+    )
 
     else_pos = body.index("else", skip_if.end())
     else_block = _block_from(body, else_pos)
@@ -479,33 +581,51 @@ def test_run_self_test_unmapped_path_uses_the_unmapped_allocator(main):
     assert "free_maybe_unmapped(ctx, by, 1)" in body
 
 
-def test_self_test_prints_cycles_total_after_the_existing_pass_line(main):
+def test_self_test_prints_cycles_total_after_the_existing_pass_line(main, main_strings):
     """The response header's cycles_total (skel_dispatch.c's PCYCLE bracket
     around the kernel call) must be printed AFTER, never instead of, the
     existing 'PASS (%d values, bit-exact)' line -- so the exact success
     string test_on_device.py's `test_scale_fp16_runs_on_the_dsp_and_is_
     correct` already asserts on stays byte-for-byte intact, and the new
-    cycles line is strictly additive."""
-    body = _function_body(main, "run_self_test")
-    pass_idx = body.index("PASS (%d values, bit-exact)")
-    cycles_idx = body.index("cycles_total=%llu", pass_idx)
+    cycles line is strictly additive.
+
+    BOTH ORDERED THINGS ARE PRINTF FORMAT STRINGS, so this is one of the few
+    checks that must run against the literal-bearing view -- the claim is
+    literally about what gets printed and in what order. The one non-literal
+    half (the value printed comes off the response header, not a constant)
+    stays on the ordinary view."""
+    body_strings = _function_body(main_strings, "run_self_test", keep_strings=True)
+    pass_idx = body_strings.index("PASS (%d values, bit-exact)")
+    cycles_idx = body_strings.index("cycles_total=%llu", pass_idx)
     assert pass_idx < cycles_idx
+    body = _function_body(main, "run_self_test")
     assert "full_hdr.cycles_total" in body
 
 
-def test_self_test_flag_parsing_routes_unmapped_and_coherency_correctly(main):
+def test_self_test_flag_parsing_routes_unmapped_and_coherency_correctly(main, main_strings):
     """main()'s --self-test branch must recognize both --unmapped and
     --coherency-check past argv[1], route --coherency-check to
     run_coherency_check(), and thread the --unmapped flag straight into
     run_self_test(unmapped) -- not merely mention both flag strings
     somewhere in the function, which a comment or an unreachable branch
-    would also satisfy."""
-    body = _function_body(main, "main")
-    self_test_pos = body.index('"--self-test"')
-    self_test_block = _block_from(body, self_test_pos)
+    would also satisfy.
 
-    assert '"--unmapped"' in self_test_block
-    assert '"--coherency-check"' in self_test_block
+    THE FLAG NAMES ARE STRING LITERALS -- argv is compared against them -- so
+    finding them needs the literal-bearing view. The ROUTING half (the branch
+    exists and calls the right function) stays on the ordinary, blanked view,
+    which is the half a FARF or a usage() line could otherwise satisfy. The two
+    views are the same length, so the `"--self-test"` offset found in one is
+    the right offset to brace-slice the other from."""
+    body = _function_body(main, "main")
+    body_strings = _function_body(main_strings, "main", keep_strings=True)
+    assert len(body) == len(body_strings)
+    self_test_pos = body_strings.index('"--self-test"')
+    self_test_block = _block_from(body, self_test_pos)
+    self_test_block_strings = _block_from(body_strings, self_test_pos,
+                                         keep_strings=True)
+
+    assert '"--unmapped"' in self_test_block_strings
+    assert '"--coherency-check"' in self_test_block_strings
     assert re.search(r"run_coherency_check\s*\(\s*\)", self_test_block)
     assert re.search(r"run_self_test\s*\(\s*unmapped\s*\)", self_test_block)
 
@@ -518,8 +638,11 @@ def test_self_test_flag_parsing_routes_unmapped_and_coherency_correctly(main):
     )
 
 
-def test_usage_mentions_the_new_self_test_modifiers(main):
-    body = _function_body(main, "usage")
+def test_usage_mentions_the_new_self_test_modifiers(main_strings):
+    """LITERAL-BEARING VIEW BY NATURE: usage() text is nothing but string
+    literals, and what this asserts is that a human running --help is told
+    about both modifiers."""
+    body = _function_body(main_strings, "usage", keep_strings=True)
     assert "--unmapped" in body
     assert "--coherency-check" in body
 
@@ -583,7 +706,9 @@ def test_coherency_check_writes_the_sentinel_before_invoking(main):
     assert sentinel_idx < invoke_idx
 
 
-def test_coherency_check_reads_the_sentinel_only_after_both_statuses_are_ok(main):
+def test_coherency_check_reads_the_sentinel_only_after_both_statuses_are_ok(
+    main, main_strings
+):
     """The sentinel read-back (and both printed verdict lines) must live
     strictly inside the branch reached only once the batch-level status AND
     the op's own result status are both confirmed HEXLIB_DSP_OK -- reading it
@@ -599,9 +724,16 @@ def test_coherency_check_reads_the_sentinel_only_after_both_statuses_are_ok(main
         "the sentinel must only be read back (and classified) once both "
         "statuses are confirmed OK"
     )
-    cycles_idx = success_block.index("cycles_total=%llu")
-    overwritten_idx = success_block.index('"COHERENCY sentinel_overwritten\\n"')
-    unchanged_idx = success_block.index('"COHERENCY sentinel_unchanged\\n"')
+    # The three ORDERED things are printf format strings, so their relative
+    # order is a claim about literal text and is checked in the literal-bearing
+    # view. Same offsets (blanking preserves length), so the `else` boundary
+    # found above is the right one to slice there too.
+    body_strings = _function_body(main_strings, "run_coherency_check",
+                                 keep_strings=True)
+    success_block_strings = _block_from(body_strings, else_pos, keep_strings=True)
+    cycles_idx = success_block_strings.index("cycles_total=%llu")
+    overwritten_idx = success_block_strings.index('"COHERENCY sentinel_overwritten\\n"')
+    unchanged_idx = success_block_strings.index('"COHERENCY sentinel_unchanged\\n"')
     assert cycles_idx < overwritten_idx
     assert cycles_idx < unchanged_idx, (
         "cycles_total must be printed before either COHERENCY verdict line "
@@ -666,7 +798,9 @@ def test_coherency_check_treats_negative_zero_as_the_expected_zero_result(main):
     )
 
 
-def test_coherency_check_verifies_the_surviving_bytes_are_really_the_sentinel(main):
+def test_coherency_check_verifies_the_surviving_bytes_are_really_the_sentinel(
+    main, main_strings
+):
     """A buffer that is neither the expected zero result nor the intact
     sentinel (garbled, or partially written) must not be folded into the
     'sentinel_unchanged' / coherency-miss verdict just because it failed the
@@ -686,10 +820,13 @@ def test_coherency_check_verifies_the_surviving_bytes_are_really_the_sentinel(ma
     body = _function_body(main, "run_coherency_check")
     assert "HEXLIB_EXIT_COHERENCY_GARBLED" in main
     assert "exit_code = HEXLIB_EXIT_COHERENCY_GARBLED;" in body
-    assert '"COHERENCY buffer_garbled\\n"' in body
+    # The printed verdict line itself -- a literal, so the literal-bearing view.
+    body_strings = _function_body(main_strings, "run_coherency_check",
+                                 keep_strings=True)
+    assert '"COHERENCY buffer_garbled\\n"' in body_strings
 
 
-def test_caps_reports_a_driver_failure_through_its_exit_code(main):
+def test_caps_reports_a_driver_failure_through_its_exit_code(main, main_strings):
     """`--caps` EXITED 0 WHEN THE DRIVER FAILED TO LOAD. `print_caps()`
     returned `void`, both failure branches printed to stderr and returned, and
     `main()` returned HEXLIB_EXIT_OK regardless -- so on a device whose image
@@ -723,8 +860,12 @@ def test_caps_reports_a_driver_failure_through_its_exit_code(main):
             "original defect, moved rather than fixed"
         )
 
+    # The flag itself is a literal, so it is located in the literal-bearing
+    # view; the block's CONTENT is then checked in the blanked one, where
+    # neither a comment nor a log line can supply the return this is about.
     main_body = _function_body(main, "main")
-    caps_pos = main_body.index('"--caps"')
+    main_body_strings = _function_body(main_strings, "main", keep_strings=True)
+    caps_pos = main_body_strings.index('"--caps"')
     caps_block = _block_from(main_body, caps_pos)
     assert re.search(r"return\s+print_caps\s*\(\s*\)\s*;", caps_block), (
         "main() must RETURN print_caps()'s value -- calling it and then "

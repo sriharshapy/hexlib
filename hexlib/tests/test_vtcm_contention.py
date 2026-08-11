@@ -73,25 +73,133 @@ def test_the_query_asks_for_the_available_size_not_only_the_total():
     assert args[3].startswith("&"), f"avail must be an out-parameter, got {args[3]}"
 
 
-def test_the_min_vtcm_size_floor_is_not_zero_and_not_a_constant():
+def _query_out_params(body):
+    """The names (without `&`) of HAP_compute_res_query_VTCM's total and avail
+    out-parameters, read off the real call. Derived rather than hardcoded: the
+    fix for the "absolute requirement" bug split one local into two, and a test
+    that names them dictates code layout instead of checking behaviour (see
+    test_skel_vtcm_source.py's note on the same rename)."""
+    m = re.search(r"HAP_compute_res_query_VTCM\s*\(([^()]*)\)", body)
+    assert m, "hexlib_vtcm_alloc must query VTCM sizes"
+    args = [a.strip() for a in m.group(1).split(",")]
+    assert len(args) == 5, f"expected 5 arguments, got {args}"
+    # Signature (HAP_compute_res.h:1087-1106): (application_id,
+    # total_block_size, total_block_layout, avail_block_size,
+    # avail_block_layout).
+    return args[1].lstrip("&").strip(), args[3].lstrip("&").strip()
+
+
+def test_the_min_vtcm_size_floor_is_below_the_request_and_comes_from_the_query():
     """`min_vtcm_size = 0` means "absolute requirement" -- the bug.
 
-    A hardcoded floor would also violate this file's governing rule that the
-    size comes from the runtime, so the floor must be a variable.
-    """
+    THIS PINNED THE BUG BY ARGUMENT SPELLING, AND THE BUG'S SEMANTIC EQUIVALENT
+    PASSED. The old form asserted only that the floor was not the literal `0`
+    and not a numeric constant. `min_vtcm_size = vtcm_total` satisfies both and
+    re-demands the WHOLE partition: it is the original defect restored, since a
+    floor equal to the request means any contention at all fails
+    HAP_compute_res_acquire, which fails hexlib_iface_start, which exits every
+    mode at session open. The identifier differing from `0` was never the
+    requirement.
+
+    THE REQUIREMENT, STATED AS TWO RELATIONS INSTEAD OF ONE SPELLING. Ask for
+    the total the runtime reported, and accept down to the AVAIL the runtime
+    reported -- so the floor is (a) derived from the query's availability
+    out-parameter, and (b) a different quantity from the request, which is what
+    makes it a floor at all. `avail <= total` is the SDK's own guarantee about
+    those two out-parameters ("largest contiguous memory chunk available" vs the
+    partition total), so pinning WHICH out-parameter each argument is pins the
+    inequality without this test having to know either number.
+
+    Name-agnostic in both directions: both names are read off the query call, so
+    a rename that keeps the semantics passes and a swap that keeps the names
+    fails."""
     body = _alloc_body()
+    total, avail = _query_out_params(body)
+    assert total != avail, (
+        f"the total and available sizes must be two distinct out-parameters -- "
+        f"HAP_compute_res_query_VTCM was passed {total!r} for both, so there is "
+        f"no availability figure for the floor to come from"
+    )
+
     m = re.search(r"HAP_compute_res_attr_set_vtcm_param_v2\s*\(([^()]*)\)", body)
     assert m, "must set the v2 VTCM params"
     args = [a.strip() for a in m.group(1).split(",")]
     assert len(args) == 4, f"expected 4 arguments, got {args}"
-    floor = args[3]
-    assert floor != "0", (
-        "min_vtcm_size = 0 is 'the size is an absolute requirement' "
-        "(HAP_compute_res.h:544-546) -- any contention then fails session open"
+    requested, floor = args[1], args[3]
+
+    assert requested == total, (
+        f"the request (total_block_size) must be the total the runtime just "
+        f"reported ({total!r}), not {requested!r} -- asking for `avail` directly "
+        f"caps the session at a value that can go stale between query and "
+        f"acquire"
     )
-    assert not re.fullmatch(r"[0-9]+[uU]?|0[xX][0-9a-fA-F]+[uU]?", floor), (
-        f"the floor must come from the runtime, not the constant {floor!r}"
+    assert floor == avail, (
+        f"min_vtcm_size must be the runtime's own AVAILABLE size ({avail!r}), "
+        f"not {floor!r}. 0 is 'the size is an absolute requirement' "
+        f"(HAP_compute_res.h:544-546); {total!r} is the same thing spelled "
+        f"differently, since a floor equal to the request refuses any "
+        f"contention at all; a constant would violate this file's governing "
+        f"rule that the size comes from the runtime"
     )
+    assert floor != requested, (
+        "the floor must be BELOW the request, not equal to it -- a floor equal "
+        "to the request is the absolute-requirement bug with a variable name on "
+        "it"
+    )
+
+
+def test_the_reservation_is_actually_acquired_and_its_results_stored():
+    """A REQUEST SHAPE IS NOT AN ACQUISITION. Every check above reads arguments
+    off two `HAP_compute_res_attr_set_*` calls, and attribute setters acquire
+    nothing: replacing the rest of hexlib_vtcm_alloc with `return
+    HEXLIB_DSP_OK;` -- so the session never holds VTCM and every kernel gets a
+    null base with size 0 -- left this whole file green. The floor being right
+    is only interesting if the request built from it is submitted, checked, and
+    its results recorded on the session.
+
+    Everything here is derived from the calls themselves rather than named, for
+    the same reason as the floor check above."""
+    body = _alloc_body()
+    m = re.search(r"HAP_compute_res_attr_set_vtcm_param_v2\s*\(([^()]*)\)", body)
+    assert m, "must set the v2 VTCM params"
+    attr = [a.strip() for a in m.group(1).split(",")][0].lstrip("&").strip()
+
+    acquire = re.search(
+        rf"(\w+)\s*=\s*HAP_compute_res_acquire\s*\(\s*&\s*{re.escape(attr)}\b", body
+    )
+    assert acquire, (
+        f"hexlib_vtcm_alloc must submit the attributes it just built "
+        f"(&{attr}) to HAP_compute_res_acquire and keep the result -- a "
+        f"discarded reservation context cannot be released or re-acquired later"
+    )
+    rctx = acquire.group(1)
+    assert re.search(rf"if\s*\(\s*!\s*{re.escape(rctx)}\s*\)", body), (
+        f"a failed acquire returns 0, so `{rctx}` must be checked for it -- "
+        f"HAP_compute_res_acquire burns its full timeout before failing and "
+        f"then every kernel would run with no VTCM at all"
+    )
+
+    ptr_query = re.search(
+        r"HAP_compute_res_attr_get_vtcm_ptr_v2\s*\(([^()]*)\)", body
+    )
+    assert ptr_query, "the acquired VTCM's base and size must be read back"
+    ptr_args = [a.strip().lstrip("&").strip() for a in ptr_query.group(1).split(",")]
+    assert len(ptr_args) == 3, f"expected 3 arguments, got {ptr_args}"
+    got_ptr, got_size = ptr_args[1], ptr_args[2]
+
+    for field, var, why in (
+        ("vtcm_base", got_ptr, "no kernel can use VTCM it has no pointer to"),
+        ("vtcm_size", got_size, "hwinfo reports this number to the host, and "
+                                "the M1 allocator's budget is it"),
+        ("vtcm_rctx", rctx, "without the reservation context the dispatcher "
+                            "cannot release VTCM at an op boundary, which is "
+                            "what a competing session waits on"),
+    ):
+        assert re.search(
+            rf"ctx->{field}\s*=\s*(?:\([^;)]*\)\s*)?{re.escape(var)}\s*;", body
+        ), (
+            f"ctx->{field} must be set from `{var}` -- {why}"
+        )
 
 
 def test_a_fully_contended_partition_is_refused_with_its_own_status():
@@ -100,9 +208,16 @@ def test_a_fully_contended_partition_is_refused_with_its_own_status():
     zero_check = re.search(r"if\s*\(\s*\w*avail\w*\s*==\s*0\s*\)", body)
     assert zero_check, "a fully contended partition (avail == 0) must be refused"
     guarded = csource.block_from(body, zero_check.start())
-    assert "HEXLIB_DSP_ERR_VTCM_TOO_SMALL" in guarded, (
+    # A RETURN, not the token. `"X" in guarded` was satisfiable by a FARF
+    # naming the constant while the function carried on to acquire a
+    # reservation it had just proven impossible -- the file-wide shape of
+    # defect this whole area was reviewed for. (csource blanks literals now, so
+    # the FARF vector is closed at the source; requiring the return closes the
+    # "assign it to an unused local" one too.)
+    assert re.search(r"return\s+HEXLIB_DSP_ERR_VTCM_TOO_SMALL\s*;", guarded), (
         "refusing with a specific status is what lets a device operator tell "
-        "contention from a load failure"
+        "contention from a load failure -- and it must be RETURNED from inside "
+        "this branch, not merely named in it"
     )
 
 

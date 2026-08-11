@@ -17,9 +17,23 @@ whole file exists to catch -- and all eight tests still passed, because
 whole-file and satisfied by an unrelated return in a different function, and
 `"nbytes" in src` was satisfied by a FARF format string. So:
 
-  * every fixture and every slice is COMMENT-BLANKED (csource strips by
-    default; `code_only` does the whole file), so nothing a mutation leaves
-    behind as a comment can satisfy anything here;
+A THIRD TIME, FOR THE SAME REASON AGAIN, AND THIS ONE IS THE POINT. The second
+rewrite's third bullet below says every presence check is a call or an
+assignment shape "so a mention in a log-message format string is not evidence
+of anything" -- and it was still possible, because `csource` handed string
+literals back untouched. `b->base = 0;` replaced by a FARF PRINTING THAT EXACT
+TEXT, with the real `b->base = m->base;` deleted, kept this file at 8 passed:
+the host's address survives into the descriptor and reaches a kernel, which is
+the single invariant this file exists for. Separately, a `}` inside a FARF
+truncated `find_by_fd`'s slice, so keying the lookup off the host's `base` (with
+an `if (0)` decoy holding the by-fd comparison) also passed. Both are fixed in
+`csource` -- literals are blanked now, and brace counting ignores them -- and
+the checks below no longer rely on nobody having thought of it.
+
+  * every fixture and every slice is COMMENT- AND LITERAL-BLANKED (csource
+    strips by default; `code_only` does the whole file), so nothing a mutation
+    leaves behind as a comment, a log line or a format string can satisfy
+    anything here;
   * every check is scoped to the ONE function -- usually the one `if`-block --
     whose behaviour the claim is about, never the file;
   * every presence check is a CALL or an ASSIGNMENT shape, never a bare token,
@@ -31,6 +45,7 @@ import re
 import pytest
 
 from hexlib.tests.csource import block_from as _block_from
+from hexlib.tests.csource import calls as _calls
 from hexlib.tests.csource import code_only as _code_only
 from hexlib.tests.csource import function_body as _function_body
 
@@ -59,17 +74,42 @@ def test_base_is_cleared_before_any_lookup(src):
     be read by the fd lookup. This is a behavioural claim about ONE function's
     body, not about the file's layout — checking whole-file text order would
     incidentally constrain where helpers like find_by_fd get defined, which is
-    not the invariant. Slice hexlib_bufs_map itself and check order there."""
+    not the invariant. Slice hexlib_bufs_map itself and check order there.
+
+    AN ASSIGNMENT STATEMENT, NOT THE TEXT OF ONE. This was `"b->base = 0" in
+    body`, and `FARF(HIGH, "hexlib: b->base = 0 before any lookup");` satisfied
+    it while the real clear was gone -- 8 passed, with the host's address left
+    in the descriptor for the rest of the function to hand onward. The
+    statement terminator is part of the requirement for that reason.
+
+    AND THE OTHER HALF OF THE INVARIANT, WHICH NOTHING USED TO CHECK: clearing
+    `base` is only half the job. The descriptor must then be filled in from the
+    DSP-side MAPPING (`m->base`, the table only hexlib_bufs_register writes),
+    after the lookup. With the clear demoted to a log line and this assignment
+    simply deleted, every check in this file still passed -- so both the destroy
+    and the re-fill are pinned here now, in that order."""
     body = _function_body(src, "hexlib_bufs_map")
-    assert "b->base = 0" in body or "b->base = NULL" in body
-    clear = min(
-        (body.index(s) for s in ("b->base = 0", "b->base = NULL") if s in body),
-        default=-1,
+    clear = re.search(r"b->base\s*=\s*(?:0|NULL)\s*;", body)
+    assert clear, (
+        "hexlib_bufs_map must destroy the host's `base` with a real assignment "
+        "statement before anything reads it -- a log line spelling out the "
+        "assignment is not one"
     )
-    assert clear != -1
     lookup = re.search(r"\bfind_by_fd\s*\(", body)
     assert lookup, "hexlib_bufs_map does not appear to look the buffer up at all"
-    assert clear < lookup.start(), "clear base before looking the buffer up"
+    assert clear.start() < lookup.start(), "clear base before looking the buffer up"
+
+    fill = re.search(r"b->base\s*=\s*m->base\s*;", body)
+    assert fill, (
+        "hexlib_bufs_map must set the descriptor's base FROM the DSP-side "
+        "mapping (b->base = m->base) -- without it the descriptor keeps "
+        "whatever the host wrote, which is the one thing this file exists to "
+        "prevent"
+    )
+    assert lookup.start() < fill.start(), (
+        "the base may only be filled in from a mapping the lookup actually "
+        "found, so it must come after the lookup"
+    )
 
 
 def test_lookup_is_by_fd(src):
@@ -129,9 +169,17 @@ def test_an_unmapped_fd_is_an_error_not_a_zero_base(src):
         "-- logging and continuing (with or without an address derived from "
         "the fd) is the upstream bug this file exists to have fixed"
     )
-    assert "continue" not in miss_block, (
+    assert not re.search(r"\bcontinue\s*;", miss_block), (
         "the unmapped-fd branch must not continue the loop: the buffer would "
         "be handed to a kernel with whatever base was left in it"
+    )
+    # Exhaustive callee set, so the refusal cannot be routed through a helper
+    # that maps the fd on demand -- the thing this branch exists NOT to do, and
+    # the thing a scoped `X not in block` ban cannot see (csource.calls()).
+    assert _calls(miss_block) == {"FARF"}, (
+        f"the unmapped-fd branch may log and return, and must call nothing "
+        f"else: mapping on demand here is the upstream bug, and on the "
+        f"simulator it would silently work; found {_calls(miss_block)!r}"
     )
 
     reg_body = _function_body(src, "hexlib_bufs_register")

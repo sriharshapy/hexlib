@@ -63,6 +63,29 @@ text with `csource.block_from` (comment-aware and comment-blanked, so a field
 name left behind in a comment cannot satisfy it). It cannot catch a TYPE change
 or a padding change -- `uint32_t offset` becoming `uint64_t offset` keeps the
 order intact -- which is what the compiled tests below are for.
+
+THE THIRD DESCRIPTION OF THE SAME BYTES, WHICH NOTHING CHECKED AT ALL. Every
+test above compares the C structs against wire.py's FORMAT STRINGS. There is a
+third description in play and it is the one that actually runs: the ARGUMENT
+ORDER of `pack_batch`'s `struct.pack` calls, and the unpacking order in
+`unpack_response`. A format string says "eleven uint32 in a row"; it does not say
+which value goes in which. Swapping `dtype` and `layout` in
+`pack_batch`'s tensor `struct.pack(...)` call -- so every tensor's dtype is
+written into the DSP's `layout` field and vice versa -- left the whole offline
+suite at 810 passed. It was caught only by the @sdk-gated `test_dsp_sim.py`,
+which needs the Hexagon SDK and which CI does not run: on any machine without
+the SDK, and in CI, a q4_0 weight read as row_major (or vice versa) was
+completely unpinned. The layout tests here could not see it, because the bytes
+still had the right SIZE at the right OFFSETS -- they just meant different
+things.
+
+`test_pack_batch_writes_every_value_into_the_field_it_belongs_to` closes that,
+with no compiler needed. It packs a batch in which every field of every record
+holds a DISTINCT recognizable value, then reads each field back at the offset
+this file's own bridge table implies and checks it is the value that field was
+given. Any two fields exchanged in a `struct.pack` call swaps two distinct
+values and fails. `test_unpack_response_reads_every_field_from_the_slot_the_dsp_
+wrote_it_in` is the same idea in the other direction, on the response path.
 """
 import pathlib
 import re
@@ -206,6 +229,208 @@ def test_the_size_constants_wire_py_exports_match_its_own_formats():
         ("_RESULT", "RESULT_SIZE"),
     ):
         assert getattr(wire, size_attr) == struct.calcsize(getattr(wire, attr))
+
+
+# ==============================================================================
+# WHAT pack_batch / unpack_response ACTUALLY PUT IN EACH SLOT. No compiler
+# needed: this is Python's own serializer checked against this file's field
+# table, which the compiled tests above have already checked against the C.
+# ==============================================================================
+
+_BY_NAME = {w.c_name: w for w in WIRE_STRUCTS}
+
+
+def _read_record(c_name, blob, offset):
+    """`{field: value}` for one record of `struct c_name` at `offset` in `blob`,
+    unpacked with wire.py's own format and named by this file's field table.
+    Array fields come back as tuples. This is the only place the two are
+    paired, which is what makes a swapped pair of `struct.pack` arguments
+    visible: the format cannot tell them apart, the names can."""
+    w = _BY_NAME[c_name]
+    values = struct.unpack_from(w.fmt, blob, offset)
+    out, i = {}, 0
+    for name, n in w.fields:
+        out[name] = values[i] if n == 1 else tuple(values[i:i + n])
+        i += n
+    assert i == len(values)
+    return out
+
+
+def _assert_distinct(record, name, exempt=()):
+    """Every scalar in `record` must be a DIFFERENT value, or a swap of the two
+    that match would pass. `exempt` names fields whose value is fixed by the
+    contract (the DSP-side scratch slots, which are both required to be 0) and
+    so cannot be made distinct."""
+    scalars = {k: v for k, v in record.items()
+               if isinstance(v, int) and k not in exempt}
+    assert len(set(scalars.values())) == len(scalars), (
+        f"this test's own {name} values are not all distinct, so a swapped pair "
+        f"of fields would pass it: {scalars!r}"
+    )
+
+
+# Chosen so that within every record every scalar differs from every other --
+# including `version` (1) against `n_ops`, which is why there are two ops and
+# three buffers rather than one of each.
+_PACK_BUFS = (
+    dict(fd=11, size=4096, flags=5),
+    dict(fd=22, size=8192, flags=6),
+    dict(fd=33, size=2048, flags=7),
+)
+_PACK_TENSORS = (
+    dict(bi=0, offset=32, nbytes=16, dtype="fp16", layout="q4_0_repacked",
+         ne=(3, 5, 7, 9)),
+    # THE EXHAUSTIVELY-CHECKED ONE: every scalar in it is a different number,
+    # and its dtype and layout ids differ from each other AND from the other
+    # tensor's, so neither can be a constant and the two cannot be exchanged.
+    dict(bi=2, offset=64, nbytes=128, dtype="int32", layout="tiled_32x32",
+         ne=(11, 13, 17, 19)),
+    dict(bi=1, offset=256, nbytes=512, dtype="fp32", layout="row_major",
+         ne=(23, 29, 31, 37)),
+    dict(bi=1, offset=1024, nbytes=48, dtype="q4_0", layout="q4_0_repacked",
+         ne=(41, 43, 47, 53)),
+)
+_PACK_OPS = (
+    dict(kind=9, flags=3, params=(101, 102, 103), src=(1, 2), dst=(0,)),
+    dict(kind=10, flags=4, params=(201, 202), src=(0, 3), dst=(1,)),
+)
+
+
+@pytest.fixture(scope="module")
+def packed():
+    """One real `pack_batch` blob built from the tables above."""
+    bufs = [wire.BufDesc(**b) for b in _PACK_BUFS]
+    tensors = [wire.TensorDesc(**t) for t in _PACK_TENSORS]
+    ops = [wire.OpDesc(**o) for o in _PACK_OPS]
+    return wire.pack_batch(bufs, tensors, ops)
+
+
+def test_pack_batch_writes_every_value_into_the_field_it_belongs_to(packed):
+    """THE THIRD DESCRIPTION, CHECKED. See the module docstring: swapping
+    `dtype` and `layout` in pack_batch's tensor pack call was 810-green offline
+    and caught only by the SDK-gated simulator test CI does not run.
+
+    Every assertion here is a whole-record equality, not a field-by-field spot
+    check, so a field this test forgot cannot be the one that drifts -- and
+    `_assert_distinct` refuses to let the test pass on values that could not
+    tell a swap apart in the first place."""
+    hdr = _read_record("hexlib_batch_hdr", packed, 0)
+    _assert_distinct(hdr, "header", exempt=("flags",))
+    assert hdr == {
+        "magic": wire.BATCH_MAGIC,
+        "version": wire.BATCH_VERSION,
+        "total_size": len(packed),
+        "n_bufs": len(_PACK_BUFS),
+        "n_tensors": len(_PACK_TENSORS),
+        "n_ops": len(_PACK_OPS),
+        "off_bufs": wire.HDR_SIZE,
+        "off_tensors": wire.HDR_SIZE + wire.BUF_SIZE * len(_PACK_BUFS),
+        "off_ops": (wire.HDR_SIZE + wire.BUF_SIZE * len(_PACK_BUFS)
+                    + wire.TENSOR_SIZE * len(_PACK_TENSORS)),
+        "flags": 0,
+    }
+
+    for i, b in enumerate(_PACK_BUFS):
+        rec = _read_record("hexlib_buf_desc", packed,
+                           hdr["off_bufs"] + wire.BUF_SIZE * i)
+        _assert_distinct(rec, f"buffer {i}", exempt=("base",))
+        assert rec == {"base": 0, "size": b["size"], "fd": b["fd"],
+                       "flags": b["flags"]}, (
+            f"buffer {i}: pack_batch put the values somewhere other than the "
+            f"fields they name. `base` must be 0 -- see wire.py's docstring: "
+            f"there is no field for a host address, and the DSP fills this one"
+        )
+
+    for i, t in enumerate(_PACK_TENSORS):
+        rec = _read_record("hexlib_tensor", packed,
+                           hdr["off_tensors"] + wire.TENSOR_SIZE * i)
+        if i == 1:
+            _assert_distinct(rec, f"tensor {i}", exempt=("data", "pad"))
+        assert rec == {
+            "bi": t["bi"], "offset": t["offset"], "nbytes": t["nbytes"],
+            "dtype": wire.DTYPE_ID[t["dtype"]],
+            "layout": wire.LAYOUT_ID[t["layout"]],
+            "ne": t["ne"], "data": 0, "pad": 0,
+        }, (
+            f"tensor {i}: the DSP reads these eleven uint32 by NAME "
+            f"(hexlib_dsp.h) and pack_batch wrote them in a different order. "
+            f"dtype/layout exchanged is a q4_0 weight read as row_major -- a "
+            f"plausible wrong answer at full speed, not a crash"
+        )
+
+    for i, op in enumerate(_PACK_OPS):
+        rec = _read_record("hexlib_op_desc", packed,
+                           hdr["off_ops"] + wire.OP_SIZE * i)
+        assert rec == {
+            "kind": op["kind"],
+            "flags": op["flags"],
+            "params": (tuple(op["params"])
+                       + (0,) * (wire.MAX_PARAMS - len(op["params"]))),
+            "src": (tuple(op["src"])
+                    + (0xFFFF,) * (wire.MAX_SRC - len(op["src"]))),
+            "dst": (tuple(op["dst"])
+                    + (0xFFFF,) * (wire.MAX_DST - len(op["dst"]))),
+        }, (
+            f"op {i}: `kind` is what skel_dispatch.c matches the kernel table "
+            f"on and src/dst are what its fill loop walks in that order, so an "
+            f"exchange here dispatches the wrong kernel or feeds it the wrong "
+            f"buffers"
+        )
+
+
+def test_unpack_response_reads_every_field_from_the_slot_the_dsp_wrote_it_in():
+    """THE RETURN PATH, SAME PROPERTY. `unpack_response` names its fields by
+    tuple position (`magic, version, status, n_ops, cycles, arch, _ = ...`), so
+    exchanging two of those names is invisible to any format-string comparison
+    -- and reading `status` out of the `n_ops` slot would report a two-op batch
+    as ERR_INTERNAL, or a failure as success.
+
+    The bytes are built HERE, in this file's own field order (the order the
+    compiled tests above have already checked against hexlib_dsp.h), rather than
+    by wire.py -- otherwise a matching pair of mistakes on both sides would
+    cancel out and this would pass."""
+    hdr_fields = {
+        "magic": wire.BATCH_MAGIC, "version": wire.BATCH_VERSION,
+        "status": wire.STATUS["ERR_REQUIRES"], "n_ops": 2,
+        "cycles_total": 1287, "arch": 75, "pad": 0,
+    }
+    _assert_distinct(hdr_fields, "response header", exempt=("pad",))
+    results = (
+        {"kind": 9, "status": wire.STATUS["OK"], "cycles": 101},
+        {"kind": 10, "status": wire.STATUS["ERR_REQUIRES"], "cycles": 202},
+    )
+    for i, r in enumerate(results):
+        _assert_distinct(r, f"result {i}")
+
+    def _pack(c_name, values):
+        w = _BY_NAME[c_name]
+        flat = []
+        for name, n in w.fields:
+            v = values[name]
+            flat.extend(v if n > 1 else [v])
+        return struct.pack(w.fmt, *flat)
+
+    blob = _pack("hexlib_batch_rsp_hdr", hdr_fields)
+    for r in results:
+        blob += _pack("hexlib_op_result", r)
+
+    rsp = wire.unpack_response(blob)
+    assert rsp.status == hdr_fields["status"], (
+        "unpack_response read `status` out of a different slot than the one "
+        "hexlib_dsp.h declares it in"
+    )
+    assert rsp.n_ops == hdr_fields["n_ops"]
+    assert rsp.cycles_total == hdr_fields["cycles_total"]
+    assert rsp.arch == hdr_fields["arch"]
+    assert len(rsp.results) == len(results)
+    for got, want in zip(rsp.results, results):
+        assert (got.kind, got.status, got.cycles) == (
+            want["kind"], want["status"], want["cycles"]
+        ), (
+            "an OpResult's kind/status/cycles came back in a different order "
+            "than the DSP wrote them"
+        )
+    assert not rsp.ok, "a non-OK batch status must not read as ok"
 
 
 @pytest.fixture(scope="module")

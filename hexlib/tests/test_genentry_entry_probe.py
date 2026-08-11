@@ -29,16 +29,51 @@ which mainstream x86 gcc does not accept -- and nothing here depends on the
 type's arithmetic, only on the entry's control flow before the call. The kernels
 themselves are recording stubs, because "the kernel was not called" is half of
 every assertion below.
+
+TWO PROBES, AND THE SECOND ONE EXISTS BECAUSE THE FIRST'S CLAIM WAS HALF TRUE.
+`test_buffers_are_packed_sources_then_destinations` says the src-then-dst
+contract is "PINNED FROM BOTH SIDES AT ONCE". It was not: only `genentry`'s
+generated entries were compiled, so it pinned `genentry`'s `out_idx = n_in` and
+nothing else. `skel_dispatch.c`'s fill loop -- the OTHER side, and the only
+statement anywhere that `a->buf[]` holds sources followed by destinations -- was
+never built here, and INVERTING IT (destinations packed first) left this file at
+6 passed. The claim was written by the same hand that wrote the test and it was
+simply wrong.
+
+So there is now a second fixture, `both_sides`, that compiles the REAL
+`skel_dispatch.c` and `skel_bufs.c` together with a generated entry and drives a
+REAL batch blob from `hexlib.runtime.wire.pack_batch` through
+`hexlib_dispatch_batch`. Nothing about the ordering is asserted textually: the
+recording kernel reports which ADDRESS it received as its input and which as its
+output, and those addresses are checked against the fd-plus-offset arithmetic the
+batch declared. Inverting either side -- the fill loop or `out_idx` -- makes the
+kernel receive the other tensor and fails it. That is what pinning both sides at
+once means, and it also makes this the one offline test that drives the host
+serializer, the DSP-side fd-to-address mapping, the dispatcher and a generated
+entry in a single run.
+
+THE STANDING-IN GOES ONE LEVEL FURTHER FOR THAT SECOND PROBE, and here is
+exactly how far. Stubbed: `HAP_farf.h` (FARF discards its arguments),
+`HAP_perf.h` (a monotonic counter), `HAP_mem.h` (HAP_mmap2 returns a small
+distinct fake address per fd, so `hexlib_tensor.data` -- a uint32_t -- can hold
+it), and `hexlib_vtcm_acquire`/`hexlib_vtcm_release`, which this probe is not
+about. Real and compiled from the repo: skel_dispatch.c, skel_bufs.c,
+hexlib_dsp.h, skel_internal.h, the generated entry. The addresses are never
+dereferenced -- the kernel stub records the pointer and returns -- so a fake
+mapping is enough to make identity meaningful, which is the only property under
+test.
 """
 import pathlib
 import re
 import shutil
+import struct
 import subprocess
 
 import pytest
 
 from hexlib.exec import runner as rn
 from hexlib.runtime import genentry as ge
+from hexlib.runtime import wire
 from hexlib.runtime.wire import DTYPE_ID, STATUS
 
 SKEL = pathlib.Path("hexlib/runtime/skel")
@@ -320,7 +355,16 @@ def test_buffers_are_packed_sources_then_destinations(probe):
 
     This checks the POINTERS the kernel actually received, so it fails on the
     swap rather than on the spelling of any particular index expression. b0/b1/b2
-    are distinct static arrays, which is what makes identity meaningful."""
+    are distinct static arrays, which is what makes identity meaningful.
+
+    ONE SIDE, HONESTLY LABELLED. The heading above used to say both sides were
+    pinned here. They were not: this probe hands `hexlib_args` to the entry
+    DIRECTLY, so it pins `genentry`'s half of the contract -- that the entry
+    reads its inputs from indices 0..n_in-1 and its output from index n_in -- and
+    nothing about how `a->buf[]` came to be filled. `skel_dispatch.c`'s fill loop
+    was not compiled by this file at all, and inverting it left every test here
+    passing. `test_the_dispatcher_and_the_generated_entry_agree_on_src_then_dst`
+    below is the other side, and the two together are what the heading claims."""
     assert probe["_scale_order"][0], (
         "scale_fp16 must receive buf[0] as its input and buf[1] as its output "
         "(1 source, then 1 destination)"
@@ -329,3 +373,335 @@ def test_buffers_are_packed_sources_then_destinations(probe):
         "add_fp16 must receive buf[0] and buf[1] as its two inputs and buf[2] as "
         "its output -- the destination sits at index n_in, not index 0"
     )
+
+
+# ==============================================================================
+# THE OTHER SIDE OF THE SAME CONTRACT: skel_dispatch.c's fill loop, compiled and
+# driven with a real batch blob. See the module docstring for what is stubbed.
+# ==============================================================================
+
+_STUB_HEADERS = {
+    # FARF discards its arguments: nothing here reads a device log.
+    "HAP_farf.h": (
+        "#ifndef HEXLIB_PROBE_HAP_FARF_H\n"
+        "#define HEXLIB_PROBE_HAP_FARF_H\n"
+        "#define FARF(...) do { } while (0)\n"
+        "#endif\n"
+    ),
+    # A monotonic counter, so the PCYCLE bracket produces a nonzero delta and
+    # the response's cycles_total is checkable without a real counter.
+    "HAP_perf.h": (
+        "#ifndef HEXLIB_PROBE_HAP_PERF_H\n"
+        "#define HEXLIB_PROBE_HAP_PERF_H\n"
+        "static unsigned long long hexlib_probe_pcycles;\n"
+        "static inline unsigned long long HAP_perf_get_pcycles(void) {\n"
+        "    hexlib_probe_pcycles += 1287; return hexlib_probe_pcycles;\n"
+        "}\n"
+        "#endif\n"
+    ),
+    # A distinct small fake address per fd. SMALL ON PURPOSE: hexlib_tensor.data
+    # is a uint32_t, so a real 64-bit host address would be truncated by
+    # skel_bufs.c's own (uint32_t) cast and identity would stop meaning
+    # anything. Nothing dereferences these.
+    "HAP_mem.h": (
+        "#ifndef HEXLIB_PROBE_HAP_MEM_H\n"
+        "#define HEXLIB_PROBE_HAP_MEM_H\n"
+        "#include <stddef.h>\n"
+        "#define HAP_PROT_READ 1\n"
+        "#define HAP_PROT_WRITE 2\n"
+        "#define HEXLIB_PROBE_BASE(fd) "
+        "(0x01000000u + 0x00010000u * (unsigned) (fd))\n"
+        "static inline void *HAP_mmap2(void *a, size_t l, int p, int f,\n"
+        "                              int fd, long o) {\n"
+        "    (void) a; (void) l; (void) p; (void) f; (void) o;\n"
+        "    return (void *) (size_t) HEXLIB_PROBE_BASE(fd);\n"
+        "}\n"
+        "static inline void *HAP_mmap(void *a, int l, int p, int f,\n"
+        "                             int fd, long o) {\n"
+        "    (void) a; (void) l; (void) p; (void) f; (void) o;\n"
+        "    return (void *) (size_t) HEXLIB_PROBE_BASE(fd);\n"
+        "}\n"
+        "static inline int HAP_munmap2(void *a, size_t l) {\n"
+        "    (void) a; (void) l; return 0;\n"
+        "}\n"
+        "static inline int HAP_munmap(void *a, int l) {\n"
+        "    (void) a; (void) l; return 0;\n"
+        "}\n"
+        "#endif\n"
+    ),
+}
+
+# Only the one kernel this probe drives, so `kernel_api.h` above is not reused
+# (it declares three).
+_DISPATCH_KERNEL_API_H = """\
+#ifndef PROBE_DISPATCH_KERNEL_API_H
+#define PROBE_DISPATCH_KERNEL_API_H
+typedef unsigned short hexlib_hf;
+void scale_fp16(const hexlib_hf *x, hexlib_hf *y, int n, float factor);
+#endif
+"""
+
+_DISPATCH_PROBE_C = r"""
+#include "skel_internal.h"
+#include "kernel_api.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Recording stub. The addresses are never dereferenced -- WHICH buffer arrived
+ * where is the entire question. */
+static int g_calls;
+static const void *g_in0;
+static const void *g_out;
+static int g_n;
+static float g_factor;
+
+void scale_fp16(const hexlib_hf *x, hexlib_hf *y, int n, float factor) {
+    g_calls++; g_in0 = x; g_out = y; g_n = n; g_factor = factor;
+}
+
+extern int scale_fp16_entry(const hexlib_args *);
+
+/* The real table shape from hexlib_dsp.h, with the one generated entry. */
+const struct hexlib_kernel_entry hexlib_kernel_table[] = {
+    { PROBE_KIND_SCALE, "scale_fp16", scale_fp16_entry },
+};
+const uint32_t hexlib_kernel_table_len = 1;
+
+/* Not what this probe is about; skel_vtcm.c needs the real HAP_compute_res. */
+int hexlib_vtcm_acquire(struct hexlib_ctx *c) { (void) c; return HEXLIB_DSP_OK; }
+void hexlib_vtcm_release(struct hexlib_ctx *c) { (void) c; }
+
+static struct hexlib_ctx g_ctx;
+static unsigned char g_batch[65536];
+/* uint64-aligned: the dispatcher casts rsp + sizeof(hdr) to
+ * struct hexlib_op_result *, which contains a uint64_t. */
+static unsigned long long g_rsp[1024];
+
+int main(int argc, char **argv) {
+    FILE *f;
+    size_t len;
+    int i;
+    uint32_t rsp_len = 0;
+    int rc;
+
+    if (argc < 3) return 2;
+    f = fopen(argv[1], "rb");
+    if (!f) return 3;
+    len = fread(g_batch, 1, sizeof(g_batch), f);
+    fclose(f);
+
+    memset(&g_ctx, 0, sizeof(g_ctx));
+    /* Register every fd the batch names, exactly as hexlib_iface_mmap would. */
+    for (i = 2; i < argc; i++) {
+        unsigned fd = (unsigned) strtoul(argv[i], 0, 10);
+        printf("register fd=%u rc=%d\n", fd,
+               hexlib_bufs_register(&g_ctx, fd, PROBE_BUF_SIZE));
+    }
+    /* The DSP-side mapping table, so the expected addresses are read out of the
+     * real skel_bufs.c state rather than recomputed by the test. */
+    for (i = 0; i < HEXLIB_MAX_MMAPS; i++) {
+        if (g_ctx.mmap[i].size) {
+            printf("mapped fd=%d base=%llu\n", (int) g_ctx.mmap[i].fd,
+                   (unsigned long long) g_ctx.mmap[i].base);
+        }
+    }
+
+    g_ctx.started = 1;
+    rc = hexlib_dispatch_batch(&g_ctx, g_batch, (uint32_t) len,
+                               (unsigned char *) g_rsp,
+                               (uint32_t) sizeof(g_rsp), &rsp_len);
+    printf("dispatch rc=%d rsp_len=%u calls=%d n=%d factor_ok=%d\n",
+           rc, rsp_len, g_calls, g_n, g_factor == 0.125f ? 1 : 0);
+    printf("in0=%llu out=%llu\n",
+           (unsigned long long) (size_t) g_in0,
+           (unsigned long long) (size_t) g_out);
+    printf("rsp=");
+    for (i = 0; i < (int) rsp_len; i++) {
+        printf("%02x", ((unsigned char *) g_rsp)[i]);
+    }
+    printf("\n");
+    return 0;
+}
+"""
+
+# Distinct fds and distinct NONZERO offsets: the input's address and the
+# output's must be different numbers for identity to prove anything, and an
+# offset of 0 on both would make a base-only bug invisible.
+_FD_IN, _FD_OUT = 11, 22
+_OFF_IN, _OFF_OUT = 128, 256
+_BUF_SIZE = 4096
+_NE = (17, 1, 1, 1)
+_FACTOR = 0.125  # a power of two, exact in fp16 -- same value run_self_test uses
+
+
+@pytest.fixture(scope="module")
+def both_sides(tmp_path_factory):
+    """Compile skel_dispatch.c + skel_bufs.c + a generated entry, build a real
+    batch with `wire.pack_batch`, run it through `hexlib_dispatch_batch`, and
+    return what the kernel saw plus the raw response bytes."""
+    if HOST_CC is None:
+        pytest.skip("no host C compiler")
+    d = tmp_path_factory.mktemp("dispatchprobe")
+    for name, text in _STUB_HEADERS.items():
+        (d / name).write_text(text)
+    (d / "kernel_api.h").write_text(_DISPATCH_KERNEL_API_H)
+    (d / "probe.c").write_text(_DISPATCH_PROBE_C)
+    (d / "scale_entry.c").write_text(ge.emit_entry("scale", rn.SPECS["scale"]))
+
+    kind = ge.KIND_ID["scale"]
+    exe = str(d / "probe.exe")
+    cmd = [
+        HOST_CC, "-std=c11", "-O0",
+        f"-DPROBE_KIND_SCALE={kind}u", f"-DPROBE_BUF_SIZE={_BUF_SIZE}u",
+        # The arch this "binary" was built for (hexlib_write_rsp_hdr reads it)
+        # and the HVX level that selects skel_bufs.c's HAP_mmap2 branch -- the
+        # v75 branch, which is the one that runs on the target part.
+        "-D__HEXAGON_ARCH__=75", "-D__HVX_ARCH__=75",
+        "-I", str(d), "-I", str(SKEL.resolve()),
+        str(d / "probe.c"), str(d / "scale_entry.c"),
+        str((SKEL / "skel_dispatch.c").resolve()),
+        str((SKEL / "skel_bufs.c").resolve()),
+        "-o", exe,
+    ]
+    cp = subprocess.run(cmd, capture_output=True, text=True)
+    assert cp.returncode == 0, (
+        "the skel dispatch probe did not compile. THIS FIXTURE IMPOSES A REAL "
+        "CONSTRAINT AND THAT IS DELIBERATE: skel_dispatch.c and skel_bufs.c must "
+        "stay buildable by a plain host C compiler, i.e. straight-line C with no "
+        "Hexagon intrinsics and no inline asm, with every SDK dependency behind "
+        "one of the stubbed headers above. That is already true and is worth "
+        "keeping -- it is the same property that makes the cycle counter go "
+        "through HAP_perf_get_pcycles() rather than a hand-rolled `c15:14` read. "
+        "If a kernel-side intrinsic genuinely belongs in one of these two files, "
+        "it needs to move behind a helper this probe can stub, not be absorbed "
+        f"by deleting this test:\n{cp.stderr}"
+    )
+
+    bufs = [wire.BufDesc(fd=_FD_IN, size=_BUF_SIZE),
+            wire.BufDesc(fd=_FD_OUT, size=_BUF_SIZE)]
+    nbytes = 2 * _NE[0]
+    tensors = [
+        wire.TensorDesc(bi=0, offset=_OFF_IN, nbytes=nbytes, dtype="fp16",
+                        layout="row_major", ne=_NE),
+        wire.TensorDesc(bi=1, offset=_OFF_OUT, nbytes=nbytes, dtype="fp16",
+                        layout="row_major", ne=_NE),
+    ]
+    factor_bits = struct.unpack("<i", struct.pack("<f", _FACTOR))[0]
+    ops = [wire.OpDesc(kind=kind, params=(factor_bits,), src=(0,), dst=(1,))]
+    (d / "batch.bin").write_bytes(wire.pack_batch(bufs, tensors, ops))
+
+    run = subprocess.run(
+        [exe, str(d / "batch.bin"), str(_FD_IN), str(_FD_OUT)],
+        capture_output=True, text=True,
+    )
+    assert run.returncode == 0, (
+        f"the skel dispatch probe exited {run.returncode}:\n"
+        f"{run.stdout}\n{run.stderr}"
+    )
+
+    out = {"bases": {}}
+    for line in run.stdout.splitlines():
+        if line.startswith("mapped "):
+            m = re.match(r"mapped fd=(-?\d+) base=(\d+)", line)
+            out["bases"][int(m.group(1))] = int(m.group(2))
+        elif line.startswith("dispatch "):
+            out.update({k: int(v) for k, v in re.findall(r"(\w+)=(-?\d+)", line)})
+        elif line.startswith("in0="):
+            m = re.match(r"in0=(\d+) out=(\d+)", line)
+            out["in0"], out["out"] = int(m.group(1)), int(m.group(2))
+        elif line.startswith("rsp="):
+            out["rsp"] = bytes.fromhex(line[4:])
+    for key in ("rc", "calls", "n", "in0", "out", "rsp"):
+        assert key in out, f"the probe printed no {key}:\n{run.stdout}"
+    assert out["bases"], f"the probe registered no fds:\n{run.stdout}"
+    return out
+
+
+@needs_cc
+def test_the_dispatcher_and_the_generated_entry_agree_on_src_then_dst(both_sides):
+    """THE CONTRACT, NOW GENUINELY PINNED FROM BOTH SIDES AT ONCE.
+
+    `skel_dispatch.c` walks `op.src` then `op.dst` into one `a->buf[]`;
+    `genentry` reads the output back out at `out_idx = n_in`. Neither references
+    the other. Invert either and `scale_fp16` writes into its own input and
+    returns the untouched output region -- at the right length, with status OK,
+    on real silicon. Only the @sdk-gated numeric test would have noticed, and CI
+    does not run it.
+
+    What is checked is the ADDRESS the kernel received for each argument,
+    against the fd-plus-offset arithmetic the batch declared, with the bases read
+    out of skel_bufs.c's own mapping table. No index expression, no field name
+    and no source text is matched, so this fails on the swap itself rather than
+    on how anyone spelled it."""
+    base_in = both_sides["bases"][_FD_IN]
+    base_out = both_sides["bases"][_FD_OUT]
+    assert base_in != base_out, "the two fds must map to different addresses"
+
+    assert both_sides["calls"] == 1, "the kernel was not called exactly once"
+    assert both_sides["in0"] == base_in + _OFF_IN, (
+        f"scale_fp16 received {both_sides['in0']} as its INPUT; the batch's one "
+        f"source tensor is at fd {_FD_IN} + {_OFF_IN} = {base_in + _OFF_IN}. "
+        f"(The output tensor is at {base_out + _OFF_OUT} -- if that is what "
+        f"arrived, sources and destinations are packed the other way round on "
+        f"one of the two sides, and the kernel is reading what it should be "
+        f"writing.)"
+    )
+    assert both_sides["out"] == base_out + _OFF_OUT, (
+        f"scale_fp16 received {both_sides['out']} as its OUTPUT, expected "
+        f"{base_out + _OFF_OUT} -- the destination sits at buf[n_in], filled "
+        f"from op.dst after op.src"
+    )
+
+
+@needs_cc
+def test_the_dispatcher_resolves_a_tensor_from_the_dsp_side_mapping_only(both_sides):
+    """The corollary, and the invariant skel_bufs.c exists for: the address the
+    kernel got is `base + offset` where `base` came from the DSP's OWN mmap
+    table, keyed by fd. `wire.pack_batch` writes zero into the `base` wire slot
+    and there is no field for a host address, so an implementation that leaned on
+    one could not even be expressed here -- what this adds is that the address
+    actually used is the mapped one, measured, rather than 0 + offset (upstream's
+    silent fallthrough) or the offset alone."""
+    base_in = both_sides["bases"][_FD_IN]
+    assert both_sides["in0"] not in (0, _OFF_IN), (
+        "the kernel's pointer must be a real mapped address plus the offset, "
+        "not the offset alone or a zero base"
+    )
+    assert both_sides["in0"] - _OFF_IN == base_in
+    assert both_sides["n"] == _NE[0], (
+        f"the extent must be derived from the tensor's own ne on the DSP side; "
+        f"got n={both_sides['n']}, expected {_NE[0]}"
+    )
+    assert both_sides["factor_ok"] == 1, (
+        "the op's params blob must reach the kernel as float bits -- it is "
+        "carried as int32[] on the wire and cast on the DSP side"
+    )
+
+
+@needs_cc
+def test_the_response_the_dispatcher_wrote_is_what_wire_py_unpacks(both_sides):
+    """END TO END, IN BOTH DIRECTIONS, IN ONE RUN: `wire.pack_batch` built the
+    blob, the real dispatcher walked it, and the response bytes it wrote go back
+    through `wire.unpack_response`. test_wire_struct_layout.py pins the two
+    descriptions of these bytes against each other by size and offset; this pins
+    them against a real dispatcher's real output.
+
+    `cycles_total > 0` because the probe's HAP_perf stub advances -- which checks
+    that the PCYCLE bracket's delta actually reaches the response header, the
+    thing `hexlib/cli.py` refuses a device job over."""
+    rsp = wire.unpack_response(both_sides["rsp"])
+    assert rsp.status == STATUS["OK"], f"batch status {rsp.status}"
+    assert rsp.n_ops == 1
+    assert rsp.arch == 75, (
+        "the response must carry the arch the skel was BUILT for "
+        "(__HEXAGON_ARCH__), never a caller-supplied value"
+    )
+    assert len(rsp.results) == 1
+    assert rsp.results[0].kind == ge.KIND_ID["scale"]
+    assert rsp.results[0].status == STATUS["OK"]
+    assert rsp.results[0].cycles > 0
+    assert rsp.cycles_total == rsp.results[0].cycles, (
+        "one op, so the batch total is that op's own bracket"
+    )
+    assert both_sides["rc"] == STATUS["OK"]
