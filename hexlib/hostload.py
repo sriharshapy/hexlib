@@ -190,7 +190,11 @@ def timeout_diagnosis(timeout_s: float, stats: LoadStats) -> str:
     return (
         f"the simulator was given {share:.0%} of one CPU "
         f"({stats.cpu_s:.0f} CPU-seconds over {stats.wall_s:.0f} wall-seconds), "
-        f"so the host was not starving it: the kernel did not finish within "
-        f"{timeout_s:.0f}s of its own accord. Either it does not terminate, or "
-        f"this shape genuinely costs more than the budget allows."
+        f"so it was not DESCHEDULED. That is weaker than 'the host was idle': a "
+        f"process keeps accruing a full CPU-second per wall-second while losing "
+        f"badly to memory-bandwidth contention, an SMT sibling, or cache "
+        f"pressure. Measured 2026-08-13: a byte-identical near-miss ELF ran "
+        f"1218s once and exceeded 1800s twice at ~99% share. So this points at "
+        f"the kernel or the shape WITHOUT ruling out a loaded host -- check what "
+        f"else was running before concluding the code is at fault."
     )

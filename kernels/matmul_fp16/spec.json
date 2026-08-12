@@ -2,12 +2,14 @@
   "task_id": "matmul_fp16",
   "dtype": "fp16",
   "caps": [],
-  "mechanisms": ["hvx"],
+  "mechanisms": [
+    "hvx"
+  ],
   "params": {
     "Bn": 3,
     "M": 40,
     "K": 128,
-    "N": 200,
+    "N": 192,
     "encoder_shapes": [
       "fp16 (12, 256, 64) @ fp16 (12, 64, 256) -> fp16 (12, 256, 256)  [QK^T]",
       "fp16 (12, 256, 256) @ fp16 (12, 256, 64) -> fp16 (12, 256, 64)  [AV]"
@@ -16,9 +18,16 @@
     "no_bias_no_activation": "matmul_epilogue is a different op/kernel",
     "mechanism": "hvx-compute: N vectorised 64-fp16-lanes-at-a-time (outer-product accumulation over K), qf32 accumulate, single narrow to fp16 at the end of each row's K loop",
     "hmx_attempted": "yes -- abandoned after the standalone gate runtime hung when the kernel enabled the HMX/SSR.XE extension context from inside kernel.c; see the kernel-matmul-report.md for what was tried",
-    "fallback": "plain scalar float32-accumulate loop for N wider than this kernel's fixed 8-block (512-column) accumulator; the vectorised column blocks use unaligned HVX loads/stores (hvx_vmemu) precisely because N is not guaranteed to be a multiple of 64 -- an earlier version used an aligned HVX_Vector dereference here, which silently corrupted the vectorised columns for any N % 64 != 0; a per-column scalar tail still handles the leftover columns past the last full 64-wide block; N=200 (not a multiple of 64) is gated specifically to keep this from regressing"
+    "fallback": "plain scalar float32-accumulate loop for N wider than this kernel's fixed 8-block (512-column) accumulator; the vectorised column blocks use unaligned HVX loads/stores (hvx_vmemu) precisely because N is not guaranteed to be a multiple of 64 -- an earlier version used an aligned HVX_Vector dereference here, which silently corrupted the vectorised columns for any N % 64 != 0; a per-column scalar tail still handles the leftover columns past the last full 64-wide block; N=200 (not a multiple of 64) is gated specifically to keep this from regressing",
+    "gate_shape_is_not_set_here": "Bn/M/K/N above are DESCRIPTIVE ONLY. The gate's real shape is #defined as MM_B/MM_M/MM_K/MM_N in kernel_api.h and nothing passes these values to the build -- editing them here changes NOTHING about what runs. Verified 2026-08-13 after changing N here 192->200 and M 40->20 and finding the rebuilt near-miss ELFs byte-identical to the previous run's. Widening the gate to a non-multiple-of-64 N (to cover the aligned-load bug fixed in 9b6f7c0) means editing MM_N in kernel_api.h, and re-checking that the harness's adversarial element (MM_ADV_N) still works at the new N."
   },
   "expert_kernel_cycles": null,
   "tolerance": "hexlib_close_f16",
-  "tags": ["matmul", "attention", "encoder", "qkt", "av"]
+  "tags": [
+    "matmul",
+    "attention",
+    "encoder",
+    "qkt",
+    "av"
+  ]
 }

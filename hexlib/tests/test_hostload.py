@@ -41,13 +41,21 @@ def test_contended_host_is_not_blamed_on_the_kernel():
     assert "not evidence that the kernel fails to terminate" in msg
 
 
-def test_unstarved_timeout_does_implicate_the_kernel():
-    """nearmiss_fp16_accumulate at the old 900s ceiling: the host gave it
-    everything and it still did not finish. That IS about the code."""
+def test_an_undescheduled_timeout_points_at_the_code_without_exonerating_the_host():
+    """A full CPU share means NOT DESCHEDULED, which is weaker than "the host
+    was idle" -- and the message must not overclaim.
+
+    This assertion was originally `"not starving it" in msg`, and the message
+    it pinned was wrong. On 2026-08-13 a byte-identical near-miss ELF ran 1218s
+    once and exceeded 1800s twice, all at ~99% CPU share: memory-bandwidth
+    contention and SMT siblings slow a process that is never descheduled. A
+    diagnosis that reads "the host was not starving it" sends the next reader
+    to hunt a kernel bug that is not there.
+    """
     stats = LoadStats(wall_s=900.0, cpu_s=890.0, samples=400)
     msg = hostload.timeout_diagnosis(900.0, stats)
-    assert "not starving it" in msg
-    assert "does not terminate" in msg or "costs more than the budget" in msg
+    assert "not DESCHEDULED" in msg
+    assert "WITHOUT ruling out a loaded host" in msg
 
 
 def test_unmeasured_timeout_reports_the_ambiguity():
