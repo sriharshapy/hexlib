@@ -423,8 +423,11 @@ def _qdc_submit(args) -> int:
 
     out_base = os.path.join(args.out, "qdc_job")
     try:
+        # binaries -> bin/, python -> tests/. See artifact.stage: a flat zip
+        # is accepted and never runs.
         zip_path = artifact.stage(
-            [hexlib_run, skel_so, utils_py, conftest_py], test_script, out_base
+            [hexlib_run, skel_so], test_script, out_base,
+            support_files=[utils_py, conftest_py],
         )
     except artifact.StagingError as e:
         print(f"error: staging the QDC artifact failed: {e}", file=sys.stderr)

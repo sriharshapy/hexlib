@@ -48,11 +48,19 @@ import tempfile
 
 QDC_LOG_DIR = "/data/local/tmp/QDC_logs"
 
-# Where QDC extracted the artifact ON THE RUNNER. Derived from this file's own
-# location rather than hardcoded to `/qdc/appium`: that is the documented
-# extraction point, but this module is the one thing guaranteed to sit beside
-# the staged binaries wherever they actually landed.
-STAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Where the staged BINARIES are ON THE RUNNER. This module lives in `tests/`
+# and the binaries in `bin/`, both under QDC's extraction point (`/qdc/appium`
+# in every observed job), so the binaries are a sibling directory up one
+# level -- derived from this file's own location rather than hardcoding
+# `/qdc/appium`, which is documented but not promised.
+#
+# Falls back to this module's own directory when there is no `bin/` sibling,
+# which is how it looks in the repo, so importing this file outside an
+# extracted artifact still gives a sane value instead of a path that cannot
+# exist.
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+_BIN_DIR = os.path.join(os.path.dirname(_TESTS_DIR), "bin")
+STAGE_DIR = _BIN_DIR if os.path.isdir(_BIN_DIR) else _TESTS_DIR
 
 
 class ShError(Exception):

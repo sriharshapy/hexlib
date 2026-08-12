@@ -52,22 +52,56 @@ def driver():
     that never establishes one is the most plausible remaining reason two
     hexlib jobs reached Completed having emitted nothing of their own.
 
+    NON-FATAL BY DESIGN, and that is the important part. This fixture is
+    session-scoped and autouse, so if it raised it would error EVERY test --
+    turning a run that would otherwise have worked into a total failure, to
+    obtain an object none of these tests use.
+
+    That is not a hypothetical trade-off. Job 744001 (hexbench, this account,
+    this device) collected and ran `tests/test_capprobe.py` against the phone
+    purely over adb, with no Appium session anywhere in its stdout. So the
+    session is plausibly unnecessary here; it is attempted because llama.cpp's
+    runner does establish one and a missing session is the other candidate
+    explanation for a test stage that never starts. Attempt it, keep it if it
+    works, and never let its absence be the reason a job reports nothing.
+
     Imported inside the fixture so that collecting this file does not require
     the Appium client to be installed -- the report-copying hook below is the
-    part that must work even when the session cannot be created.
+    part that must work regardless.
     """
-    from appium import webdriver
-    from appium.options.common import AppiumOptions
+    try:
+        from appium import webdriver
+        from appium.options.common import AppiumOptions
 
-    options = AppiumOptions()
-    options.set_capability("automationName", "UiAutomator2")
-    options.set_capability("platformName", "Android")
-    options.set_capability("deviceName", os.getenv("ANDROID_DEVICE_VERSION"))
-    return webdriver.Remote(
-        command_executor="http://127.0.0.1:4723/wd/hub", options=options
-    )
+        options = AppiumOptions()
+        options.set_capability("automationName", "UiAutomator2")
+        options.set_capability("platformName", "Android")
+        options.set_capability("deviceName", os.getenv("ANDROID_DEVICE_VERSION"))
+        return webdriver.Remote(
+            command_executor="http://127.0.0.1:4723/wd/hub", options=options
+        )
+    except Exception:
+        # Recorded, not raised: a reader of the collected logs needs to know
+        # whether a session existed when interpreting whatever the job did.
+        try:
+            write_qdc_log(
+                "hexlib_appium_session.txt",
+                "no Appium session was established; tests ran over adb "
+                f"alone:\n{traceback.format_exc()}",
+            )
+        except Exception:
+            pass
+        return None
 
-_RESULTS_NAME = os.path.join("TestLogs", "results.xml")
+# FLAT, and deliberately NOT `TestLogs/results.xml`. QDC publishes pytest's
+# own junitxml as `<job>/<subid>/TestLogs/results.xml` -- that is the file
+# job.wait() matches. This copy lands under `UserCollectedLogs/QDC_logs/`
+# (exactly where job 744001's own `results.xml` is), so naming it
+# `TestLogs/results.xml` would produce a SECOND collected name ending in that
+# suffix, and cli._qdc_check_results treats two matches as a failure rather
+# than picking one. This copy exists to survive the framework not publishing
+# its own, not to compete with it.
+_RESULTS_NAME = "results.xml"
 
 
 def _copy_report(config):

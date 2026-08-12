@@ -72,7 +72,7 @@ def _stub_build_submit_and_wait(monkeypatch):
         open(os.path.join(build_dir, "libhexlib_skel.so"), "wb").close()
         return exe
 
-    def fake_stage(binaries, test_script, out_base):
+    def fake_stage(binaries, test_script, out_base, support_files=None):
         zip_path = out_base + ".zip"
         os.makedirs(os.path.dirname(zip_path), exist_ok=True)
         open(zip_path, "wb").close()

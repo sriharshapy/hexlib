@@ -351,11 +351,38 @@ def wait(job_id: int, cap_s: int = 1800) -> bool:
     """
     client = _client()
     deadline = time.monotonic() + cap_s
+    errors = 0
     while True:
-        files = qdc_api.get_job_log_files(client, job_id)
-        if _has_results(files):
-            return True
+        # A TRANSIENT API ERROR IS NOT A VERDICT. This call used to be
+        # unguarded, so one HTTP 502 anywhere in ~60 polls raised straight out
+        # of wait(), through _qdc_submit, and killed the CLI -- discarding a
+        # job whose minutes were already spent, before anything was fetched or
+        # checked. Observed on job 756206 (2026-08-12), and a second 502 hit
+        # get_job_log_upload_status for 756159 the same afternoon, so this is
+        # a property of the service rather than one bad moment. llama.cpp's
+        # runner retries these calls for the same reason.
+        #
+        # Swallowed only until the cap, never forever, and counted so that
+        # "the API was down the whole time" cannot masquerade as the ordinary
+        # "no results appeared" answer -- those are different findings and the
+        # caller is told which one it got.
+        try:
+            files = qdc_api.get_job_log_files(client, job_id)
+            if _has_results(files):
+                return True
+        except Exception as e:  # noqa: BLE001 - any transport failure retries
+            errors += 1
+            print(
+                f"qdc: polling job {job_id} log files failed "
+                f"({errors} time(s)), retrying: {e}"
+            )
         if time.monotonic() >= deadline:
+            if errors:
+                print(
+                    f"qdc: gave up on job {job_id} after {cap_s}s with "
+                    f"{errors} failed poll(s) -- if that is every poll, this "
+                    f"is an API outage, not a job that produced nothing"
+                )
             return False
         time.sleep(POLL_S)
 
