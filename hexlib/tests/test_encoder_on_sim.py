@@ -47,6 +47,7 @@ import hexlib.graph.opdefs  # noqa: F401  -- registers the op definitions
 from hexlib import toolchain as tc
 from hexlib.exec import dsp as dspmod
 from hexlib.exec import interpreter
+from hexlib.exec.quant import dequantize_q4_0, quantize_q4_0
 from hexlib.exec.runner import SPECS, select
 from hexlib.graph.pipeline import compile_model
 from hexlib.models.vit import VitConfig, build_vision_encoder
@@ -104,21 +105,40 @@ def _compiled():
     return compiled, compiled.graph, compiled.plan
 
 
-def _feeds(graph, seed=3):
+def _feeds(graph, plan, seed=3):
     """Every graph input and every const, in the shapes the graph declares.
 
     Consts are RANDOM rather than zero or one. A zero weight makes every matmul
     return zeros, which agrees with any reference for any reason; a weight of one
     makes a transposed operand undetectable. Neither would fail if the DSP were
     wrong.
+
+    WEIGHT CONSTS ARE PRE-QUANTIZED. `matmul_epilogue`'s weight input (index 1,
+    see `hexlib.graph.opdefs.fused._infer`) crosses the wire as q4_0 -- `dsp.py`
+    quantizes it on the fly, on the way to the simulator (see
+    `interpreter_backends`'s docstring). The reference path never quantizes
+    anything, so comparing it against the fp32 weight measures the q4_0 FORMAT's
+    own ~1/16-of-range error, not the kernel. Running the same round trip here,
+    on the feed, makes both paths multiply by the identical q4_0-quantized
+    values: dsp.py's on-the-wire quantization of an already-quantized array
+    reproduces the same bytes, so what is left to compare is arithmetic and fp16
+    rounding -- what the tolerance below is actually for.
     """
+    weight_names = {
+        step.op.inputs[1]
+        for step in plan.steps
+        if step.op.kind == "matmul_epilogue"
+    }
     rng = np.random.default_rng(seed)
     feeds = {}
     for name in list(graph.inputs) + [
         t.name for t in graph.tensors.values() if t.const
     ]:
         spec = graph.tensor(name)
-        feeds[name] = (rng.standard_normal(spec.shape) * 0.5).astype(np.float32)
+        w = (rng.standard_normal(spec.shape) * 0.5).astype(np.float32)
+        if name in weight_names:
+            w = dequantize_q4_0(quantize_q4_0(w), w.shape).astype(w.dtype)
+        feeds[name] = w
     return feeds
 
 
@@ -156,12 +176,17 @@ def test_the_tiny_encoder_plan_is_the_shape_this_test_assumes():
         "no perm(0,2,1) transpose in the plan -- the variant-routing claim below "
         "would be vacuous"
     )
-    # Every kind either dispatches or is a known gap, never something else.
-    known_gaps = {"matmul", "matmul_epilogue"}
-    assert set(fallback) <= known_gaps, (
-        f"unexpected kinds fell back to the reference: "
-        f"{sorted(set(fallback) - known_gaps)}. Either a kernel regressed out of "
-        f"SPECS or the graph grew an op kind nobody has looked at."
+    # NO GAPS LEFT. matmul and matmul_epilogue got RunnerSpecs on 2026-08-12,
+    # so this goes from "no UNEXPECTED fallback" to "no fallback at all" --
+    # which is the property that makes the SDK test below an end-to-end DSP
+    # run rather than a partial one. The `known_gaps` set is gone rather than
+    # emptied: an empty allowlist and a plain emptiness check are the same
+    # assertion, and keeping both leaves a dead name for the next reader to
+    # wonder about.
+    assert not fallback, (
+        f"these ops fell back to the numpy reference instead of dispatching: "
+        f"{dict(fallback)}. Every real-work op is supposed to reach the DSP; "
+        f"either a kernel regressed out of SPECS or the graph grew a new kind."
     )
 
 
@@ -189,7 +214,7 @@ def test_the_whole_encoder_agrees_with_the_reference_with_every_kernel_on_the_ds
     """
     compiled, graph, plan = _compiled()
     on_dsp, fallback = _dispatchable(plan)
-    feeds = _feeds(graph)
+    feeds = _feeds(graph, plan)
 
     sim = dspmod.DspSimBackend(
         sorted({os.path.basename(s.kernel_dir) for s in SPECS.values()}),
