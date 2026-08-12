@@ -121,10 +121,10 @@ void matmul_fp16(const hexlib_hf *A, const hexlib_hf *B, hexlib_hf *C,
                 const float av = (float) arow[k];
                 const HVX_Vector va = hvx_vec_splat_f32(av);
                 const hexlib_hf *brow = Bb + (long) k * N;
-                const HVX_Vector *bv = (const HVX_Vector *) brow;
 
                 for (int i = 0; i < nvec64; ++i) {
-                    HVX_VectorPair bp = hvx_vec_f16_to_f32(bv[i]);
+                    HVX_Vector bvi = hvx_vmemu(brow + (long) i * LANES_FP16);
+                    HVX_VectorPair bp = hvx_vec_f16_to_f32(bvi);
                     HVX_Vector blo = Q6_V_lo_W(bp);
                     HVX_Vector bhi = Q6_V_hi_W(bp);
                     acc_lo[i] = hvx_vec_add_f32_f32(acc_lo[i], hvx_vec_mul_f32_f32(va, blo));
@@ -135,9 +135,8 @@ void matmul_fp16(const hexlib_hf *A, const hexlib_hf *B, hexlib_hf *C,
                 }
             }
 
-            HVX_Vector *cv = (HVX_Vector *) crow;
             for (int i = 0; i < nvec64; ++i) {
-                cv[i] = hvx_vec_f32_to_f16(acc_lo[i], acc_hi[i]);
+                hvx_vmemu(crow + (long) i * LANES_FP16) = hvx_vec_f32_to_f16(acc_lo[i], acc_hi[i]);
             }
             for (int n = vecN; n < N; ++n) {
                 crow[n] = (hexlib_hf) scalar_acc[n - vecN];

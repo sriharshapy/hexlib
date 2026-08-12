@@ -623,6 +623,25 @@ def test_matmul_reduces_over_k_and_not_over_a_transposed_operand(backend):
     assert np.max(np.abs(y - want)) < 1e-2 * max(1.0, float(np.max(np.abs(want))))
 
 
+@sdk
+def test_matmul_is_correct_when_n_is_not_a_multiple_of_64(backend):
+    """N=96 is not a multiple of 64, so B's rows are not 128-byte aligned.
+
+    The vectorised path used to load them with an ALIGNED read, so the first
+    nvec64*64 columns were computed from shifted data while the scalar tail
+    was correct. Regression guard for that fix; the gate now covers this
+    shape too (spec.json's N is 200).
+    """
+    rng = np.random.default_rng(21)
+    Bn, M, K, N = 2, 4, 32, 96
+    a = rng.standard_normal((Bn, M, K)).astype(np.float16)
+    b = rng.standard_normal((Bn, K, N)).astype(np.float16)
+
+    y, _ = backend.run("matmul", [a, b], {})
+    want = a.astype(np.float32) @ b.astype(np.float32)
+    assert np.max(np.abs(y - want)) < 1e-2 * max(1.0, float(np.max(np.abs(want))))
+
+
 # ---------------------------------------------------------------------------
 # matmul_epilogue: fp16 activations, a q4_0 weight, an fp32 bias, and a string
 # `act` attr that has to cross the wire as an int code.
