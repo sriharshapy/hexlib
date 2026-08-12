@@ -115,7 +115,23 @@ HVX_CFLAGS = [f"-m{DSP_ARCH}", "-mhvx", "-mhvx-length=128B", f"-std={STD}", "-O2
 SIM_TIMEOUT_S = 60
 # An XL kernel gets more time, but this still kills genuine infinite loops.
 # Measured need: DMA/VTCM kernels have run 204-406s under the timing model.
-SIM_TIMEOUT_MAX_S = 900
+#
+# Raised 900 -> 1800 for matmul_fp16, whose SCALAR near-misses are the most
+# expensive code the gate runs. At its harness shape (Bn=3, M=40, K=128,
+# N=192 = 2.95M inner iterations) the three near-misses measured 825s, 862s
+# and 1195s. The 1195s one is nearmiss_fp16_accumulate: it narrows to fp16 on
+# every multiply-add rather than once per output element, costing 185,300,776
+# simulated cycles against the real kernel's 995,714 (186x). At 900s it was
+# killed 295s from the end and reported INCONCLUSIVE -- a correct near-miss
+# scored as a gate failure. Given room it terminates and rejects properly
+# (n_wrong 64, max_err 0.125).
+#
+# The cost of this headroom is that a genuine infinite loop now burns 30
+# minutes instead of 15. That was accepted deliberately: the alternative was
+# shrinking matmul_fp16's harness shape, and K=128 cannot move without
+# destroying the adversarial element (one dominant product plus exactly 127
+# followers) that catches the fp16-accumulation bug in the first place.
+SIM_TIMEOUT_MAX_S = 1800
 
 
 def default_sdk_root() -> str:
