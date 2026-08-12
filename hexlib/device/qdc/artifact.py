@@ -34,7 +34,10 @@ import shutil
 import zipfile
 
 _PYTEST_INI = "[pytest]\naddopts = --junitxml=TestLogs/results.xml\n"
-_REQUIREMENTS = "pytest\n"
+# Appium-Python-Client is here because the job runs under
+# TestFramework.APPIUM and conftest.py opens a session with it; the version is
+# the one llama.cpp's own QDC runner pins against this same account.
+_REQUIREMENTS = "pytest\nAppium-Python-Client==5.2.4\n"
 
 
 class StagingError(Exception):

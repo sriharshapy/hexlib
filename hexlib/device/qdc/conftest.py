@@ -37,7 +37,35 @@ immediately by `cli._qdc_check_results` and names its own cause.
 import os
 import traceback
 
+import pytest
+
 from utils import QDC_LOG_DIR, write_qdc_log
+
+
+@pytest.fixture(scope="session", autouse=True)
+def driver():
+    """Open the Appium session QDC's APPIUM framework expects.
+
+    hexlib's tests drive the phone through `adb` and never touch this object.
+    It exists because the framework is `TestFramework.APPIUM` and llama.cpp's
+    working runner on this same account opens exactly this session; a package
+    that never establishes one is the most plausible remaining reason two
+    hexlib jobs reached Completed having emitted nothing of their own.
+
+    Imported inside the fixture so that collecting this file does not require
+    the Appium client to be installed -- the report-copying hook below is the
+    part that must work even when the session cannot be created.
+    """
+    from appium import webdriver
+    from appium.options.common import AppiumOptions
+
+    options = AppiumOptions()
+    options.set_capability("automationName", "UiAutomator2")
+    options.set_capability("platformName", "Android")
+    options.set_capability("deviceName", os.getenv("ANDROID_DEVICE_VERSION"))
+    return webdriver.Remote(
+        command_executor="http://127.0.0.1:4723/wd/hub", options=options
+    )
 
 _RESULTS_NAME = os.path.join("TestLogs", "results.xml")
 

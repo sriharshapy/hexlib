@@ -27,7 +27,7 @@ satisfy it -- is exactly the kind of silent gap this project's own history
 """
 import re
 
-from utils import sh, write_qdc_log
+from utils import push, sh, write_qdc_log
 
 DEV = "/data/local/tmp/hexlib"
 
@@ -74,8 +74,13 @@ def assert_cycles_total_is_a_real_measurement(out, what):
 
 
 def test_binaries_are_present_and_executable():
+    # PUSHED, not copied. pytest runs on the QDC RUNNER and the binaries are
+    # AArch64/Hexagon, so `cp` moved them between two host directories and
+    # succeeded -- the artifact "landed" and only failed later, as an exec
+    # format error. See utils.py's module docstring.
     sh(f"mkdir -p {DEV}")
-    sh(f"cp hexlib_run libhexlib_skel.so {DEV}/")
+    push("hexlib_run", DEV)
+    push("libhexlib_skel.so", DEV)
     sh(f"chmod 755 {DEV}/hexlib_run")
     out = sh(f"ls -l {DEV}")
     assert "hexlib_run" in out, f"hexlib_run did not land in {DEV}:\n{out}"

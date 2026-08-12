@@ -68,6 +68,11 @@ def on_device():
     stub = types.ModuleType("utils")
     stub.sh = _no
     stub.write_qdc_log = _no
+    # `push` joined these when the on-device model was corrected: pytest runs
+    # on the QDC RUNNER, so binaries reach the phone by `adb push`, not `cp`.
+    # Stubbed like the others so an import-time call fails here rather than
+    # shelling out.
+    stub.push = _no
 
     saved = sys.modules.get("utils")
     sys.modules["utils"] = stub
