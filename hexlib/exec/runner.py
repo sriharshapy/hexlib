@@ -497,6 +497,25 @@ SPECS: dict[str, RunnerSpec] = {
             "and only the innermost W run is contiguous on both sides."
         ),
     ),
+    "matmul": RunnerSpec(
+        kind="matmul",
+        kernel_dir="kernels/matmul_fp16",
+        inputs=("fp16", "fp16"),
+        out_dtype="fp16",
+        scalars=(
+            Scalar("dim:0:0", "int"),   # Bn
+            Scalar("dim:0:1", "int"),   # M
+            Scalar("dim:0:2", "int"),   # K
+            Scalar("dim:1:2", "int"),   # N, input 1's last axis
+        ),
+        notes=(
+            "24 ops: the encoder's attention matmuls, QK^T (12) and AV (12). "
+            "No bias and no activation -- those are matmul_epilogue, a "
+            "different op kind and a different kernel. Accumulation is fp32 "
+            "with a single narrow to fp16 per row, which is what every "
+            "near-miss in the gate is judged against."
+        ),
+    ),
     "softmax": RunnerSpec(
         kind="softmax",
         kernel_dir="kernels/softmax_fp16",

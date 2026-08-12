@@ -577,3 +577,47 @@ def test_patchify_dispatches_and_matches_the_registry(backend):
         "the output is in raster order, so `merge` was ignored -- the "
         "downstream merger is a pure reshape and needs 2x2 blocks"
     )
+
+
+@sdk
+def test_matmul_dispatches_and_matches_the_reference(backend):
+    """A batched fp16 matmul through the DSP batch path.
+
+    Bn > 1 so a wrong batch stride cannot pass, and K is not a multiple of the
+    kernel's 64-wide accumulator block so the scalar tail runs.
+    """
+    rng = np.random.default_rng(5)
+    Bn, M, K, N = 3, 8, 70, 128
+    a = rng.standard_normal((Bn, M, K)).astype(np.float16)
+    b = rng.standard_normal((Bn, K, N)).astype(np.float16)
+
+    y, _ = backend.run("matmul", [a, b], {})
+    want = a.astype(np.float32) @ b.astype(np.float32)
+
+    assert y.shape == want.shape, f"{y.shape} != {want.shape}"
+    assert np.max(np.abs(y - want)) < 1e-2 * max(1.0, float(np.max(np.abs(want))))
+
+
+@sdk
+def test_matmul_reduces_over_k_and_not_over_a_transposed_operand(backend):
+    """Oracle-independent. Build B so that every column is a distinct constant:
+    then C[b,m,n] must equal n * sum(A[b,m,:]), which a kernel that read B as
+    [N,K] cannot reproduce for a non-square operand."""
+    rng = np.random.default_rng(6)
+    # N IS A MULTIPLE OF 64 ON PURPOSE. kernels/matmul_fp16/kernel.c loads B
+    # rows with an ALIGNED vector read (`(const HVX_Vector *) brow` then
+    # `bv[i]`), so a row is only correctly aligned when N % 64 == 0. N=96
+    # trips that and this test would fail for a reason that has nothing to do
+    # with the property it exists to check. The bug is real and is Task 6;
+    # both encoder matmul shapes use N=256 and N=64, so it does not affect
+    # dispatch.
+    Bn, M, K, N = 2, 4, 32, 128
+    a = rng.standard_normal((Bn, M, K)).astype(np.float16)
+    b = np.tile(np.arange(N, dtype=np.float16), (Bn, K, 1))
+
+    y, _ = backend.run("matmul", [a, b], {})
+    row_sums = a.astype(np.float32).sum(axis=2)              # (Bn, M)
+    want = row_sums[:, :, None] * np.arange(N, dtype=np.float32)
+
+    assert y.shape == (Bn, M, N)
+    assert np.max(np.abs(y - want)) < 1e-2 * max(1.0, float(np.max(np.abs(want))))
