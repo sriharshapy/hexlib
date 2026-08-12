@@ -1,0 +1,24 @@
+{
+  "task_id": "matmul_fp16",
+  "dtype": "fp16",
+  "caps": [],
+  "mechanisms": ["hvx"],
+  "params": {
+    "Bn": 3,
+    "M": 40,
+    "K": 128,
+    "N": 192,
+    "encoder_shapes": [
+      "fp16 (12, 256, 64) @ fp16 (12, 64, 256) -> fp16 (12, 256, 256)  [QK^T]",
+      "fp16 (12, 256, 256) @ fp16 (12, 256, 64) -> fp16 (12, 256, 64)  [AV]"
+    ],
+    "encoder_op_count": 24,
+    "no_bias_no_activation": "matmul_epilogue is a different op/kernel",
+    "mechanism": "hvx-compute: N vectorised 64-fp16-lanes-at-a-time (outer-product accumulation over K), qf32 accumulate, single narrow to fp16 at the end of each row's K loop",
+    "hmx_attempted": "yes -- abandoned after the standalone gate runtime hung when the kernel enabled the HMX/SSR.XE extension context from inside kernel.c; see the kernel-matmul-report.md for what was tried",
+    "fallback": "plain scalar float32-accumulate loop for N wider than this kernel's fixed 8-block (512-column) accumulator; a per-column scalar tail handles any N not a multiple of 64"
+  },
+  "expert_kernel_cycles": null,
+  "tolerance": "hexlib_close_f16",
+  "tags": ["matmul", "attention", "encoder", "qkt", "av"]
+}
