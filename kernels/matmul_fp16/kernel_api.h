@@ -72,7 +72,7 @@ typedef __fp16 hexlib_hf;
 #define MM_B 3
 #define MM_M 40
 #define MM_K 128
-#define MM_N 192
+#define MM_N 200
 
 void matmul_fp16(const hexlib_hf *A, const hexlib_hf *B, hexlib_hf *C,
                   int Bn, int M, int K, int N);

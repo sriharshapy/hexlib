@@ -3,17 +3,31 @@
  * Builds inputs, runs the baseline for reference, times ONLY the kernel call,
  * compares with tolerance, and prints the two lines the driver parses.
  *
- * SHAPE: (Bn,M,K,N) = (MM_B,MM_M,MM_K,MM_N) = (3, 40, 128, 192). All four
+ * SHAPE: (Bn,M,K,N) = (MM_B,MM_M,MM_K,MM_N) = (3, 40, 128, 200). All four
  * DELIBERATELY DIFFERENT numbers -- kernels/transpose_th_fp16's own
  * convention (see its harness.c header comment): with any two of B/M/K/N
  * equal, a stride-confusion or transposed-operand bug can produce a
  * same-shape, same-size result that a shape check (or an unlucky data set)
  * cannot see. All four distinct here means nearmiss_wrong_batch_stride.c and
- * nearmiss_transposed_operand.c cannot pass by accident. N is a multiple of
- * 64 (the fp16 HVX vector width) so this harness's own timed run exercises
- * kernel.c's fully vectorised column-block path, not its scalar tail -- the
- * near-misses below are therefore rejected by the SAME code path the real
- * encoder shapes (N = 256 or 64, both multiples of 64) use.
+ * nearmiss_transposed_operand.c cannot pass by accident -- neither near-miss
+ * is HVX code at all (both are plain scalar C with no dependency on N's
+ * relationship to 64), so that guarantee holds regardless of what follows.
+ *
+ * N IS DELIBERATELY NOT A MULTIPLE OF 64 (200 = 3*64 + 8), unlike the real
+ * encoder shapes (N = 256 or 64, both multiples of 64) -- this is
+ * intentional, not an oversight. kernel.c's vectorised column-block loop
+ * used to dereference an aligned `HVX_Vector *` on both the B-row load and
+ * the C-row store, which lowers to a 128-byte-ALIGNED access, correct only
+ * when N % 64 == 0. At the old N=192, every row start (k * N * sizeof(hf) =
+ * k * 384 bytes) happens to be a multiple of 128 for every k, so that bug
+ * was invisible right here even though it silently corrupted any real,
+ * non-multiple-of-64 shape. Fixed in 9b6f7c0 by switching both the load and
+ * the store to the repo's `hvx_vmemu` unaligned wrapper
+ * (include/hexlib/hvx/hvx-base.h). At N=200, row starts (k * 400 bytes) are
+ * NOT all 128-byte-aligned, and this run now also exercises kernel.c's
+ * scalar tail (the last 8 columns, 192..199) in addition to its vectorised
+ * blocks -- so a regression back to an aligned dereference cannot hide
+ * behind this shape the way it hid behind N=192.
  *
  * GENERIC DATA. A[b][m][k] and B[b][k][n] are deterministic, small, and
  * exact multiples of 0.25 (exactly representable in fp16), built from a
