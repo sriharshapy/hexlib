@@ -621,3 +621,67 @@ def test_matmul_reduces_over_k_and_not_over_a_transposed_operand(backend):
 
     assert y.shape == (Bn, M, N)
     assert np.max(np.abs(y - want)) < 1e-2 * max(1.0, float(np.max(np.abs(want))))
+
+
+# ---------------------------------------------------------------------------
+# matmul_epilogue: fp16 activations, a q4_0 weight, an fp32 bias, and a string
+# `act` attr that has to cross the wire as an int code.
+#
+# THE ORACLE TRAP: the registry's own `matmul_epilogue` reference multiplies by
+# the FULL-PRECISION weight. The kernel multiplies by the q4_0-QUANTIZED
+# weight, whose per-block rounding error dwarfs anything a kernel bug could
+# add. So the expected value here is built from `dequantize_q4_0` of the SAME
+# bytes handed to the kernel -- the only way left to compare is the
+# arithmetic, not the quantization format.
+# ---------------------------------------------------------------------------
+
+
+@sdk
+@pytest.mark.parametrize("act", ["none", "gelu_tanh", "gelu_erf"])
+def test_matmul_epilogue_dispatches_for_every_activation(backend, act):
+    """Bias then activation, against a reference built from the SAME q4_0
+    bytes the kernel gets -- see the oracle trap above."""
+    from hexlib.exec.quant import dequantize_q4_0, quantize_q4_0
+    from hexlib.exec.runner import RawTensor
+    from hexlib.graph.ops import get
+
+    rng = np.random.default_rng(11)
+    M, K, N = 12, 96, 160
+    a = rng.standard_normal((M, K)).astype(np.float16)
+    w = rng.standard_normal((K, N)).astype(np.float32)
+    bias = rng.standard_normal((N,)).astype(np.float32)
+
+    w_bytes = quantize_q4_0(w)
+    w_raw = RawTensor(dtype="q4_0", shape=w.shape, data=w_bytes)
+
+    y, _ = backend.run("matmul_epilogue", [a, w_raw, bias], {"act": act})
+
+    w_eff = dequantize_q4_0(w_bytes, w.shape)
+    ref = a.astype(np.float32) @ w_eff + bias
+    want = ref if act == "none" else get(act).reference((ref,), {})[0]
+
+    assert y.shape == (M, N)
+    assert np.max(np.abs(y - want)) < 1e-2 * max(1.0, float(np.max(np.abs(want))))
+
+
+@sdk
+def test_matmul_epilogue_applies_bias_before_activation(backend):
+    """Oracle-independent: with gelu_erf and a large negative bias every output
+    is driven to ~0. Adding the bias AFTER the activation cannot produce that --
+    the bias would still be visible in the result."""
+    from hexlib.exec.quant import quantize_q4_0
+    from hexlib.exec.runner import RawTensor
+
+    rng = np.random.default_rng(12)
+    M, K, N = 8, 64, 64
+    a = rng.standard_normal((M, K)).astype(np.float16)
+    w = rng.standard_normal((K, N)).astype(np.float32)
+    bias = np.full((N,), -50.0, dtype=np.float32)
+
+    w_raw = RawTensor(dtype="q4_0", shape=w.shape, data=quantize_q4_0(w))
+    y, _ = backend.run("matmul_epilogue", [a, w_raw, bias], {"act": "gelu_erf"})
+    assert np.max(np.abs(y)) < 1.0, (
+        "a large negative bias applied BEFORE gelu must collapse the output; "
+        f"max |y| = {float(np.max(np.abs(y)))} means bias came after the "
+        "activation"
+    )

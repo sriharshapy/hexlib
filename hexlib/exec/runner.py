@@ -516,6 +516,29 @@ SPECS: dict[str, RunnerSpec] = {
             "near-miss in the gate is judged against."
         ),
     ),
+    "matmul_epilogue": RunnerSpec(
+        kind="matmul_epilogue",
+        kernel_dir="kernels/matmul_epilogue_fp16",
+        inputs=("fp16", "q4_0", "fp32"),
+        out_dtype="fp16",
+        scalars=(
+            Scalar("dim:0:0", "int"),   # M, activation rows
+            Scalar("dim:0:1", "int"),   # K, the reduction axis
+            Scalar("dim:1:1", "int"),   # N, the weight's free axis
+            Scalar(
+                "attr:act", "int",
+                codes=(("none", 0), ("gelu_tanh", 1), ("gelu_erf", 2)),
+            ),
+        ),
+        notes=(
+            "75 ops -- the single largest kind in the encoder, and 55.9 MB of "
+            "its 58.6 MB of traffic. Weights cross the wire as q4_0 (WIRE_RAW) "
+            "in row-major order with blocks along N, NOT ggml-hexagon's "
+            "576-byte HMX tile order. The act codes match MM_ACT_* in the "
+            "kernel's own kernel_api.h; `codes` is what lets a string attr "
+            "cross a wire that carries only numbers."
+        ),
+    ),
     "softmax": RunnerSpec(
         kind="softmax",
         kernel_dir="kernels/softmax_fp16",
