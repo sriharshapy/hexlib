@@ -414,10 +414,18 @@ def _qdc_submit(args) -> int:
     here = os.path.dirname(__file__)
     test_script = os.path.join(here, "device", "qdc", "test_on_device.py")
     utils_py = os.path.join(here, "device", "qdc", "utils.py")
+    # conftest.py is what copies the junit report into QDC's collected log
+    # directory. Without it the report is written to the runner's working
+    # directory, never collected, and `job.wait()` polls its whole cap for a
+    # results.xml that exists on the device and will never be listed --
+    # observed on job 756124. See device/qdc/conftest.py.
+    conftest_py = os.path.join(here, "device", "qdc", "conftest.py")
 
     out_base = os.path.join(args.out, "qdc_job")
     try:
-        zip_path = artifact.stage([hexlib_run, skel_so, utils_py], test_script, out_base)
+        zip_path = artifact.stage(
+            [hexlib_run, skel_so, utils_py, conftest_py], test_script, out_base
+        )
     except artifact.StagingError as e:
         print(f"error: staging the QDC artifact failed: {e}", file=sys.stderr)
         return 1

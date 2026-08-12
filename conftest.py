@@ -48,3 +48,21 @@ rather than silently pass, which is the right outcome.
 # test_on_device.py must be excluded for the same reason, without anyone
 # having to remember to come back here.
 collect_ignore = ["hexlib/device"]
+
+# The SAME defect by a second route. `hexlib test <k> --device qdc --out DIR`
+# stages the artifact into `DIR/qdc_job_stage/`, and that staging tree contains
+# a COPY of `test_on_device.py` -- so after any qdc run inside the repo,
+# collection walks into it and dies on the flat `import utils` exactly as
+# above. Worse than the original: with two `--out` directories there are two
+# copies with one basename, and pytest refuses both with "import file mismatch"
+# before running a single test.
+#
+# Reproduced on 2026-08-12 with `_work_qdc` and `_work_qdc2` present:
+#     python -m pytest -q -m "not sdk"
+#     -> ERROR _work_qdc2/qdc_job_stage/test_on_device.py
+#     -> Interrupted: 1 error during collection   (5 deselected, 0 run)
+#
+# A glob, not a fixed name, because `--out` is the caller's to choose and
+# `_work` is only the default; anything a run drops beside it is build output,
+# never a test this suite should collect.
+collect_ignore_glob = ["_work*"]

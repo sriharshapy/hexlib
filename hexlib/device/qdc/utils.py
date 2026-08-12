@@ -86,8 +86,14 @@ def write_qdc_log(name: str, text: str) -> str:
     itself judge whether `text` is meaningful -- the caller's own assertions,
     run BEFORE this is called, are what a reader should trust for that.
     """
-    os.makedirs(QDC_LOG_DIR, exist_ok=True)
     path = os.path.join(QDC_LOG_DIR, name)
+    # The PARENT OF THE TARGET, not QDC_LOG_DIR itself. `name` legitimately
+    # carries a subdirectory -- conftest.py writes `TestLogs/results.xml`,
+    # because job.wait() matches that suffix and QDC lists collected logs as
+    # `<job_id>/<name>`. Creating only QDC_LOG_DIR left the nested case
+    # raising FileNotFoundError from open(), on the one write whose whole
+    # purpose is to make the run's result visible.
+    os.makedirs(os.path.dirname(path) or QDC_LOG_DIR, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
     return path

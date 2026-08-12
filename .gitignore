@@ -6,7 +6,7 @@
 # `kernels/*/RESULT.md`, which is the promoted, reviewed record for a gated
 # kernel and IS tracked on purpose. Do not "unify" these into `RESULT.md` or
 # `*result*` -- that would untrack every kernel's evidence.
-_work/
+_work*/
 *.result.json
 *.result.md
 

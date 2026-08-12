@@ -224,7 +224,17 @@ def _real_upload_artifact(client, zip_path: str) -> str:
     from qualcomm_device_cloud_sdk.api import qdc_api as _vendor
     from qualcomm_device_cloud_sdk.models.artifact_type import ArtifactType
 
-    uuid = _vendor.upload_file(client, zip_path, ArtifactType.TESTPACKAGE)
+    # TESTSCRIPT, NOT TESTPACKAGE, and this was measured rather than reasoned.
+    # Uploading the same zip as TESTPACKAGE authenticates and uploads fine and
+    # is then refused at submission with HTTP 400 "Appium tests requires 1 test
+    # script and at most 1 test package" -- the package is the OPTIONAL half and
+    # the script is the required one, so one package and zero scripts is not a
+    # valid Appium job. llama.cpp's own QDC runner
+    # (scripts/snapdragon/qdc/run_qdc_jobs.py) uploads its Appium zip as
+    # TESTSCRIPT against this same API, which is the working reference this was
+    # matched to. Costs no device minutes to get wrong -- the job is rejected
+    # before dispatch -- but it does cost a round trip.
+    uuid = _vendor.upload_file(client, zip_path, ArtifactType.TESTSCRIPT)
     if not uuid:
         raise QdcError("QDC accepted the artifact upload but returned no uuid")
     return uuid

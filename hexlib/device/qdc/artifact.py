@@ -1,7 +1,8 @@
 # hexlib/device/qdc/artifact.py
 """Stage the stage-2 binaries and the on-device pytest into a zip QDC can run.
 
-The zip is a flat TestPackage: hexlib_run, libhexlib_skel.so, and the
+The zip is uploaded as a flat TestScript (see job.py's _real_upload_artifact
+for why that artifact type and not TestPackage): hexlib_run, libhexlib_skel.so, and the
 on-device test script sit next to a pytest.ini and requirements.txt, matching
 what TestFramework.APPIUM finds once QDC extracts it at /qdc/appium. There is
 no subdirectory nesting here on purpose -- the on-farm scripts invoke a plain
