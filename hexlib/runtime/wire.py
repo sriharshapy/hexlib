@@ -45,6 +45,7 @@ STATUS = {
     "ERR_VTCM_RECLAIMED": 12,
     "ERR_REQUIRES": 13,
     "ERR_NOT_STARTED": 14,
+    "ERR_CACHE": 15,
 }
 STATUS_NAME = {v: k for k, v in STATUS.items()}
 

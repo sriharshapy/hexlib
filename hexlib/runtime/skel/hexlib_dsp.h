@@ -46,6 +46,11 @@ enum hexlib_dsp_status {
     HEXLIB_DSP_ERR_VTCM_RECLAIMED = 12,
     HEXLIB_DSP_ERR_REQUIRES = 13,
     HEXLIB_DSP_ERR_NOT_STARTED = 14,
+    /* A qurt_mem_cache_clean() call failed. Its own status, not folded into
+     * ERR_INTERNAL, because the consequence is specific and misleading: the
+     * ops all ran and the data the host reads back may be stale rather than
+     * wrong. Telling those apart from the host is impossible without this. */
+    HEXLIB_DSP_ERR_CACHE = 15,
 };
 
 /* The status as text, for the one place a human reads it: the host's error
@@ -78,6 +83,7 @@ static inline const char *hexlib_dsp_status_name(int s) {
     case HEXLIB_DSP_ERR_VTCM_TOO_SMALL: return "ERR_VTCM_TOO_SMALL";
     case HEXLIB_DSP_ERR_VTCM_RECLAIMED: return "ERR_VTCM_RECLAIMED";
     case HEXLIB_DSP_ERR_REQUIRES:       return "ERR_REQUIRES";
+    case HEXLIB_DSP_ERR_CACHE:          return "ERR_CACHE";
     case HEXLIB_DSP_ERR_NOT_STARTED:    return "ERR_NOT_STARTED";
     default:                            return "UNKNOWN";
     }

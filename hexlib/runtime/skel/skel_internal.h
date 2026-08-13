@@ -57,6 +57,10 @@ struct hexlib_ctx {
 int hexlib_bufs_register(struct hexlib_ctx *ctx, uint32_t fd, uint32_t size);
 int hexlib_bufs_unregister(struct hexlib_ctx *ctx, uint32_t fd);
 int hexlib_bufs_map(struct hexlib_ctx *ctx, struct hexlib_buf_desc *bufs, uint32_t n);
+/* Cache maintenance over every mapped buffer. See skel_bufs.c's block comment
+ * for why FastRPC does not do this for us and what its absence measured. */
+int hexlib_bufs_invalidate(struct hexlib_ctx *ctx);
+int hexlib_bufs_flush(struct hexlib_ctx *ctx);
 int hexlib_tensors_resolve(struct hexlib_ctx *ctx, struct hexlib_buf_desc *bufs,
                            uint32_t n_bufs, struct hexlib_tensor *tens, uint32_t n_tens);
 

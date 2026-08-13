@@ -1037,6 +1037,46 @@ static int run_batch_file(const char *batch_path, const char *in_path,
                     "writing no output file\n", status);
             exit_code = HEXLIB_EXIT_OP_FAILED;
         } else {
+            /* THE PER-OP RESULTS, PRINTED. They already came back in `rsp` and
+             * nothing ever looked at them, so when the 49-op encoder returned
+             * an all-zero final output the only way to find out whether the
+             * last op had even run was to diff the arena byte by byte on the
+             * host. It had run; the answer was in the DSP's cache. One summary
+             * line plus every non-OK op means the next such run says so itself.
+             *
+             * cycles_total is DSP-measured and brackets the whole batch, so a
+             * zero here is the same alarm it is in --self-test: PCYCLE dead in
+             * the unsigned PD, and every cycle figure meaningless. */
+            struct hexlib_batch_rsp_hdr rh;
+            memcpy(&rh, rsp, sizeof(rh));
+            size_t have = (rsp_len - sizeof(rh)) / sizeof(struct hexlib_op_result);
+            const struct hexlib_op_result *ops =
+                (const struct hexlib_op_result *) (rsp + sizeof(rh));
+            uint32_t n_bad = 0;
+            for (size_t i = 0; i < have; i++) {
+                if (ops[i].status != HEXLIB_DSP_OK) {
+                    fprintf(stderr, "hexlib: --batch: op %zu (kind %u) %s\n",
+                            i, (unsigned int) ops[i].kind,
+                            hexlib_dsp_status_name((int) ops[i].status));
+                    n_bad++;
+                }
+            }
+            printf("hexlib: --batch: %u ops reported, %u not OK, "
+                   "cycles_total=%llu\n",
+                   (unsigned int) rh.n_ops, (unsigned int) n_bad,
+                   (unsigned long long) rh.cycles_total);
+            if (rh.n_ops != hdr.n_ops) {
+                /* The batch status was OK, so this cannot be a failed op -- it
+                 * means the DSP stopped early for a reason that did not
+                 * propagate, which would otherwise look like a clean run over
+                 * a plan that was never finished. */
+                fprintf(stderr,
+                        "hexlib: --batch: the template carries %u ops but only "
+                        "%u were reported -- the batch did not run to the end\n",
+                        (unsigned int) hdr.n_ops, (unsigned int) rh.n_ops);
+                exit_code = HEXLIB_EXIT_OP_FAILED;
+            }
+
             /* ONLY NOW, after the magic AND the status are both confirmed
              * good, does anything get written to disk. */
             hexlib_buf *out_buf = bufs[hdr.n_bufs - 1];

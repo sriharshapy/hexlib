@@ -162,6 +162,18 @@ int hexlib_dispatch_batch(struct hexlib_ctx *ctx, const uint8_t *batch, uint32_t
         return rc;
     }
 
+    /* BEFORE ANY KERNEL READS ANYTHING. The host has just written weights and
+     * inputs into these pages from the applications processor; any line THIS
+     * DSP still holds from a previous invoke on the same session is stale.
+     * Skipping this works for exactly one invoke and then silently computes on
+     * old data -- a worse failure than the one the flush below fixes, because
+     * it takes two runs to appear. */
+    int cache_rc = hexlib_bufs_invalidate(ctx);
+    if (cache_rc != HEXLIB_DSP_OK) {
+        hexlib_write_rsp_hdr(rsp, (uint32_t) cache_rc, 0, 0);
+        return cache_rc;
+    }
+
     struct hexlib_op_result *results =
         (struct hexlib_op_result *) (rsp + sizeof(struct hexlib_batch_rsp_hdr));
     uint64_t total = 0;
@@ -261,6 +273,26 @@ int hexlib_dispatch_batch(struct hexlib_ctx *ctx, const uint8_t *batch, uint32_t
             batch_status = HEXLIB_DSP_ERR_VTCM_RECLAIMED;
             break;
         }
+    }
+
+    /* BEFORE THE HOST READS ANYTHING. Our writes are in this DSP's data cache
+     * and FastRPC will not write them back for us -- these buffers are mapped
+     * out of band by fd, not passed as invoke arguments, so it does not know
+     * they were touched. Measured on SM8650 without this: the 49-op encoder
+     * returned 179,124 changed bytes and an all-zero final output, because the
+     * last op's 1024 bytes never got evicted. See skel_bufs.c.
+     *
+     * RUNS EVEN WHEN THE BATCH FAILED, and deliberately: an op that failed
+     * halfway still wrote whatever it wrote, and leaving those lines in cache
+     * makes the wreckage unreadable to anyone debugging it from the host.
+     *
+     * DOES NOT OVERWRITE A REAL FAILURE. If the batch already has a status, that
+     * is what the caller needs to see; a cache failure on top of it is logged by
+     * cache_op_all and only becomes the reported status when nothing else went
+     * wrong. */
+    cache_rc = hexlib_bufs_flush(ctx);
+    if (cache_rc != HEXLIB_DSP_OK && batch_status == HEXLIB_DSP_OK) {
+        batch_status = cache_rc;
     }
 
     hexlib_write_rsp_hdr(rsp, (uint32_t) batch_status, done, total);
