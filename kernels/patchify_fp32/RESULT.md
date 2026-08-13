@@ -11,6 +11,6 @@
 | near-miss `nearmiss_patch_interior_swap.c` | correctly rejected |
 | **gate** | **PASS** |
 
-target `v75` · toolchain `19.0.04` · SDK `6.4.0.2` · host `sriha@Heathcliff` · `2026-08-11T21:27:58Z`
+target `v75` · toolchain `19.0.04` · SDK `6.4.0.2` · host `sriha@Heathcliff` · `2026-08-11T21:47:01Z`
 
 Measured on the hexagon simulator under the pinned bus model (buspenalty 75, busratio 2). The simulator is cycle-approximate; these numbers are reproducible, not silicon measurements.
