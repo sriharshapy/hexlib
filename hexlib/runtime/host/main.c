@@ -955,12 +955,58 @@ static int run_batch_file(const char *batch_path, const char *in_path,
             }
             memcpy(bufs[i]->ptr, in_data + in_off, sz);
             in_off += sz;
+        } else {
+            /* THE LAST BUFFER IS FILLED TOO IF `--in` CARRIES ITS BYTES.
+             *
+             * A WHOLE-PLAN BATCH IS ONE IN-OUT ARENA. hexlib/exec/wholeplan.py
+             * packs every op of a compiled plan into a single blob over a
+             * single buffer holding the weights, the activations and the
+             * graph's input and output all at once -- so that buffer must be
+             * written by the host BEFORE the invoke (weights, image) and read
+             * back after it (the encoder's output). With n_bufs == 1 the
+             * convention above would have left it never filled, and the DSP
+             * would have multiplied by whatever rpcmem happened to hand back.
+             *
+             * NOT a second buffer, deliberately: `simhost.c` patches the SAME
+             * fd into every buf_desc (one rpcmem allocation for the whole
+             * batch), so on the simulator two buffers share one address space
+             * while on a device they do not. The blob that runs on QDC has to
+             * be the blob the simulator already validated, byte for byte, or
+             * the rehearsal proves nothing.
+             *
+             * The size is checked exactly rather than "as much as is left", so
+             * a truncated `--in` is a refusal and not a partly-staged arena. */
+            size_t remaining = in_len - in_off;
+            if (remaining == sz) {
+                memcpy(bufs[i]->ptr, in_data + in_off, sz);
+                in_off += sz;
+            } else if (remaining != 0) {
+                fprintf(stderr,
+                        "hexlib: --batch: %s has %zu bytes left for the final "
+                        "buffer, which is %zu -- pass either nothing for it "
+                        "(output-only) or exactly its size (in-out arena)\n",
+                        in_path, remaining, sz);
+                ok = 0;
+                break;
+            }
         }
         /* Patch the real fd into the working copy of the buffer table.
          * `base` stays 0 -- hexlib_buf_to_desc() never sets anything else. */
         struct hexlib_buf_desc d;
         hexlib_buf_to_desc(bufs[i], &d);
         memcpy(&descs[i], &d, sizeof(d));
+    }
+    /* NOTHING IN `--in` MAY GO UNUSED. A file longer than the buffers it is
+     * staging means the caller and the template disagree about the layout, and
+     * every byte that did land went to an offset derived from that same
+     * disagreement. Previously this was silent, so a stale or wrongly-built
+     * `--in` produced a full run and a plausible output file. */
+    if (ok && in_off != in_len) {
+        fprintf(stderr,
+                "hexlib: --batch: %s is %zu bytes but the batch template "
+                "consumed only %zu -- the two disagree about the buffer "
+                "layout\n", in_path, in_len, in_off);
+        ok = 0;
     }
     free(in_data);
 
