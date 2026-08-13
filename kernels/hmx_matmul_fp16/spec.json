@@ -1,0 +1,19 @@
+{
+  "task_id": "hmx_matmul_fp16",
+  "dtype": "fp16",
+  "caps": ["hmx"],
+  "mechanisms": ["hmx"],
+  "params": {
+    "M": 32,
+    "N": 32,
+    "K": 64,
+    "n_dot_tiles": 2,
+    "tile_bytes": 2048,
+    "range": 4095,
+    "note": "range = 2048 * n_dot_tiles - 1. Operands are symmetric in fp16 mode (both 2048-byte tiles), unlike the int8 path where the activation is masked at 2047 and the weight at 1023.",
+    "purpose": "Establish the fp16 HMX tile sequence at a shape whose scalar reference is trivially checkable, before weight repacking, deep-K accumulation or matmul_epilogue integration are built on it."
+  },
+  "expert_kernel_cycles": null,
+  "tolerance": "hexlib_close_f16",
+  "tags": ["matmul", "hmx", "tile", "probe", "first-rung"]
+}
