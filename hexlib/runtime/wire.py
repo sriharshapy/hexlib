@@ -58,7 +58,7 @@ STATUS_NAME = {v: k for k, v in STATUS.items()}
 # codegen, while `RunnerSpec` accepted it happily.
 # `test_runtime_wire.py::test_the_dtype_table_uses_the_same_SPELLING_as_the_
 # runner_and_the_generator` binds the three tables so they cannot drift again.
-DTYPE_ID = {"fp32": 0, "fp16": 1, "q4_0": 2, "int32": 3}
+DTYPE_ID = {"fp32": 0, "fp16": 1, "q4_0": 2, "int32": 3, "q8_0": 4}
 LAYOUT_ID = {"row_major": 0, "tiled_32x32": 1, "q4_0_repacked": 2}
 
 _HDR = "<10I"

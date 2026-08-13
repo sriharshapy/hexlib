@@ -69,8 +69,16 @@ def test_tensor_rejects_nonpositive_dim():
     assert "x" in str(e.value)
 
 
-def test_dtypes_are_exactly_the_four():
-    assert DTYPES == frozenset({"fp32", "fp16", "int32", "q4_0"})
+def test_dtypes_are_exactly_these():
+    """AN EXHAUSTIVE PIN, DELIBERATELY. A dtype added here has to be carried
+    through `wire.DTYPE_ID`, `runner.WIRE_DTYPE` or `WIRE_RAW`, and
+    `genentry._CTYPE` before anything can use it -- `test_runtime_wire.py` binds
+    those three -- so a silent addition is a dtype the graph accepts and the
+    wire cannot carry. Failing here is the intended way to be reminded.
+
+    q8_0 was added on 2026-08-13 and this test caught it, which is the check
+    working rather than the check being in the way."""
+    assert DTYPES == frozenset({"fp32", "fp16", "int32", "q4_0", "q8_0"})
 
 
 def test_nbytes_dense():

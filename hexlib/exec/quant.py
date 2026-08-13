@@ -133,3 +133,88 @@ def dequantize_q4_0(data: bytes, shape: tuple[int, ...]) -> np.ndarray:
     q = np.concatenate([lo, hi], axis=1)     # back to element order 0..31
     v = (q - 8).astype(np.float32) * d[:, None]
     return v.reshape(shape)
+
+
+# ---------------------------------------------------------------------------
+# q8_0. TRANSCRIBED FROM `quantize_row_q8_0_ref` (ggml-quants.c:276-299) AND
+# `dequantize_row_q8_0` (:553-567), NOT ADAPTED FROM q4_0 ABOVE.
+#
+#     #define QK8_0 32
+#     typedef struct {
+#         ggml_half d;       // delta
+#         int8_t  qs[QK8_0]; // quants
+#     } block_q8_0;          // 34 bytes
+#
+#     amax = max|x[j]|
+#     d    = amax / 127
+#     id   = d ? 1/d : 0
+#     qs[j] = roundf(x[j] * id)
+#
+# THREE THINGS DIFFER FROM q4_0 AND EVERY ONE OF THEM PRODUCES A PLAUSIBLE WRONG
+# ANSWER IF CARRIED OVER:
+#
+#   1. `d` IS POSITIVE. q4_0 uses the SIGNED largest-magnitude element over -8,
+#      so a block whose extreme is positive stores a negative scale. q8_0 uses
+#      `amax`, which has no sign, over +127. Reusing q4_0's sign trick here
+#      negates every value in the block -- the same failure q4_0's own
+#      `test_blocks_whose_extreme_value_is_POSITIVE_get_a_negative_scale`
+#      exists to catch, in the opposite direction.
+#   2. THE ROUNDING IS `roundf`, which is round-half-AWAY-FROM-ZERO. It is not
+#      q4_0's `trunc(x + 8.5)` (that trick exists only because q4_0 stores an
+#      unsigned nibble biased by 8) and it is NOT `np.round`, which is banker's
+#      rounding and disagrees on every exact .5. np.floor(|x| + 0.5) with the
+#      sign reapplied is what matches.
+#   3. THERE IS NO BIAS AND NO NIBBLE PACKING. `qs` is a plain int8 per element,
+#      in element order. No `- 8`, no low/high nibble split, so none of q4_0's
+#      j-with-j+16 pairing applies.
+QK8_0 = ir.Q8_0_BLOCK
+Q8_0_BLOCK_BYTES = ir.Q8_0_BLOCK_BYTES
+
+
+def quantize_q8_0(x: np.ndarray) -> bytes:
+    """`x` (any shape, last axis a multiple of 32) -> packed q8_0 blocks."""
+    a = np.ascontiguousarray(x, dtype=np.float32)
+    if a.ndim == 0 or a.shape[-1] % QK8_0 != 0:
+        raise ValueError(
+            f"q8_0 needs a last axis that is a multiple of {QK8_0}; got shape "
+            f"{tuple(a.shape)}"
+        )
+    blocks = a.reshape(-1, QK8_0)
+    n = blocks.shape[0]
+
+    # UNSIGNED, unlike q4_0's signed `mx`. See note 1 above.
+    amax = np.abs(blocks).max(axis=1).astype(np.float32)
+    d = (amax / np.float32(127.0)).astype(np.float32)
+    # Narrowed before use, for the same reason q4_0 narrows: `d` is stored as
+    # fp16, so quantizing against the fp32 value would make this function's own
+    # round trip look better than the kernel's can be.
+    d16 = d.astype(np.float16)
+    d_used = d16.astype(np.float32)
+    inv = np.zeros_like(d_used)
+    np.divide(np.float32(1.0), d_used, out=inv, where=(d_used != 0.0))
+
+    scaled = blocks * inv[:, None]
+    # `roundf`, not np.round. See note 2 above.
+    q = np.sign(scaled) * np.floor(np.abs(scaled) + np.float32(0.5))
+    # int8 saturation: 127/-128. amax/127 makes |scaled| <= 127 before fp16
+    # narrowing, but narrowing `d` DOWNWARD makes it slightly larger, so the
+    # extreme element can land on 128 and wrap to -128 without this.
+    q = np.clip(q, -128, 127).astype(np.int8)
+
+    out = np.empty((n, Q8_0_BLOCK_BYTES), dtype=np.uint8)
+    out[:, :2] = d16.view(np.uint8).reshape(n, 2)
+    out[:, 2:] = q.view(np.uint8)
+    return out.tobytes()
+
+
+def dequantize_q8_0(data: bytes, shape: tuple[int, ...]) -> np.ndarray:
+    """The inverse, to fp32: `v[j] = qs[j] * d`. No bias term, unlike q4_0."""
+    want = ir.nbytes(tuple(shape), "q8_0")
+    if len(data) != want:
+        raise ValueError(
+            f"a q8_0 tensor of shape {tuple(shape)} is {want} bytes; got {len(data)}"
+        )
+    raw = np.frombuffer(data, dtype=np.uint8).reshape(-1, Q8_0_BLOCK_BYTES)
+    d = raw[:, :2].copy().view(np.float16).reshape(-1).astype(np.float32)
+    q = raw[:, 2:].copy().view(np.int8).astype(np.float32)
+    return (q * d[:, None]).reshape(shape)

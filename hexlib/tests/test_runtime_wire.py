@@ -150,11 +150,20 @@ def test_the_dtype_table_uses_the_same_SPELLING_as_the_runner_and_the_generator(
     and `rope_2d` and `patchify`, both about to be written, are the kernels that
     would hit it.
 
-    q4_0 is the one deliberate asymmetry, asserted rather than tolerated: it has
-    a wire id because a block-quantized weight is a real tensor on the DSP, and
-    no numpy/C scalar form because it is staged as raw bytes.
+    The BLOCK-QUANTIZED dtypes are the deliberate asymmetry, asserted rather
+    than tolerated: they have a wire id because a block-quantized weight is a
+    real tensor on the DSP, and no numpy/C scalar form because they are staged
+    as raw bytes.
+
+    That assertion used to read `== {"q4_0"}`, a literal, and q8_0 broke it the
+    moment it was added -- correctly, since a new wire id with no numpy form is
+    exactly what the check is watching for. It is bound to `WIRE_RAW` now, which
+    is the set that decides the question everywhere else (genentry picks
+    `unsigned char *` from it, and `RawTensor.__post_init__` refuses anything
+    outside it). A literal here would have to be edited for every future format
+    and is satisfied by editing it; the binding is not.
     """
-    from hexlib.exec.runner import WIRE_DTYPE
+    from hexlib.exec.runner import WIRE_DTYPE, WIRE_RAW
     from hexlib.runtime.genentry import _CTYPE
 
     assert set(WIRE_DTYPE) <= set(wire.DTYPE_ID), (
@@ -169,7 +178,11 @@ def test_the_dtype_table_uses_the_same_SPELLING_as_the_runner_and_the_generator(
         "every dtype a spec can declare needs a C type in the generated entry, "
         "and vice versa"
     )
-    assert set(wire.DTYPE_ID) - set(WIRE_DTYPE) == {"q4_0"}
+    assert set(wire.DTYPE_ID) - set(WIRE_DTYPE) == set(WIRE_RAW), (
+        "every wire dtype without a numpy form must be a declared raw "
+        "block-quantized one, and every raw one must have a wire id"
+    )
+    assert WIRE_RAW, "WIRE_RAW is empty, so the assertion above is vacuous"
 
 
 def test_tensor_naming_a_nonexistent_buffer_is_refused():

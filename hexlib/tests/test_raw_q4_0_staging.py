@@ -147,8 +147,23 @@ def test_a_spec_may_not_WRITE_q4_0():
 
 
 def test_an_unknown_dtype_is_still_refused_and_names_both_tables():
+    """THE STAND-IN IS DERIVED, NOT SPELLED. This test used the literal "q8_0"
+    as its example of an unknown dtype, and on 2026-08-13 q8_0 was added as a
+    real block-quantized weight format -- so the test stopped exercising the
+    refusal and started asserting that a SUPPORTED dtype raises, which it no
+    longer did. It failed loudly, which was lucky; a test whose negative example
+    quietly becomes positive can just as easily keep passing for a new reason.
+
+    So the unknown dtype is now chosen at run time as one that is in neither
+    table. That cannot go stale, because the day it becomes known it stops
+    being selected."""
+    from hexlib.exec.runner import WIRE_DTYPE, WIRE_RAW
+
+    known = set(WIRE_DTYPE) | set(WIRE_RAW)
+    unknown = next(c for c in ("q3_k", "q2_k", "nf4", "not_a_dtype")
+                   if c not in known)
     with pytest.raises(ValueError, match="neither a dense wire dtype"):
-        _spec(inputs=("fp16", "q8_0", "fp32"))
+        _spec(inputs=("fp16", unknown, "fp32"))
 
 
 def test_payload_refuses_a_numpy_array_where_the_spec_declared_q4_0():

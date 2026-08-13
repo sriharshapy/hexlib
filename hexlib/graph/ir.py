@@ -12,15 +12,33 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping
 
-DTYPES = frozenset({"fp32", "fp16", "int32", "q4_0"})
+DTYPES = frozenset({"fp32", "fp16", "int32", "q4_0", "q8_0"})
 
-# Dense dtypes only. q4_0 is block-structured and handled separately in nbytes().
+# Dense dtypes only. q4_0 and q8_0 are block-structured and handled separately
+# in nbytes().
 _DENSE_BYTES = {"fp32": 4, "fp16": 2, "int32": 4}
 
 # Q4_0: 32 four-bit values (16 bytes) + one fp16 scale (2 bytes) = 18 bytes.
 # Spec 5.1.1; matches llama.cpp's block_q4_0.
 Q4_0_BLOCK = 32
 Q4_0_BLOCK_BYTES = 18
+
+# `block_q8_0` (ggml-common.h:250-256): `ggml_half d; int8_t qs[32];` = 34 bytes.
+# WHY A SECOND BLOCK-QUANTIZED WEIGHT FORMAT EXISTS AT ALL. Measured against
+# transformers on the shipped Qwen3.5-0.8B vision weights at 256x256, with fp32
+# arithmetic on both sides so nothing but the weight format differs:
+#
+#     q4_0   encoder output cosine 0.867606
+#     q8_0   encoder output cosine 0.999002
+#
+# for 1.89x the weight bytes (55.5 MB -> 105 MB). Four bits is not enough for
+# this encoder, and the reason is that the error is DIFFUSE rather than
+# concentrated -- keeping the merger, the patch embedding and all of attention
+# at higher precision while leaving the MLPs at q4_0 still only reaches 0.913,
+# because 12 layers of small errors compound. Mixed precision was measured and
+# rejected on that evidence, not assumed.
+Q8_0_BLOCK = 32
+Q8_0_BLOCK_BYTES = 34
 
 _ATTR_SCALARS = (bool, int, float, str, type(None))
 
@@ -43,13 +61,17 @@ def nbytes(shape: tuple[int, ...], dtype: str) -> int:
     if dtype not in DTYPES:
         raise ValueError(f"unknown dtype {dtype!r}; expected one of {sorted(DTYPES)}")
     numel = math.prod(shape) if shape else 1
-    if dtype == "q4_0":
-        if not shape or shape[-1] % Q4_0_BLOCK != 0:
+    if dtype in ("q4_0", "q8_0"):
+        block, block_bytes = (
+            (Q4_0_BLOCK, Q4_0_BLOCK_BYTES) if dtype == "q4_0"
+            else (Q8_0_BLOCK, Q8_0_BLOCK_BYTES)
+        )
+        if not shape or shape[-1] % block != 0:
             raise ValueError(
-                f"q4_0 tensor of shape {shape} has last dim {shape[-1] if shape else 0}, which is not a "
-                f"multiple of the {Q4_0_BLOCK}-element block size"
+                f"{dtype} tensor of shape {shape} has last dim {shape[-1] if shape else 0}, which is not a "
+                f"multiple of the {block}-element block size"
             )
-        return numel // Q4_0_BLOCK * Q4_0_BLOCK_BYTES
+        return numel // block * block_bytes
     return numel * _DENSE_BYTES[dtype]
 
 

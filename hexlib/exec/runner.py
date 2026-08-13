@@ -60,7 +60,7 @@ WIRE_DTYPE: dict[str, np.dtype] = {
 # and nbytes=331776, both true. Writing the byte shape into `ne` would be a lie on
 # the wire, and every `dim:` scalar and every kernel reading `a->ne` would inherit
 # it.
-WIRE_RAW: frozenset[str] = frozenset({"q4_0"})
+WIRE_RAW: frozenset[str] = frozenset({"q4_0", "q8_0"})
 
 _STRUCT_CODE = {"int": "i", "float": "f"}
 
