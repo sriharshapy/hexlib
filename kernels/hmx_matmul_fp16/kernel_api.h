@@ -51,6 +51,54 @@ typedef __fp16 hexlib_hf;
  * additive bias" from int8 probing. That was half of it: it is BOTH, one pair
  * per column.
  *
+ * ==========================================================================
+ * WHY THIS KERNEL CANNOT BE GATED BY `hexlib test`, ESTABLISHED BY READING
+ * llama.cpp RATHER THAN BY MORE PROBING.
+ * ==========================================================================
+ * HMX needs FOUR things before a single `mxmem` will execute, and a standalone
+ * simulator ELF -- which is what every other kernel in this repository is
+ * gated as -- has none of them. All four are in
+ * ../llama.cpp/ggml/src/ggml-hexagon/htp (MIT; see ATTRIBUTION.md):
+ *
+ *   1. POWER. `main.c:473-492`, guarded `#if __HVX_ARCH__ >= 75`, and SEPARATE
+ *      from the HVX power request beside it:
+ *          request.type = HAP_power_set_HMX_v2;
+ *          request.hmx_v2.set_power = TRUE;  .power_up = TRUE;
+ *          request.hmx_v2.set_clock = TRUE;
+ *          request.hmx_v2.target_corner = HAP_DCVS_EXP_VCORNER_MAX;  (min, max too)
+ *          request.hmx_v2.perf_mode = HAP_CLK_PERF_HIGH;
+ *          HAP_power_set(ctx, &request);
+ *
+ *   2. ACQUISITION, in the SAME compute-res attr as VTCM, not a separate one
+ *      (`vtcm_alloc`, main.c:259-291):
+ *          HAP_compute_res_attr_set_hmx_param(&attr, 1);
+ *          rctx = HAP_compute_res_acquire(&attr, 1000000);
+ *
+ *   3. AN EXPLICIT LOCK around every use (`hmx-queue.c:17-30`):
+ *          HAP_compute_res_hmx_lock(rctx);   ... mxmem ...   _hmx_unlock(rctx);
+ *
+ *   4. A DEDICATED THREAD owning that lock -- upstream queues all HMX work to
+ *      `hmx_queue_thread`, created only `if (n_hmx)` (main.c:386-394). Whether
+ *      the lock is thread-scoped, and therefore whether hexlib's
+ *      single-threaded skel can hold it inline, IS NOT SETTLED and must not be
+ *      assumed either way.
+ *
+ * WHAT THAT MEANS FOR hexlib. The pieces map almost one-to-one onto code that
+ * already exists here, which is why this is a short list and not a redesign:
+ *
+ *   - `session.c` passes n_hmx = 0 unconditionally today. llama.cpp's
+ *     `htp_iface_start(..., n_hvx, n_hmx, max_vmem)` is the same signature
+ *     hexlib ported, and `n_hmx` was always meant for exactly this.
+ *   - `skel_vtcm.c:102` ALREADY has `if (ctx->n_hmx > 0)
+ *     HAP_compute_res_attr_set_hmx_param(&attr, 1);` -- requirement 2, written
+ *     and never once executed.
+ *   - Requirements 1 and 3 do not exist in hexlib at all.
+ *
+ * So an HMX kernel belongs on the QuRT-hosted BATCH path (skel + VTCM + a real
+ * compute-res context), not on the standalone-ELF gate path. The kernel source
+ * below is probably fine; it was being run somewhere it can never work. The
+ * fault it produces there is exception 0x18 with badva on the stack.
+ *
  * TILE GEOMETRY. A 32x32 fp16 tile is 1024 elements and 2048 bytes
  * (HTP_MM_HMX_TILE_N_ELMS = 1024, matmul-ops.h:19). Operands are SYMMETRIC in
  * fp16 mode -- both 2048 bytes -- unlike the int8 path, where the activation
