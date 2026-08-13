@@ -104,7 +104,14 @@ def main() -> int:
     ap.add_argument("--key", required=True,
                     help="QDC-ISSUED pem (~/.ssh/qdc_id_<date>.pem), not your own key")
     ap.add_argument("--bin-dir", required=True,
-                    help="directory holding hexlib_run and libhexlib_skel.so")
+                    help="directory holding hexlib_run and the skel .so")
+    ap.add_argument("--stage-dir",
+                    help="directory holding batch.bin + arena.bin (a whole-plan "
+                         "batch from hexlib.exec.wholeplan). If given, the "
+                         "session pushes them, runs --batch, and pulls the "
+                         "arena back as out.bin")
+    ap.add_argument("--self-tests", action="store_true",
+                    help="also run --self-test / --coherency-check / --unmapped")
     ap.add_argument("--timeout-min", type=int, default=15,
                     help="session ceiling; you are billed for ALL of it")
     ap.add_argument("--adb-port", type=int, default=15037)
@@ -116,6 +123,7 @@ def main() -> int:
         SessionSubmissionParameter,
     )
     from hexlib.device.qdc import job
+    from hexlib.runtime import build
 
     key = os.path.expanduser(args.key)
     pub = subprocess.run(["ssh-keygen", "-y", "-f", key],
@@ -183,20 +191,47 @@ def main() -> int:
         adb(p, "shell", "getprop ro.product.model")
         adb(p, "shell", f"mkdir -p {DEV}")
         adb(p, "push", os.path.join(args.bin_dir, "hexlib_run"), f"{DEV}/")
-        adb(p, "push", os.path.join(args.bin_dir, "libhexlib_skel.so"), f"{DEV}/")
-        # BOTH NAMES until runtime/build.py is fixed -- FastRPC dlopens
-        # libhexlib_iface_skel.so and the build emits libhexlib_skel.so.
-        adb(p, "push", os.path.join(args.bin_dir, "libhexlib_skel.so"),
-            f"{DEV}/libhexlib_iface_skel.so")
+        # ONE NAME NOW. The build emits the name FastRPC dlopens
+        # (`device_skel_so_name()`, derived from the IDL stem), so the
+        # push-under-both-names workaround this script used to carry is gone.
+        # If it comes back, the bug is in runtime/build.py, not here.
+        skel = build.device_skel_so_name()
+        adb(p, "push", os.path.join(args.bin_dir, skel), f"{DEV}/")
         adb(p, "shell", f"chmod 755 {DEV}/hexlib_run")
 
         env = f"cd {DEV} && ADSP_LIBRARY_PATH={DEV}"
-        for mode in ("--caps",
-                     "--self-test",
-                     "--self-test --coherency-check",
-                     "--self-test --unmapped"):
-            log(f"=== hexlib_run {mode} ===")
-            adb(p, "shell", f"{env} ./hexlib_run {mode}; echo RC=$?", timeout=300)
+        log("=== hexlib_run --caps ===")
+        adb(p, "shell", f"{env} ./hexlib_run --caps; echo RC=$?", timeout=300)
+
+        if args.self_tests:
+            for mode in ("--self-test",
+                         "--self-test --coherency-check",
+                         "--self-test --unmapped"):
+                log(f"=== hexlib_run {mode} ===")
+                adb(p, "shell", f"{env} ./hexlib_run {mode}; echo RC=$?", timeout=300)
+
+        if args.stage_dir:
+            # THE WHOLE PLAN, ONE INVOKE. `arena.bin` is an IN-OUT buffer: it
+            # carries the weights and the graph input in, and the DSP writes
+            # every activation and the output back into it, so the same file
+            # is both `--in` and the thing pulled back afterwards.
+            batch = os.path.join(args.stage_dir, "batch.bin")
+            arena = os.path.join(args.stage_dir, "arena.bin")
+            adb(p, "push", batch, f"{DEV}/")
+            adb(p, "push", arena, f"{DEV}/")
+            log("=== hexlib_run --batch (the whole encoder, one invoke) ===")
+            rc, out = adb(
+                p, "shell",
+                f"{env} ./hexlib_run --batch batch.bin --in arena.bin "
+                f"--out out.bin; echo RC=$?",
+                timeout=900,
+            )
+            if "RC=0" in out:
+                dest = os.path.join(args.stage_dir, "out.bin")
+                adb(p, "pull", f"{DEV}/out.bin", dest, timeout=300)
+                log(f"pulled {dest}")
+            else:
+                log("--batch did not exit 0; nothing pulled")
         return 0
     finally:
         if tunnel and tunnel.poll() is None:
