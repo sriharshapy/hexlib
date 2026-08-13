@@ -67,6 +67,29 @@ def qaic_include_dirs(sdk_root: str) -> list[str]:
     return [os.path.join(sdk_root, "incs"), os.path.join(sdk_root, "incs", "stddef")]
 
 
+HEXLIB_IDL_STEM = "hexlib_iface"
+
+
+def device_skel_so_name(idl_stem: str = HEXLIB_IDL_STEM) -> str:
+    """The filename FastRPC will `dlopen`, derived rather than chosen.
+
+    THIS WAS A REAL DEFECT AND ONLY SILICON COULD FIND IT. The skel was linked
+    as `libhexlib_skel.so`, but the URI qaic generates into `hexlib_iface.h`
+    (`hexlib_iface_URI`, used by `session.c:163`) names the library after the
+    IDL: `hexlib_iface.idl` -> `libhexlib_iface_skel.so`. On the device
+    `hexlib_iface_open` failed with rc -2147482618 until the file was pushed
+    under BOTH names by hand.
+
+    Nothing offline could see it. Stage 1's simulator build LINKS the skel
+    directly rather than loading it by name, so the filename never participates
+    -- which is exactly the class of thing this project has learned to bind
+    structurally instead of asserting. Hence a derivation from the IDL stem,
+    used by the linker, the artifact packer and the device test alike, so the
+    three cannot drift apart again.
+    """
+    return f"lib{idl_stem}_skel.so"
+
+
 def run_qaic(idl: str, out_dir: str, sdk_root: str | None = None) -> QaicOutput:
     root = sdk_root or tc.default_sdk_root()
     if not os.path.isfile(idl):
@@ -594,7 +617,8 @@ DEVICE_SKEL_LINK_FLAGS = [
 
 def _build_device_skel_so(out_dir: str, root: str, gen: str, qa: QaicOutput) -> str:
     """Compile the skel + kernels + generated entries into a real Hexagon
-    SHARED OBJECT (`libhexlib_skel.so`), the device counterpart of
+    SHARED OBJECT (named by `device_skel_so_name()`, i.e.
+    `libhexlib_iface_skel.so`), the device counterpart of
     `build_skel_lib`'s `.a` above. Deliberately NOT a thin wrapper around
     `build_skel_lib` -- the object sets genuinely differ (see below), and
     `build_skel_lib`'s own `-fpic` insertion is asserted, by literal source
@@ -687,7 +711,7 @@ def _build_device_skel_so(out_dir: str, root: str, gen: str, qa: QaicOutput) -> 
     if not os.path.isfile(lib_hexagon):
         raise RuntimeBuildError(f"libhexagon.a not found: {lib_hexagon}")
 
-    so = os.path.join(out_dir, "libhexlib_skel.so")
+    so = os.path.join(out_dir, device_skel_so_name())
     cmd = [compiler] + tc.cflags_for_caps(["hvx"]) + DEVICE_SKEL_LINK_FLAGS
     cmd += [
         "-Wl,-Map=" + so + ".map",
@@ -698,7 +722,8 @@ def _build_device_skel_so(out_dir: str, root: str, gen: str, qa: QaicOutput) -> 
 
     rc, out, err, to = tc.run(cmd, env, timeout=tc.SIM_TIMEOUT_S)
     if to or rc != 0 or not os.path.isfile(so):
-        raise RuntimeBuildError("linking libhexlib_skel.so failed", (out + err).strip())
+        raise RuntimeBuildError(f"linking {os.path.basename(so)} failed",
+                                (out + err).strip())
     return so
 
 

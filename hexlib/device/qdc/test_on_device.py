@@ -31,6 +31,17 @@ from utils import push, sh, write_qdc_log
 
 DEV = "/data/local/tmp/hexlib"
 
+# A LITERAL, DELIBERATELY, AND BONDED BY A TEST. This module runs on the QDC
+# runner where hexlib is not installed -- it imports `utils` as a flat module,
+# not `hexlib.runtime.build` -- so it cannot call `device_skel_so_name()` and
+# has to spell the name out. `hexlib/tests/test_device_skel_so_name.py` reads
+# this literal back and asserts it equals what the linker produces, because two
+# independently written copies of a filename are exactly the drift that cost a
+# device session: the skel was linked `libhexlib_skel.so`, FastRPC dlopens the
+# name in qaic's generated URI, and `hexlib_iface_open` failed with
+# rc -2147482618 until the file was pushed under both names by hand.
+SKEL_SO = "libhexlib_iface_skel.so"
+
 # `hexlib_run` prints `hexlib: <mode>: cycles_total=%llu` (main.c's
 # run_self_test and run_coherency_check). Built as a regex, not a substring,
 # because the SUBSTRING IS SATISFIED BY `cycles_total=0` -- a run in which the
@@ -80,11 +91,11 @@ def test_binaries_are_present_and_executable():
     # format error. See utils.py's module docstring.
     sh(f"mkdir -p {DEV}")
     push("hexlib_run", DEV)
-    push("libhexlib_skel.so", DEV)
+    push(SKEL_SO, DEV)
     sh(f"chmod 755 {DEV}/hexlib_run")
     out = sh(f"ls -l {DEV}")
     assert "hexlib_run" in out, f"hexlib_run did not land in {DEV}:\n{out}"
-    assert "libhexlib_skel.so" in out, f"libhexlib_skel.so did not land in {DEV}:\n{out}"
+    assert SKEL_SO in out, f"{SKEL_SO} did not land in {DEV}:\n{out}"
 
 
 def test_capabilities_report_a_v75_cdsp_with_unsigned_pd():

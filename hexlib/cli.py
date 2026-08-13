@@ -409,7 +409,12 @@ def _qdc_submit(args) -> int:
     except runtime_build.RuntimeBuildError as e:
         print(f"error: building the device artifacts failed: {e}", file=sys.stderr)
         return 1
-    skel_so = os.path.join(build_dir, "libhexlib_skel.so")
+    # NAME IT THE WAY THE LINKER DID. `device_skel_so_name()` derives it
+    # from the IDL stem because FastRPC dlopens the name in qaic's
+    # generated URI, not one we pick -- see its docstring for the device
+    # failure (rc -2147482618) that this bond exists to prevent.
+    from hexlib.runtime.build import device_skel_so_name
+    skel_so = os.path.join(build_dir, device_skel_so_name())
 
     here = os.path.dirname(__file__)
     test_script = os.path.join(here, "device", "qdc", "test_on_device.py")
@@ -827,7 +832,7 @@ def _cmd_test_qdc(args) -> int:
     # RANGE-CHECKED HERE, NOT ONLY IN job.submit. job.py enforces 1..240 too
     # (it is the authority, and these bounds are imported from it rather than
     # respelled), but it does so AFTER _qdc_submit has run a full SDK build of
-    # hexlib_run + libhexlib_skel.so and staged a zip -- minutes of local work
+    # hexlib_run + the skel .so and staged a zip -- minutes of local work
     # thrown away to reject an argument that was wrong before any of it
     # started. A lazy import: job.py pulls in nothing but the stdlib at module
     # scope, and never the vendor SDK.

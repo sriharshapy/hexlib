@@ -2,7 +2,7 @@
 """Stage the stage-2 binaries and the on-device pytest into a zip QDC can run.
 
 The zip is uploaded as a flat TestScript (see job.py's _real_upload_artifact
-for why that artifact type and not TestPackage): hexlib_run, libhexlib_skel.so, and the
+for why that artifact type and not TestPackage): hexlib_run, libhexlib_iface_skel.so, and the
 on-device test script sit next to a pytest.ini and requirements.txt, matching
 what TestFramework.APPIUM finds once QDC extracts it at /qdc/appium. There is
 no subdirectory nesting here on purpose -- the on-farm scripts invoke a plain
@@ -18,7 +18,7 @@ minutes for nothing.
 WHY EMPTINESS IS CHECKED AND NOT JUST EXISTENCE. `os.path.isfile` was the
 whole test, and `stage` was verified to accept four 0-byte files and produce a
 perfectly submittable zip. A link or a copy that fails part-way leaves exactly
-that: a `libhexlib_skel.so` of length zero, present, named correctly, and
+that: a `libhexlib_iface_skel.so` of length zero, present, named correctly, and
 completely unrunnable -- discovered on the device, after the minutes are spent,
 as a dlopen failure with no obvious cause. Size zero is the one truncation
 that is unambiguous and free to detect here; deeper validation (ELF magic,

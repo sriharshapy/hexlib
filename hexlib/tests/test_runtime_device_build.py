@@ -1,6 +1,6 @@
 # hexlib/tests/test_runtime_device_build.py
 """Task 10 -- STAGE 2 GATE: cross-compile hexlib_run (Android aarch64) and
-libhexlib_skel.so (Hexagon device shared object). NEITHER IS EVER RUN HERE --
+libhexlib_iface_skel.so (Hexagon device shared object). NEITHER IS EVER RUN HERE --
 no device is available -- so every SDK-gated test below asserts the built
 ARTIFACT and its machine type, never merely that a function returned a path
 string that happens to exist.
@@ -121,12 +121,12 @@ def test_device_skel_so_actually_carries_the_symbolic_dynamic_flag(tmp_path):
     which the review this test responds to explicitly said not to do.
     """
     rb.build_device_binary(str(tmp_path))
-    so = os.path.join(str(tmp_path), "libhexlib_skel.so")
+    so = os.path.join(str(tmp_path), rb.device_skel_so_name())
     with open(so, "rb") as f:
         data = f.read()
     DT_SYMBOLIC = 0x10
     assert DT_SYMBOLIC in _elf32_dynamic_tags(data), (
-        "libhexlib_skel.so has no DT_SYMBOLIC dynamic tag -- -Wl,-Bsymbolic "
+        "the skel .so has no DT_SYMBOLIC dynamic tag -- -Wl,-Bsymbolic "
         "from DEVICE_SKEL_LINK_FLAGS did not actually reach the link"
     )
 
@@ -219,13 +219,13 @@ def test_the_built_binary_actually_embeds_the_pinned_api_level(tmp_path):
 @sdk
 def test_device_binary_and_skel_so_build(tmp_path):
     exe = rb.build_device_binary(str(tmp_path))
-    so = os.path.join(str(tmp_path), "libhexlib_skel.so")
+    so = os.path.join(str(tmp_path), rb.device_skel_so_name())
     assert os.path.isfile(exe)
     assert os.path.isfile(so)
     # FAIL CLOSED: a build step that exits 0 without writing real content
     # (e.g. `open(path, "w").close()`) must not pass as "it builds".
     assert os.path.getsize(exe) > 4096, "hexlib_run is implausibly small"
-    assert os.path.getsize(so) > 4096, "libhexlib_skel.so is implausibly small"
+    assert os.path.getsize(so) > 4096, "the skel .so is implausibly small"
 
 
 def _elf_header(path):
@@ -248,7 +248,7 @@ def test_the_device_binary_is_aarch64(tmp_path):
 @sdk
 def test_the_skel_so_is_hexagon(tmp_path):
     rb.build_device_binary(str(tmp_path))
-    so = os.path.join(str(tmp_path), "libhexlib_skel.so")
+    so = os.path.join(str(tmp_path), rb.device_skel_so_name())
     _, e_machine = _elf_header(so)
     assert e_machine == 164, f"expected EM_QDSP6 (164), got {e_machine}"
 
@@ -288,18 +288,18 @@ def test_the_stub_not_the_skel_is_linked_into_the_aarch64_binary(tmp_path):
 @sdk
 def test_the_skel_so_contains_the_skel_not_the_host(tmp_path):
     """The mirror image of the test above, from the Hexagon side.
-    `libhexlib_skel.so` must carry `hexlib_bufs_register` (skel_bufs.c) and
+    `libhexlib_iface_skel.so` must carry `hexlib_bufs_register` (skel_bufs.c) and
     must NOT carry `hexlib_drv_init` (driver.c, host-only) -- a build that
     accidentally bundled the aarch64 host sources into the device skel
     (nonsensical machine-code-wise, but a real risk if out_dir/object-name
     bookkeeping were wrong) would still produce *a* Hexagon .so, which the
     machine-type test above cannot by itself catch."""
     rb.build_device_binary(str(tmp_path))
-    so = os.path.join(str(tmp_path), "libhexlib_skel.so")
+    so = os.path.join(str(tmp_path), rb.device_skel_so_name())
     with open(so, "rb") as f:
         blob = f.read()
-    assert b"hexlib_bufs_register" in blob, "skel_bufs.c was not linked into libhexlib_skel.so"
+    assert b"hexlib_bufs_register" in blob, "skel_bufs.c was not linked into the skel .so"
     assert b"hexlib_drv_init" not in blob, (
-        "libhexlib_skel.so contains driver.c's hexlib_drv_init -- the "
+        "the skel .so contains driver.c's hexlib_drv_init -- the "
         "aarch64 host code was linked into the DSP-side skel"
     )
