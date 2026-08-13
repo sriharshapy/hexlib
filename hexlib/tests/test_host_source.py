@@ -877,13 +877,22 @@ def test_caps_reports_a_driver_failure_through_its_exit_code(main, main_strings)
     )
 
 
-# The three places §6.1's coherency table is written down. A doc claiming a
+# The places §6.1's coherency table is written down. A doc claiming a
 # guarantee the code does not deliver is, on this project, a defect at the same
-# weight as a code bug -- so the correction has to land in all three or the
+# weight as a code bug -- so the correction has to land in all of them or the
 # stale one becomes the one someone reads on the first device job.
+#
+# THERE WERE THREE. The design spec
+# (`docs/superpowers/specs/2026-08-10-silicon-path-runtime-design.md`) was the
+# third, and it left the repository entirely when `docs/` was untracked and
+# purged from history. A test cannot assert against a file the repository does
+# not contain: it passes on the machine that still has the untracked copy on
+# disk and fails on every fresh clone, which is the CI-only failure this suite
+# exists to avoid. The site is dropped rather than made conditional -- a
+# `skipif` here would be a check that silently protects nothing everywhere it
+# actually runs.
 _COHERENCY_TABLE_SITES = (
     pathlib.Path("hexlib/runtime/host/main.c"),
-    pathlib.Path("docs/superpowers/specs/2026-08-10-silicon-path-runtime-design.md"),
     pathlib.Path("hexlib/device/qdc/test_on_device.py"),
 )
 
@@ -912,23 +921,22 @@ _CORRECTION_ELEMENTS = ("unreachable", "not discriminated", "pcycleen", "buffer_
 # collected) -- so a parametrize id here made THAT test fail, on a file that
 # was correctly excluded. Reproduced before this comment existed.
 @pytest.mark.parametrize(
-    "path", _COHERENCY_TABLE_SITES, ids=("host_main", "design_spec", "device_test")
+    "path", _COHERENCY_TABLE_SITES, ids=("host_main", "device_test")
 )
 def test_the_coherency_table_correction_landed_everywhere_it_is_written_down(path):
     """READ WITH COMMENTS ON, DELIBERATELY -- unlike every other check in this
     file. The subject IS the prose: §6.1's table is a claim made to a human
     about what the first device job's output will mean, and it was asserting a
-    separation the code does not achieve. Two of the three copies are comments
-    (main.c's `run_coherency_check` header, test_on_device.py's docstring) and
-    the third is a design doc, so blanking comments would make this assert
-    nothing.
+    separation the code does not achieve. BOTH remaining copies are comments
+    (main.c's `run_coherency_check` header, test_on_device.py's docstring), so
+    blanking comments would make this assert nothing.
 
-    Deleting the correction from ANY ONE of the three fails this."""
+    Deleting the correction from EITHER fails this."""
     text = path.read_text(encoding="utf-8").lower()
     missing = [e for e in _CORRECTION_ELEMENTS if e not in text]
     assert not missing, (
         f"{path} is missing part of §6.1's corrected coherency table: "
-        f"{missing!r}. All three copies must say the same thing -- a stale one "
+        f"{missing!r}. Both copies must say the same thing -- a stale one "
         f"is the copy someone reads while triaging job 1."
     )
 

@@ -127,6 +127,21 @@ qdc_credentials*
 .superpowers/
 .claude/
 
+# ---- Project documentation, deliberately untracked ----
+# `docs/` -- STATE.md, the design specs, the plans, the HVX tour, the research
+# audits -- is kept on disk and OUT of the repository, and was purged from git
+# history rather than merely untracked from here on.
+#
+# The consequence, stated once so nobody rediscovers it: a tracked file MAY
+# still cite a `docs/...` path as provenance for a decision, and those
+# citations are now unresolvable to anyone but the author. They are left in
+# place because a comment naming where a fact came from is still worth more
+# than no attribution -- but NOTHING tracked may DEPEND on a docs path at run
+# time. One test did (`test_host_source.py`'s §6.1 coherency-table check read
+# the design spec) and passed only on the machine that still had the untracked
+# copy on disk; it was fixed when this rule landed, not after CI found it.
+docs/
+
 # ---- Patch and merge debris ----
 *.orig
 *.rej
