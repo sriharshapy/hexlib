@@ -50,10 +50,20 @@ A kernel clears these one at a time, and is unsupported until it clears all six.
    documented authorship record, and a comment explaining *why* it is fast.
 5. **Adversarial** — the `nearmiss_*.c` variants must fail, and `spec.json` edge cases
    become named tests.
-6. **Silicon** — batched QDC or local device, sim-vs-silicon drift recorded. **Not
-   implemented in this plan.** Gate 6, the `local` and `qdc` backends, and drift
-   recording arrive with the silicon-path plan. A kernel that has cleared gates 1-5
-   here has not cleared gate 6, and hexlib does not currently have a way to run it.
+6. **Silicon** — batched QDC or local device, sim-vs-silicon drift recorded. **The
+   transport now exists; the per-kernel record does not.** A QDC session with
+   `--stage-dir` pushes a batch blob and its arena to an SM8650, runs it, and pulls the
+   arena back — the whole encoder has gone through it in a single FastRPC invoke, and
+   the one sim-vs-silicon cycle comparison that produced is in `README.md`. What is
+   still missing is a *per-kernel* drift record and a place to put it, so a kernel that
+   has cleared gates 1-5 has still not cleared gate 6. Do not mark one as gate-6 clear
+   on the strength of the whole-encoder run.
+
+   **An HMX kernel cannot clear gates 3 and 5 on the standalone-ELF path at all** — HMX
+   needs power, acquisition, a lock and possibly a dedicated thread, none of which exist
+   in a program with no protection domain around it. HMX work belongs on the QuRT-hosted
+   batch path; see `kernels/hmx_matmul_fp16/README.md`, which is a worked example of a
+   kernel committed *without* a `RESULT.md` because it does not gate.
 
 `hexlib new-kernel <name>` scaffolds a directory that satisfies the structural half of
 gates 1-5 (required files, a near-miss stub, a matching `spec.json`); `hexlib

@@ -25,15 +25,18 @@ its evidence.
 |---|---|---|
 | **Kernel pipeline** | ✅ shipped | write a `.c`, run `hexlib test`, get a gate verdict + cycles + ELF proof |
 | **Graph → plan compiler** | ✅ shipped | `hexlib plan qwen35 --print`, no SDK needed |
-| **Plan executor** | ✅ shipped | whole encoder runs end to end; validated against PyTorch **on a tiny config only** — no full-size reference exists yet |
-| **6 kernels** | ✅ gated | 4 dispatchable from the executor; 86 of 259 real-work ops |
-| **Silicon-path runtime** | 🚧 on a branch | FastRPC + DSP skel; simulator green, **never run on hardware** |
-| **On-device execution** | ❌ not yet | cross-compiles and stages; no job has been run |
+| **Plan executor** | ✅ shipped | whole encoder runs end to end, and now against the **real** Qwen3.5-0.8B checkpoint at 256×256 |
+| **12 kernels** | ✅ gated | **every one of the encoder's 259 real-work ops selects a kernel** |
+| **Silicon-path runtime** | ✅ runs on hardware | whole plan, **one** FastRPC invoke, on an SM8650 |
+| **On-device execution** | ⚠️ tiny config only | the 256×256 encoder has never been run on a device |
+| **HMX** | ❌ blocked | a kernel exists and does **not** gate — see below |
 
-**Nothing here has executed on real silicon.** All cycle counts come from
-`hexagon-sim` under a pinned bus model. The simulator is cycle-*approximate* — see
+Cycle counts, unless a row says silicon, come from `hexagon-sim` under a pinned bus
+model. The simulator is cycle-*approximate* — see
 [`docs/hardware/simulator-accuracy.md`](docs/hardware/simulator-accuracy.md) for where
-it is most likely to drift.
+it is most likely to drift. On the one workload measured both ways it runs 6.7% high —
+see [Results](#results-pytorch--simulator--silicon) below, which chains PyTorch, the
+simulator and the device.
 
 ### The Hexagon SDK is required to build or run a kernel
 
@@ -109,26 +112,43 @@ Design docs: [encoder](docs/superpowers/specs/2026-08-09-vlm-encoder-design.md) 
 
 ## Kernels
 
-Six kernels through the gates. Cycles are `kernel_cycles` — the DSP-side count for the
-kernel call alone, never whole-program `cycles`, which carries 155k–190k of roughly
-constant harness and CRT overhead.
+Twelve kernels through gates 1–5. Cycles are `kernel_cycles` — the DSP-side count for
+the kernel call alone, never whole-program `cycles`, which carries 155k–190k of roughly
+constant harness and CRT overhead. Each row's number and near-miss set is the
+tool-generated `kernels/<name>/RESULT.md`, not a figure retyped here.
 
-| kernel | cycles | accuracy vs numpy | notes |
+| kernel | cycles | max abs error | notes |
 |---|---|---|---|
-| `scale_fp16` | **886** | exact (normal range) | factor 0.125 is a power of two, so no mantissa bit is lost |
-| `transpose_th_fp16` | **706** | exact | perm (1,0,2), both directions |
-| `add_fp16` | **1139** | 1 ULP | the hardware's fp16 narrowing is not IEEE round-to-nearest-even |
-| `cast_f32_f16` | **1176** | bit-exact | needs a lane deal — the widening conversion interleaves |
-| `rmsnorm_fp16` | **2231** | — | **31.13×** over a 69443-cycle scalar baseline |
-| `layernorm_fp16` | 111088 | — | **a first rung, not a result** — reductions still scalar |
+| `transpose_th_fp16` | **706** | 0 | perm (1,0,2), both directions |
+| `scale_fp16` | **886** | 0 | factor 0.125 is a power of two, so no mantissa bit is lost |
+| `add_fp16` | **1139** | 0 | 1 ULP class: the hardware's fp16 narrowing is not IEEE round-to-nearest-even |
+| `cast_f32_f16` | **1176** | 0.5 | needs a lane deal — the widening conversion interleaves |
+| `rope_2d_fp16` | **1212** | 6.10e-05 | six near-misses, the largest set here — pairing, table indexing and sign are each independently wrong-able |
+| `rmsnorm_fp16` | **2231** | 1.95e-03 | **31.13×** over a 69443-cycle scalar baseline |
+| `transpose_hd_fp16` | **5606** | 0 | perm (0,2,1); movement-only, no arithmetic in the ELF |
+| `softmax_fp16` | **11292** | 0 | fp32 exp path deliberately — see the upstream findings below |
+| `layernorm_fp16` | 111088 | 4.88e-04 | **a first rung, not a result** — reductions still scalar |
+| `matmul_fp16` | 995714 | 9.77e-04 | the encoder's 24 unfused attention matmuls; gated at N=200 |
+| `patchify_fp32` | 2018331 | 0 | runs once, at the input; emits merge-block order, not raster |
+| `matmul_epilogue_fp16` | 14310406 | 2.44e-04 | fused matmul+bias+activation over q4_0 weights — 75 of 308 steps and 95.5% of all DDR traffic |
 
 `layernorm_fp16`'s number is deliberately unoptimised: the affine epilogue is
 vectorised, both reductions are not. It was left scalar so the reduction has a
 *recorded* baseline to beat rather than an assumed one. A rotate-and-add butterfly
-already exists in `kernels/rmsnorm_fp16/`.
+already exists in `kernels/rmsnorm_fp16/`. `matmul_epilogue_fp16` is the same story at
+the other end of the scale — it is correct and gated, and nothing has been optimised
+about it yet.
 
 Full bake-off records, including the candidates that **lost**, live in each kernel's
 `BAKEOFF.md`.
+
+**A thirteenth kernel is committed and does not gate.**
+[`kernels/hmx_matmul_fp16/`](kernels/hmx_matmul_fp16/README.md) has no `RESULT.md`,
+deliberately, because the simulator faults before the harness prints a verdict — and
+the gate reports that as a failure, not a pass. The reason is now known exactly and it
+is structural: **HMX cannot be used inside `hexlib test`'s standalone ELF at all.** The
+directory's `README.md` records the four things it needs, the two real defects found on
+the way, and what to do next.
 
 ### Target model
 
@@ -140,28 +160,113 @@ DDR ↔ VTCM        58,643,456 bytes
 Plan steps        308   (396 ops before fusion)
 ```
 
-`matmul_epilogue` alone accounts for 56.0 of those 58.6 MB — 95.5% of all the traffic —
-which is why it is next.
+`matmul_epilogue` alone accounts for 56.0 of those 58.6 MB — 95.5% of all the traffic.
 
-**Numerical validation is at a different scale, and the distinction matters.** The plan
-figures above are at 256×256. The accuracy figures below are **not**: they are measured
-on a *tiny* config — 2 layers, hidden 64, image 32 — against committed golden vectors,
-with no torch at test time.
+Every one of the 259 real-work steps now selects a dispatchable kernel; the remaining 49
+are reshapes, which are pure metadata once resident and need none. That claim is
+*asked*, not counted — `hexlib/tests/test_encoder_dispatch_coverage.py` puts every step
+of the real compiled plan through `select()`, because this project published a wrong
+coverage number three times by counting kernel directories instead. (`hexlib plan
+--print` still lists all eleven kinds under "no kernel": `OpDef.kernel` is a separate
+registry that is still `None` everywhere, and wiring it moves figures several tests pin.)
 
-| | |
+### Accuracy — measured on the real checkpoint
+
+The shipped `Qwen/Qwen3.5-0.8B` vision weights at 256×256, against `transformers`, with
+fp32 arithmetic on **both** sides so nothing but the weight format differs:
+
+| | cosine vs `transformers` |
 |---|---|
-| tiny config vs upstream `transformers` | **4.47e-08** |
-| tiny config through the plan executor, fp32 | 4.470e-08 |
-| tiny config through the plan executor, fp16 | 6.747e-05 |
+| hexlib fp32, full-precision weights | **0.9999999999** |
+| q8_0 weights | **0.999002** (max_rel 7.98e-02, 1.89× the weight bytes) |
+| q4_0 weights | **0.867606** (max_rel 4.32e-01) |
+| fp16 *activations*, weights exact | 0.999991 — **15,000× smaller than quantization** |
 
-**There is no full-size PyTorch reference yet**, so nothing here says the 0.8B encoder is
-validated at 256×256. What the tiny config does establish is that the graph, the pass
-pipeline, the plan and the executor agree with upstream to fp32 round-off, and what the
-fp16 row costs — which is the part a larger config would not change. Obtaining a
-full-size reference is tracked in [`docs/STATE.md`](docs/STATE.md).
+**q4_0 is not enough for this encoder, and it is not the kernels' fault.** Mixed
+precision was measured and rejected: the error is *diffuse*, so keeping the patch
+embedding, the merger and all of attention at 8 bits while the MLPs stay q4_0 still only
+reaches 0.913. Smaller blocks were measured and rejected: block=8 spends 6 bits/value on
+more scales for 0.937, where q8_0 spends 8.5 on mantissa for 0.999. Fusion and HMX
+cannot recover it either — fusion's entire budget is the fp16-activation term, 8.8e-06
+of cosine, and HMX is a speed lever, not an accuracy one.
 
-*(Corrected 2026-08-11: these three figures previously sat directly under the "at
-256×256" heading with no scale caveat, which read as a claim about the full model.)*
+**A tiny-config sweep said the opposite of all of this** and nearly sent the work the
+wrong way: at 2 layers with random weights it ranked the merger dominant, put `wq`/`wk`
+at the noise floor, and made mixed precision look like a 30× win. Two layers is not
+enough depth for diffuse error to compound, and random normals have no outliers. **Do
+not tune quantization against the tiny config.**
+
+The tiny config (2 layers, hidden 64, image 32) is still what the committed golden
+vectors cover, and still what runs with no torch at test time: 4.47e-08 vs upstream,
+4.470e-08 through the plan executor in fp32, 6.747e-05 in fp16.
+
+*(Corrected 2026-08-11: the tiny-config figures previously sat directly under the "at
+256×256" heading with no scale caveat, which read as a claim about the full model. The
+full-size reference that was missing then now exists — it is the first row of the table
+above.)*
+
+---
+
+## Results: PyTorch → simulator → silicon
+
+The chain is four links, and each is checked against the one before it rather than
+against an assumption. Read down the table: what upstream `transformers` computes, what
+hexlib's numpy reference computes from the same weights, what the Hexagon simulator
+computes running the real kernels, and what an SM8650 computes running the same blob.
+
+| link | what is compared | scale | result |
+|---|---|---|---|
+| **PyTorch → hexlib reference** | upstream `transformers` vs the graph + passes + plan executor, fp32 both sides, real `Qwen/Qwen3.5-0.8B` weights | **256×256, 12 layers** | cosine **0.9999999999** |
+| **PyTorch → hexlib reference** | same, against committed golden vectors with no torch at test time | tiny (2 layers) | **4.47e-08** max abs |
+| **hexlib reference → simulator, per-op** | every op with a kernel routed through `hexagon-sim`, one launch each, vs the numpy registry over the identical plan and feeds | tiny (49 ops) | max rel **1.1319e-03**, corr **1.000000** |
+| **hexlib reference → simulator, one invoke** | the whole plan as a *single* batch blob, one simulator entry | tiny (49 ops) | the same figure |
+| **hexlib reference → silicon, one invoke** | the same blob, one FastRPC invoke on an SM8650 | tiny (49 ops) | the same figure — cosine **0.99999967** |
+
+**Three transports, one answer.** The per-op simulator path, the single-invoke simulator
+path and the device agree to the digits printed above; that agreement is the point, not
+the individual number. The residual 1.13e-03 is fp16 activations compounding across the
+encoder, not a wrong kernel — every intermediate narrows to fp16 and feeds the next op.
+
+Cycles, on the one workload measured both ways:
+
+| | cycles_total | note |
+|---|---|---|
+| simulator, single invoke | 302,087,160 | no `--timing --buspenalty 75 --busratio 2` on the batch path |
+| SM8650, single invoke | **283,220,278** | 0 ops not OK |
+
+The simulator is **6.7% high** here. That is a bare comparison of two numbers, not a
+calibrated drift figure — the flags differ, and one workload is not a model.
+
+**Everything on the device is the tiny config.** The 256×256 encoder compiles to a 46 KB
+blob over a 203.7 MB arena and **has never been run on a device**. Nothing above is a
+full-model silicon result. The reason is cost, not capability: a full-size *simulator*
+run is 259 separate `hexagon-sim` launches, which is hours for a signal a 49-op graph
+gives in minutes, and QDC sessions bill for their whole timeout.
+
+Three things silicon settled that no simulator test could:
+
+- **`cycles_total` is non-zero in a user-mode unsigned PD.** `SYSCFG.PCYCLEEN` cannot be
+  set there, and a dead counter would have invalidated every cycle figure this project
+  has ever reported. It is alive.
+- **`arch_ver` is 0x8c75, bit-identical to the simulator**, with `unsigned_pd_support=1`
+  and `vtcm_total_bytes=8388608`. An assertion that had never actually been checked.
+- **A real defect the simulator structurally could not catch.** FastRPC keeps the two
+  caches coherent only for buffers passed as invoke arguments; hexlib's are mapped out
+  of band by `fastrpc_mmap` and named by fd, so nothing wrote them back. `--self-test`
+  returned 3859/4100 values not bit-exact and the encoder's last op read all zero. It is
+  *ordered* corruption — early writes landed, the final op's 1024 bytes never left the
+  cache — which is what identified it, because random corruption does not sort itself by
+  age. Fixed with `qurt_mem_cache_clean`: **invalidate before and flush after**. Flush
+  alone works for exactly one invoke per session and then silently computes on old data.
+
+**Device cycle counts from before that fix are still valid** — PCYCLE is a register read.
+Device *data* from before it is not.
+
+Reaching a device at all needs three non-obvious things, none of them in the SDK
+signature: the SSH key must be the one **QDC** issued rather than your own,
+`session_parameters=[SSHONLY]` is what provisions SSH at all, and what you get back is
+an **adb tunnel**, not a shell — nothing runs remotely, everything goes through a local
+`adb -P <port>`. Sessions bill for the whole timeout, not for what you use.
 
 ---
 
