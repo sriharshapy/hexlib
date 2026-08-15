@@ -1,0 +1,23 @@
+{
+  "task_id": "patchify_fp32",
+  "dtype": "fp32",
+  "caps": [],
+  "mechanisms": ["hvx"],
+  "params": {
+    "C": 3,
+    "T": 2,
+    "H": 256,
+    "W": 256,
+    "patch": 16,
+    "temporal_patch": 2,
+    "merge": 2,
+    "grid_h": 16,
+    "grid_w": 16,
+    "encoder_shape": "[3, 2, 256, 256] -> [256, 1536]",
+    "small_shape": "[2, 3, 12, 12] -> [16, 54], patch=3, merge=2 (scalar-tail path)"
+  },
+  "expert_kernel_cycles": null,
+  "tolerance": "exact",
+  "movement_only": true,
+  "tags": ["layout", "encoder", "vision", "patch-embed"]
+}

@@ -34,11 +34,45 @@ llama.cpp or ggml, and none of the copied headers reference ggml (verified by
 `hexlib/tests/test_vendored_headers.py`, which fails the build if a `ggml` reference
 appears in any of them, or if the vendored directory is empty).
 
-**Deferred to plan 2 (the tile DSL / v2 spec):** ggml-hexagon's IDL, host driver
-(`htp-drv.cpp`), and CMake toolchain file are also planned to be copied under this
-same MIT attribution, once the DSL and device runtime work that needs them begins.
-Nothing under those categories has been copied yet in this plan; when it is, this
-document must be updated alongside it.
+## Adapted: ggml-hexagon's FastRPC runtime (MIT)
+
+**Source:** `ggml/src/ggml-hexagon/` in
+[`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp).
+**License:** MIT. **Copyright:** (c) 2023-2026 The ggml authors.
+**Upstream commit:** `6a32c29a746a2e44de463de647f9f6661eb5086b` (2026-08-06).
+
+hexlib's silicon-path runtime (`hexlib/runtime/`) is **adapted** from this
+backend — rewritten in hexlib's own tree, not copied verbatim. What was adapted,
+and from where:
+
+| hexlib | upstream | what was taken |
+|---|---|---|
+| `runtime/idl/hexlib_iface.idl` | `htp/htp_iface.idl` | the session lifecycle: `start`, `stop`, `mmap`, `munmap`, `hwinfo` |
+| `runtime/host/driver.c` | `htp-drv.cpp` | dlopen/dlsym of `libcdsprpc`, so a missing driver is a message rather than a loader failure |
+| `runtime/skel/skel_bufs.c` | `htp/main.c` `reuse_buf`/`mmap_buf`/`prep_tensor` | fd→base mmap caching, and the **(buffer index, offset)** tensor addressing that keeps host addresses off the wire |
+| `runtime/skel/skel_vtcm.c` | `htp/main.c` `vtcm_acquire`/`vtcm_alloc` | `HAP_compute_res_*` acquisition with a release callback |
+| `runtime/skel/hexlib_dsp.h` | `htp/htp-ops.h` | the batch descriptor SHAPE, and `htp_status`'s "OK is 1, not 0" |
+| `runtime/wire.py` | `htp/htp-ops.h` `htp_opbatch_req` | the batch request SHAPE that `wire.py:10` credits: a fixed header, then buffer descriptors, tensor descriptors and ops in one opaque blob. The Python serializer is hexlib's own; only the layout is adapted, and it is the host-side mirror of the `hexlib_dsp.h` row above |
+| `runtime/skel/skel.c` | `htp/main.c` session entry points | the `open`/`close`/`start`/`stop`/`mmap`/`munmap`/`hwinfo` lifecycle qaic's skel dispatches to; `invoke` is hexlib's own (a single opaque batch, not a dspqueue packet per op) |
+| `runtime/host/session.c` (`hexlib_query_caps`'s `ARCH_VER` query) | `htp-drv.cpp` `htpdrv_get_arch` | the `remote_dsp_capability` / `DSPRPC_GET_DSP_INFO` query shape. Not adapted from it: hexlib queries every capability it needs (`DOMAIN_SUPPORT`, `UNSIGNED_PD_SUPPORT`, `HVX_SUPPORT_128B`, `VTCM_PAGE`, `VTCM_COUNT`, `ARCH_VER`, `HMX_SUPPORT_DEPTH`) through one loop rather than one bespoke function per attribute, and cross-checks the **arch** against the skel's own `hwinfo` reply rather than trusting the driver alone. **Corrected 2026-08-11:** this row previously implied every capability is cross-checked. Only `arch` is. `vtcm_page × vtcm_count` vs the skel's `vtcm_size`, `hvx_support_128b` vs `n_hvx`, and `hmx_support_depth` vs `n_hmx` are queried and never compared — and `n_hvx`/`n_hmx` are host echoes rather than DSP facts anyway, so there is currently nothing on the DSP side to compare them against |
+| `runtime/host/session.c` `hexlib_decode_bcd_arch` | `htp-drv.cpp` `htpdrv_get_arch` (the decode, not just the query shape) | the actual formula, copied line-for-line: `val = arch_ver & 0xff; arch = (val >> 4) * 10 + (val & 0x0f)`. **Bug found and fixed while adapting this, not upstream's:** an earlier draft of this file compared the skel's plain-decimal `__HEXAGON_ARCH__` (75) directly against the driver's raw, BCD-packed `ARCH_VER` (0x8c75 = 35957) with no decode at all, which can never agree on any real device and would have refused every session unconditionally; extracting and adapting `htpdrv_get_arch`'s decode is the fix |
+| `exec/quant.py` | `ggml/src/ggml-quants.c` `quantize_row_q4_0_ref` and `ggml/src/ggml-common.h` `block_q4_0` | the **q4_0 block format and the quantization arithmetic**, transcribed rather than copied: the 18-byte block (one fp16 scale then 32 nibbles), the `j`/`j+16` nibble pairing, the signed `d = max / -8` scale, and the `min(15, (int8_t)(x * id + 8.5f))` truncating quantize step. hexlib needs it because 75 of the encoder's plan steps take a q4_0 weight and hexlib has no checkpoint loader, so nothing else in the tree can produce one. It is a reference implementation in numpy for tests and the end-to-end run -- not on any hot path -- and it is bound to an independent scalar transcription of the same upstream loop by `tests/test_quant_q4_0.py`, byte for byte |
+| `runtime/host/buffers.c` | `htp-drv.cpp` | the sequence, not the code. It performs the same `rpcmem_alloc` / `rpcmem_to_fd` / `fastrpc_mmap` calls that `htp-drv.cpp` wraps, written from the SDK's own documented call order rather than copied — upstream's allocation call sites live in `htp-drv.cpp`'s caller, not in the file the `driver.c` row above already attributes |
+
+**Deliberately not adapted:** `dspqueue` dispatch (`htp_main_thread`,
+`htp_packet_callback`, `process_opbatch`), because it has no simulator path;
+`htp_tensor`'s `ne`/`nb` strides, because hexlib uses an enumerated layout; and
+the ggml opcode enum.
+
+**One upstream defect is fixed rather than carried over:** `mmap_buf` returns
+silently with `base == 0` when all mmap slots are occupied, after which
+`prep_tensor` computes `0 + offset` and the kernel reads or writes a small bogus
+address; it also `abort()`s on a failed mapping. hexlib returns
+`HEXLIB_DSP_ERR_NO_MMAP_SLOT` / `HEXLIB_DSP_ERR_MMAP_FAILED` and runs no op.
+
+This is **adapted, not vendored** — unlike `include/hexlib/hvx/`, which is
+byte-identical upstream and must never be edited in place. hexlib still has no
+build or runtime dependency on llama.cpp or ggml.
 
 ## Adapted, not vendored: hexbench (same author)
 

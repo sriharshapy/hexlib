@@ -1,0 +1,27 @@
+{
+  "task_id": "matmul_epilogue_fp16",
+  "dtype": "q4_0->fp16",
+  "caps": [],
+  "mechanisms": ["hvx"],
+  "params": {
+    "shapes_tested": [
+      {"M": 8, "K": 64, "N": 128, "act": "none"},
+      {"M": 12, "K": 96, "N": 160, "act": "gelu_tanh"},
+      {"M": 20, "K": 128, "N": 96, "act": "gelu_erf"}
+    ],
+    "encoder_shapes": [
+      "48x (256,768)x(768,768)+bias->  (256,768)   act=none",
+      "12x (256,768)x(768,3072)+bias-> (256,3072)  act=gelu_tanh",
+      "12x (256,3072)x(3072,768)+bias->(256,768)   act=none",
+      "1x  (256,1536)x(1536,768)+bias->(256,768)   act=none",
+      "1x  (64,3072)x(3072,3072)+bias->(64,3072)   act=gelu_erf",
+      "1x  (64,3072)x(3072,1024)+bias->(64,1024)   act=none"
+    ],
+    "encoder_op_count": 75,
+    "weight_layout": "row_major q4_0, blocks along N (the output/free axis, the last logical dim of the (K,N) weight), NOT ggml-hexagon's 576-byte HMX-repacked tile order",
+    "accel_path": "HVX-compute (widen-multiply-accumulate in qf32, one narrow at the end); HMX not implemented -- see kernel_api.h 'WHY HVX-COMPUTE, NOT HMX'"
+  },
+  "expert_kernel_cycles": null,
+  "tolerance": "hexlib_close_f16 (rel=0.01, abs=3e-4; derivation in harness.c's header)",
+  "tags": ["matmul", "bias", "gelu", "q4_0", "quantized-weight", "encoder", "first-rung"]
+}

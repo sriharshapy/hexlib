@@ -1,0 +1,41 @@
+# Normalize line endings. Without this, every commit from a Windows checkout
+# prints "warning: CRLF will be replaced by LF the next time Git touches it",
+# and a contributor on another platform sees whole-file diffs that contain no
+# actual change.
+#
+# `text=auto eol=lf` means: store everything Git detects as text with LF in the
+# repository, and check it out with LF everywhere, including on Windows. LF is
+# the right choice rather than native because the DSP-side C is read by
+# hexagon-clang and by this repo's own source-assertion tests, which slice C
+# function bodies by byte offset (hexlib/tests/csource.py) -- a mixed-ending
+# working tree makes those offsets platform-dependent.
+* text=auto eol=lf
+
+# Explicitly text, so no heuristic has to guess.
+*.py    text eol=lf
+*.c     text eol=lf
+*.h     text eol=lf
+*.idl   text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.toml  text eol=lf
+*.cfg   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.txt   text eol=lf
+*.sh    text eol=lf
+
+# Binary. Never normalize, never diff as text.
+*.npz   binary
+*.bin   binary
+*.elf   binary
+*.so    binary
+*.a     binary
+*.png   binary
+*.zip   binary
+
+# The committed vision-encoder golden vectors. Marked binary explicitly rather
+# than relying on the *.npz rule above, because this file is the correctness
+# oracle for the whole encoder (docs/research/oracle-provenance.md) and a
+# line-ending "fix" applied to it would corrupt it silently.
+hexlib/tests/data/qwen35_vision_tiny.npz binary

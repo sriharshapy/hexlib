@@ -36,6 +36,15 @@ oracle = ["torch>=2.0", "transformers>=5.10"]
 "hexlib.tests" = ["data/*.npz"]
 
 [tool.pytest.ini_options]
+# NO `testpaths` HERE, ON PURPOSE. Keeping hexlib/device/qdc/test_on_device.py
+# out of the offline suite (it runs on the phone, and its flat `import utils`
+# breaks collection here) is done by `collect_ignore` in the ROOT conftest.py
+# instead. `testpaths` would apply only when no path is given on the command
+# line, so `pytest hexlib` or `pytest .` would walk back into it; the conftest
+# covers every invocation form. See conftest.py's docstring for the full
+# reasoning and hexlib/tests/test_qdc_on_device_is_excluded.py for the test
+# that pins both -- adding `testpaths` in place of that mechanism fails
+# test_naming_a_path_does_not_reach_the_on_device_test_either.
 markers = [
     "sdk: requires the Hexagon SDK (hexagon-clang, hexagon-sim). Not run in CI.",
 ]

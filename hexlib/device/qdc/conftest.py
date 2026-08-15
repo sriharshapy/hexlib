@@ -1,0 +1,144 @@
+"""Runs ON THE DEVICE, beside `test_on_device.py`, under the farm's own pytest.
+
+WHY THIS FILE EXISTS. `pytest.ini` (written by `artifact.py`) points
+`--junitxml` at the RELATIVE path `TestLogs/results.xml`, which lands in
+whatever directory QDC's runner happens to invoke pytest from. QDC does not
+collect that. It collects `/data/local/tmp/QDC_logs` -- which is precisely
+what `utils.write_qdc_log` writes to, and which NOTHING called with the
+report until this file existed.
+
+That gap is not theoretical: job 756124 (2026-08-12, the first hexlib job QDC
+ever accepted) reached state Completed and returned exactly one log file --
+a stale `LauncherUI` log from an unrelated job four days earlier. No
+`TestLogs/results.xml`, so `wait()` polled for its whole cap and returned
+False on a job that may well have run correctly. The report was written; it
+just never left the device.
+
+`llama.cpp`'s own QDC runner (`scripts/snapdragon/qdc/tests/conftest.py`)
+solves the same problem the same way, and is the working reference this was
+matched to. It does the copy in `pytest_sessionfinish`; this uses
+`pytest_unconfigure`, which is strictly later -- the junitxml plugin writes
+the file during its OWN `pytest_sessionfinish`, and two hookimpls for one hook
+have no ordering guarantee worth betting a device job on.
+
+THE SUBDIRECTORY IS LOAD-BEARING. `job.wait()` matches a log whose name ENDS
+WITH `TestLogs/results.xml`, and QDC lists collected logs as
+`<job_id>/<name>`. Writing a flat `results.xml` would be listed as
+`756124/results.xml`, which does not match that suffix, and `wait()` would
+miss a report that had arrived. The nesting here and `RESULTS_MARKER` in
+job.py are one decision recorded in two places.
+
+FAIL CLOSED. If the junitxml is missing or unreadable, this writes a file at
+the same path SAYING SO rather than writing nothing. Writing nothing is
+indistinguishable from the job never finishing, costs the full wait cap, and
+tells the operator nothing; a file that exists and does not parse is caught
+immediately by `cli._qdc_check_results` and names its own cause.
+"""
+import os
+import traceback
+
+import pytest
+
+from utils import QDC_LOG_DIR, write_qdc_log
+
+
+@pytest.fixture(scope="session", autouse=True)
+def driver():
+    """Open the Appium session QDC's APPIUM framework expects.
+
+    hexlib's tests drive the phone through `adb` and never touch this object.
+    It exists because the framework is `TestFramework.APPIUM` and llama.cpp's
+    working runner on this same account opens exactly this session; a package
+    that never establishes one is the most plausible remaining reason two
+    hexlib jobs reached Completed having emitted nothing of their own.
+
+    NON-FATAL BY DESIGN, and that is the important part. This fixture is
+    session-scoped and autouse, so if it raised it would error EVERY test --
+    turning a run that would otherwise have worked into a total failure, to
+    obtain an object none of these tests use.
+
+    That is not a hypothetical trade-off. Job 744001 (hexbench, this account,
+    this device) collected and ran `tests/test_capprobe.py` against the phone
+    purely over adb, with no Appium session anywhere in its stdout. So the
+    session is plausibly unnecessary here; it is attempted because llama.cpp's
+    runner does establish one and a missing session is the other candidate
+    explanation for a test stage that never starts. Attempt it, keep it if it
+    works, and never let its absence be the reason a job reports nothing.
+
+    Imported inside the fixture so that collecting this file does not require
+    the Appium client to be installed -- the report-copying hook below is the
+    part that must work regardless.
+    """
+    try:
+        from appium import webdriver
+        from appium.options.common import AppiumOptions
+
+        options = AppiumOptions()
+        options.set_capability("automationName", "UiAutomator2")
+        options.set_capability("platformName", "Android")
+        options.set_capability("deviceName", os.getenv("ANDROID_DEVICE_VERSION"))
+        return webdriver.Remote(
+            command_executor="http://127.0.0.1:4723/wd/hub", options=options
+        )
+    except Exception:
+        # Recorded, not raised: a reader of the collected logs needs to know
+        # whether a session existed when interpreting whatever the job did.
+        try:
+            write_qdc_log(
+                "hexlib_appium_session.txt",
+                "no Appium session was established; tests ran over adb "
+                f"alone:\n{traceback.format_exc()}",
+            )
+        except Exception:
+            pass
+        return None
+
+# FLAT, and deliberately NOT `TestLogs/results.xml`. QDC publishes pytest's
+# own junitxml as `<job>/<subid>/TestLogs/results.xml` -- that is the file
+# job.wait() matches. This copy lands under `UserCollectedLogs/QDC_logs/`
+# (exactly where job 744001's own `results.xml` is), so naming it
+# `TestLogs/results.xml` would produce a SECOND collected name ending in that
+# suffix, and cli._qdc_check_results treats two matches as a failure rather
+# than picking one. This copy exists to survive the framework not publishing
+# its own, not to compete with it.
+_RESULTS_NAME = "results.xml"
+
+
+def _copy_report(config):
+    xml_path = getattr(config.option, "xmlpath", None)
+    if not xml_path:
+        return (
+            "<!-- no --junitxml path was configured, so pytest wrote no report. "
+            "artifact.py's pytest.ini is what sets it. -->"
+        )
+    if not os.path.exists(xml_path):
+        return (
+            f"<!-- pytest was told to write {xml_path} and no such file exists "
+            f"at the end of the run. The session most likely died before the "
+            f"junitxml plugin wrote it. -->"
+        )
+    try:
+        with open(xml_path, encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return f"<!-- reading {xml_path} raised:\n{traceback.format_exc()}\n-->"
+
+
+def pytest_unconfigure(config):
+    """Copy the JUnit report into QDC's collected log directory.
+
+    Never raises: an exception here would be reported as an error in the
+    runner's own teardown, on a path whose entire job is to make the real
+    result visible. Any failure is written to a second log instead.
+    """
+    try:
+        write_qdc_log(_RESULTS_NAME, _copy_report(config))
+    except Exception:
+        try:
+            write_qdc_log(
+                "hexlib_conftest_error.txt",
+                "copying the junit report into "
+                f"{QDC_LOG_DIR} raised:\n{traceback.format_exc()}",
+            )
+        except Exception:
+            pass

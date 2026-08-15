@@ -15,6 +15,7 @@ import os
 import re
 from dataclasses import dataclass
 
+from hexlib import hostload
 from hexlib import toolchain as tc
 from hexlib.build import BuildOutput
 
@@ -106,15 +107,18 @@ def run_sim(
     sim_exe = os.path.join(build_out.bin_dir, tc.exe("hexagon-sim"))
     cmd = sim_command(sim_exe, build_out.elf, caps)
 
-    rc, out, err, timed_out = tc.run(
-        cmd, env, timeout=timeout or tc.SIM_TIMEOUT_MAX_S
-    )
+    budget = timeout or tc.SIM_TIMEOUT_MAX_S
+    # Sampled for the life of the run so a timeout can be ATTRIBUTED rather
+    # than guessed at. See hexlib/hostload.py for what goes wrong without it.
+    with hostload.SimLoadMonitor() as monitor:
+        rc, out, err, timed_out = tc.run(cmd, env, timeout=budget)
+    load = monitor.stats()
     combined = out + err
 
     if timed_out:
         raise SimError(
-            f"simulator timed out after {timeout or tc.SIM_TIMEOUT_MAX_S}s — "
-            "the kernel may not terminate",
+            f"simulator timed out after {budget}s — "
+            f"{hostload.timeout_diagnosis(budget, load)}",
             combined,
         )
 
